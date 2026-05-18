@@ -15,9 +15,20 @@ use std::sync::Arc;
 use config::Config;
 use eframe::egui;
 use sni_actor::{Cmd, ConnState, SniHandle};
+use sni_cache::{PollConfig, PollEngine, WatchHandle, WatchPriority};
 use sni_client::MemRegion;
 use sni_render::{DrawList, SNES_H, SNES_W};
 use tokio::runtime::Runtime;
+
+/// Super Metroid demo watches, registered so the poll engine has real,
+/// fast-moving data to batch the moment a device is connected. These move to
+/// Lua `snes.watch(...)` declarations in M4; here they prove the engine.
+struct SmWatches {
+    samus_x: WatchHandle,
+    samus_y: WatchHandle,
+    health: WatchHandle,
+    missiles: WatchHandle,
+}
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
@@ -51,6 +62,8 @@ struct App {
     _rt: Runtime,
     config: Config,
     sni: SniHandle,
+    engine: Arc<PollEngine>,
+    sm: SmWatches,
     /// Latest draw list. In M4+ the script host writes this; M5 paints it.
     draw_list: Arc<parking_lot::Mutex<DrawList>>,
     status: String,
@@ -73,10 +86,34 @@ impl App {
 
         let sni = sni_actor::spawn();
 
+        // Spawn the poll engine. It reads the actor's shared client slot each
+        // cycle, so connect / device-switch needs no engine restart.
+        let slot = sni.client_slot.clone();
+        let engine = sni_cache::spawn(
+            move || slot.load_full().as_ref().clone(),
+            PollConfig::default(),
+        );
+
+        // Register Super Metroid demo watches. Samus X/Y move every frame ->
+        // High priority (refreshed every cycle); health/missiles change
+        // slowly -> Normal. All four sit in WRAM a few hundred bytes apart,
+        // so the coalescer fuses them into one MultiRead per cycle.
+        let reg = engine.registry();
+        let sm = SmWatches {
+            // SM WRAM: $0AF6 Samus X, $0AFA Samus Y, $09C2 health,
+            // $09C6 missiles (FxPakPro = $F5_0000 + offset).
+            samus_x: reg.register(MemRegion::wram(0x0AF6, 2), WatchPriority::High),
+            samus_y: reg.register(MemRegion::wram(0x0AFA, 2), WatchPriority::High),
+            health: reg.register(MemRegion::wram(0x09C2, 2), WatchPriority::Normal),
+            missiles: reg.register(MemRegion::wram(0x09C6, 2), WatchPriority::Normal),
+        };
+
         Self {
             _rt: rt,
             config,
             sni,
+            engine,
+            sm,
             draw_list: Arc::new(parking_lot::Mutex::new(DrawList::default())),
             status: format!("Ready. {lua_status}"),
             // Super Metroid: WRAM $7E:0AF6 = Samus X position (u16). In the
@@ -266,13 +303,90 @@ impl eframe::App for App {
                         );
                         ui.label(
                             egui::RichText::new(
-                                "↑ this latency is what M3's batched poll engine will hide.",
+                                "↑ raw one-shot latency. The poll engine below hides it.",
                             )
                             .small()
                             .weak(),
                         );
                     }
                 }
+
+                // --- Poll engine HUD: the M3 deliverable, live ---
+                ui.add_space(12.0);
+                ui.heading("Poll engine");
+                ui.separator();
+                let stats = self.engine.stats();
+                let snap = self.engine.snapshot();
+                egui::Grid::new("poll_stats")
+                    .num_columns(2)
+                    .spacing([8.0, 2.0])
+                    .show(ui, |ui| {
+                        ui.label("cycle");
+                        ui.monospace(stats.cycle.to_string());
+                        ui.end_row();
+                        ui.label("watches");
+                        ui.monospace(stats.watches.to_string());
+                        ui.end_row();
+                        ui.label("reads/cycle");
+                        ui.monospace(format!(
+                            "{} ({} B)",
+                            stats.reads_last_cycle, stats.bytes_last_cycle
+                        ));
+                        ui.end_row();
+                        ui.label("RTT (ewma)");
+                        ui.monospace(format!(
+                            "{:.1} ms (last {} ms)",
+                            stats.rtt_ms_ewma, stats.last_rtt_ms
+                        ));
+                        ui.end_row();
+                    });
+                if stats.budget_capped {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 170, 0),
+                        "byte budget hit — some watches deferred",
+                    );
+                }
+                if let Some(e) = stats.last_error {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 60, 60),
+                        format!("last cycle error: {e}"),
+                    );
+                }
+
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Super Metroid (cached, from snapshot)")
+                        .small()
+                        .weak(),
+                );
+                let fmt = |v: Option<u16>| {
+                    v.map(|n| n.to_string()).unwrap_or_else(|| "—".into())
+                };
+                egui::Grid::new("sm_watch")
+                    .num_columns(2)
+                    .spacing([8.0, 2.0])
+                    .show(ui, |ui| {
+                        ui.label("Samus X");
+                        ui.monospace(fmt(snap.u16(self.sm.samus_x.id)));
+                        ui.end_row();
+                        ui.label("Samus Y");
+                        ui.monospace(fmt(snap.u16(self.sm.samus_y.id)));
+                        ui.end_row();
+                        ui.label("Health");
+                        ui.monospace(fmt(snap.u16(self.sm.health.id)));
+                        ui.end_row();
+                        ui.label("Missiles");
+                        ui.monospace(fmt(snap.u16(self.sm.missiles.id)));
+                        ui.end_row();
+                    });
+                ui.label(
+                    egui::RichText::new(
+                        "These update with no per-read latency — \
+                         one batched MultiRead/cycle feeds them all.",
+                    )
+                    .small()
+                    .weak(),
+                );
             });
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {

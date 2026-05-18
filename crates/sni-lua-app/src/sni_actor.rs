@@ -9,9 +9,15 @@
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use sni_client::{DeviceInfo, MemRegion, MemoryMapping, SniClient};
 use tokio::sync::mpsc;
+
+/// The active `(client, device_uri)` the poll engine reads each cycle.
+/// `None` whenever we're disconnected or no device is selected — the engine
+/// idles instead of erroring, so reconnects don't restart polling.
+pub type ClientSlot = Arc<ArcSwap<Option<(SniClient, String)>>>;
 
 /// Connection lifecycle as observed by the UI.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -64,6 +70,8 @@ pub enum Cmd {
 pub struct SniHandle {
     tx: mpsc::UnboundedSender<Cmd>,
     pub state: SharedState,
+    /// Shared with the poll engine so it always sees the live client/device.
+    pub client_slot: ClientSlot,
 }
 
 impl SniHandle {
@@ -78,21 +86,29 @@ impl SniHandle {
 pub fn spawn() -> SniHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let state: SharedState = Arc::new(Mutex::new(SniState::default()));
+    let client_slot: ClientSlot = Arc::new(ArcSwap::from_pointee(None));
     let actor_state = state.clone();
+    let actor_slot = client_slot.clone();
     tokio::spawn(async move {
         Actor {
             state: actor_state,
             client: None,
+            slot: actor_slot,
         }
         .run(rx)
         .await;
     });
-    SniHandle { tx, state }
+    SniHandle {
+        tx,
+        state,
+        client_slot,
+    }
 }
 
 struct Actor {
     state: SharedState,
     client: Option<SniClient>,
+    slot: ClientSlot,
 }
 
 impl Actor {
@@ -102,8 +118,11 @@ impl Actor {
                 Cmd::Connect { endpoint } => self.connect(endpoint).await,
                 Cmd::Disconnect => {
                     self.client = None;
-                    let mut s = self.state.lock();
-                    *s = SniState::default();
+                    {
+                        let mut s = self.state.lock();
+                        *s = SniState::default();
+                    }
+                    self.republish_slot(); // -> None; poll engine idles
                 }
                 Cmd::RefreshDevices => self.refresh_devices().await,
                 Cmd::SelectDevice { uri } => self.select_device(uri).await,
@@ -115,6 +134,18 @@ impl Actor {
 
     fn set_conn(&self, conn: ConnState) {
         self.state.lock().conn = conn;
+    }
+
+    /// Republish the `(client, uri)` the poll engine reads. Called whenever
+    /// the client or selected device changes. The poll engine picks this up
+    /// on its next cycle with no restart.
+    fn republish_slot(&self) {
+        let uri = self.state.lock().selected_uri.clone();
+        let next = match (self.client.clone(), uri) {
+            (Some(c), Some(u)) => Some((c, u)),
+            _ => None,
+        };
+        self.slot.store(Arc::new(next));
     }
 
     async fn connect(&mut self, endpoint: String) {
@@ -158,11 +189,13 @@ impl Actor {
         if let Some(uri) = sel {
             self.detect_mapping(&uri).await;
         }
+        self.republish_slot();
     }
 
     async fn select_device(&mut self, uri: String) {
         self.state.lock().selected_uri = Some(uri.clone());
         self.detect_mapping(&uri).await;
+        self.republish_slot();
     }
 
     async fn detect_mapping(&mut self, uri: &str) {
