@@ -18,6 +18,21 @@ pub struct Config {
     /// Capture device index (composited mode). Capture cards enumerate as
     /// webcam-class devices.
     pub capture_device: u32,
+    /// Preferred capture input width/height/fps. Zero means "auto".
+    pub capture_width: u32,
+    pub capture_height: u32,
+    pub capture_fps: u32,
+    /// Capture crop margins in source pixels, applied before scaling into the
+    /// overlay canvas.
+    pub capture_crop_left: u32,
+    pub capture_crop_top: u32,
+    pub capture_crop_right: u32,
+    pub capture_crop_bottom: u32,
+    /// "aspect" = center-crop the source to the canvas aspect after manual
+    /// margins; "stretch" = stretch the cropped source into the canvas rect.
+    pub capture_crop_mode: String,
+    /// Mouse input should pass through the transparent overlay window.
+    pub overlay_click_through: bool,
     /// Last loaded script path, restored on launch.
     pub last_script: Option<PathBuf>,
     /// Canvas (script coordinate space) policy:
@@ -41,6 +56,15 @@ impl Default for Config {
             poll_interval_ms: 16, // ~60 logical poll cycles/sec target
             capture_mode: "composited".to_string(),
             capture_device: 0,
+            capture_width: 0,
+            capture_height: 0,
+            capture_fps: 0,
+            capture_crop_left: 0,
+            capture_crop_top: 0,
+            capture_crop_right: 0,
+            capture_crop_bottom: 0,
+            capture_crop_mode: "aspect".to_string(),
+            overlay_click_through: false,
             last_script: None,
             canvas_mode: "script".to_string(),
             text_sizing_mode: "game".to_string(),

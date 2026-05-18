@@ -22,9 +22,9 @@ use std::thread::JoinHandle;
 use arc_swap::ArcSwap;
 use nokhwa::pixel_format::RgbAFormat;
 use nokhwa::utils::{
-    ApiBackend, CameraIndex, RequestedFormat, RequestedFormatType,
+    ApiBackend, CameraFormat, CameraIndex, RequestedFormat, RequestedFormatType, Resolution,
 };
-use nokhwa::Camera;
+use nokhwa::{Camera, FormatDecoder};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureMode {
@@ -66,6 +66,34 @@ pub struct DeviceDesc {
     pub name: String,
 }
 
+/// Capture format preferences. A zero value means "auto".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureSettings {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+}
+
+impl Default for CaptureSettings {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            fps: 0,
+        }
+    }
+}
+
+impl CaptureSettings {
+    fn wants_format(self) -> bool {
+        self.width > 0 || self.height > 0 || self.fps > 0
+    }
+
+    fn wants_resolution(self) -> bool {
+        self.width > 0 || self.height > 0
+    }
+}
+
 /// Enumerate capture devices (capture cards show up as webcam-class).
 pub fn list_devices() -> Vec<DeviceDesc> {
     match nokhwa::query(ApiBackend::Auto) {
@@ -98,15 +126,15 @@ pub struct CaptureSource {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     device_index: u32,
+    settings: CaptureSettings,
 }
 
 impl CaptureSource {
     /// Open `device_index` and start capturing on a background thread. Errors
     /// from the device are logged; the source simply yields no frames until
     /// the device works (the overlay still runs).
-    pub fn open(device_index: u32) -> Self {
-        let latest: Arc<ArcSwap<Option<Frame>>> =
-            Arc::new(ArcSwap::from_pointee(None));
+    pub fn open(device_index: u32, settings: CaptureSettings) -> Self {
+        let latest: Arc<ArcSwap<Option<Frame>>> = Arc::new(ArcSwap::from_pointee(None));
         let stop = Arc::new(AtomicBool::new(false));
 
         let thread_latest = latest.clone();
@@ -114,7 +142,7 @@ impl CaptureSource {
         let handle = std::thread::Builder::new()
             .name("sni-capture".into())
             .spawn(move || {
-                capture_loop(device_index, thread_latest, thread_stop);
+                capture_loop(device_index, settings, thread_latest, thread_stop);
             })
             .expect("spawn capture thread");
 
@@ -123,11 +151,16 @@ impl CaptureSource {
             stop,
             handle: Some(handle),
             device_index,
+            settings,
         }
     }
 
     pub fn device_index(&self) -> u32 {
         self.device_index
+    }
+
+    pub fn settings(&self) -> CaptureSettings {
+        self.settings
     }
 
     /// The most recent decoded frame, or `None` if the device hasn't
@@ -149,28 +182,30 @@ impl Drop for CaptureSource {
 
 fn capture_loop(
     device_index: u32,
+    settings: CaptureSettings,
     latest: Arc<ArcSwap<Option<Frame>>>,
     stop: Arc<AtomicBool>,
 ) {
     // Ask for the highest-rate format the device offers; we decode to RGBA.
-    let requested = RequestedFormat::new::<RgbAFormat>(
-        RequestedFormatType::AbsoluteHighestFrameRate,
-    );
-    let mut camera = match Camera::new(CameraIndex::Index(device_index), requested)
-    {
+    let requested =
+        RequestedFormat::new::<RgbAFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+    let mut camera = match Camera::new(CameraIndex::Index(device_index), requested) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("cannot open capture device {device_index}: {e}");
             return;
         }
     };
+
+    apply_requested_format(&mut camera, device_index, settings);
+
     if let Err(e) = camera.open_stream() {
         tracing::warn!("cannot start capture stream: {e}");
         return;
     }
     tracing::info!(
-        "capture device {device_index} streaming at {:?}",
-        camera.resolution()
+        "capture device {device_index} streaming at {}",
+        camera.camera_format()
     );
 
     let mut seq: u64 = 0;
@@ -200,4 +235,108 @@ fn capture_loop(
     }
     let _ = camera.stop_stream();
     tracing::info!("capture device {device_index} stopped");
+}
+
+fn apply_requested_format(camera: &mut Camera, device_index: u32, settings: CaptureSettings) {
+    if !settings.wants_format() {
+        return;
+    }
+
+    match camera.compatible_camera_formats() {
+        Ok(formats) => {
+            if let Some(format) = choose_format(&formats, settings) {
+                tracing::info!(
+                    "capture device {device_index} requested {:?}, selected {}",
+                    settings,
+                    format
+                );
+                let wanted_formats = [format.format()];
+                let request = RequestedFormat::with_formats(
+                    RequestedFormatType::Exact(format),
+                    &wanted_formats,
+                );
+                if let Err(e) = camera.set_camera_requset(request) {
+                    tracing::warn!(
+                        "capture device {device_index} rejected selected format \
+                         {format}: {e}"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    "capture device {device_index} has no compatible decoded \
+                     formats for {:?}; using backend default",
+                    settings
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "capture device {device_index} format query failed ({e}); \
+                 trying direct format setters"
+            );
+            if settings.width > 0 && settings.height > 0 {
+                let res = Resolution::new(settings.width, settings.height);
+                if let Err(e) = camera.set_resolution(res) {
+                    tracing::warn!(
+                        "capture device {device_index} rejected resolution \
+                         {res}: {e}"
+                    );
+                }
+            }
+            if settings.fps > 0 {
+                if let Err(e) = camera.set_frame_rate(settings.fps) {
+                    tracing::warn!(
+                        "capture device {device_index} rejected {} FPS: {e}",
+                        settings.fps
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn choose_format(formats: &[CameraFormat], settings: CaptureSettings) -> Option<CameraFormat> {
+    let mut formats = formats
+        .iter()
+        .copied()
+        .filter(|format| <RgbAFormat as FormatDecoder>::FORMATS.contains(&format.format()))
+        .collect::<Vec<_>>();
+
+    formats.sort_by_key(|format| {
+        (
+            resolution_score(*format, settings),
+            fps_score(*format, settings),
+            std::cmp::Reverse(format.frame_rate()),
+            std::cmp::Reverse(format_area(*format)),
+        )
+    });
+    formats.into_iter().next()
+}
+
+fn resolution_score(format: CameraFormat, settings: CaptureSettings) -> u64 {
+    if !settings.wants_resolution() {
+        return 0;
+    }
+    let dx = if settings.width > 0 {
+        format.width().abs_diff(settings.width) as u64
+    } else {
+        0
+    };
+    let dy = if settings.height > 0 {
+        format.height().abs_diff(settings.height) as u64
+    } else {
+        0
+    };
+    dx * dx + dy * dy
+}
+
+fn fps_score(format: CameraFormat, settings: CaptureSettings) -> u32 {
+    if settings.fps == 0 {
+        return 0;
+    }
+    format.frame_rate().abs_diff(settings.fps)
+}
+
+fn format_area(format: CameraFormat) -> u64 {
+    u64::from(format.width()) * u64::from(format.height())
 }

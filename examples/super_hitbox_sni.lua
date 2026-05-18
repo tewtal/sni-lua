@@ -74,12 +74,47 @@ local function to_fxpak(cpu_addr)
     return nil
 end
 
--- Priority heuristic: WRAM moves every frame -> high; ROM is static -> low
--- (registered once, rarely re-read by the poll engine, but always cached).
-local function priority_for(fxpak)
-    if fxpak >= 0xF50000 and fxpak <= 0xF6FFFF then
-        return "high"
+-- ---- tiered auto-classification ---------------------------------------------
+--
+-- The cache-aware model: every address the script touches is auto-assigned a
+-- poll tier so the script renders at full rate from cache while the engine
+-- streams fresh data in by priority.
+--
+--   realtime : controller state. Tiny, latency-critical -> the poll engine's
+--              dedicated sub-poll (never queued behind block data).
+--   high     : Samus/camera/sprite/enemy WRAM that moves every frame.
+--   normal   : slower WRAM (HUD-ish values).
+--   low      : level/block/room tables + ROM. Large and slow-changing;
+--              prefetched in the background, always served from cache.
+--
+-- WRAM offset = fxpak - 0xF50000. Ranges are SM-specific but the buckets are
+-- conservative; an explicit snes.tier() hint from the script always wins
+-- (the engine only ever upgrades urgency, never downgrades).
+
+local WRAM_BASE = 0xF50000
+
+-- Controller 1 mirror ($7E:008B held, $7E:008F newly-pressed) -> realtime.
+local function is_controller(off)
+    return off == 0x008B or off == 0x008C   -- $008B u16
+        or off == 0x008F or off == 0x0090   -- $008F u16
+end
+
+-- Frame-volatile player/world state -> high.
+local function is_high_volatility(off)
+    return (off >= 0x00B0 and off <= 0x00B7)   -- layer1/2 scroll (camera)
+        or (off >= 0x0911 and off <= 0x0B0F)   -- Samus pos/vel/pose/hitbox
+        or (off >= 0x0D00 and off <= 0x1FFF)  -- sprite/enemy/projectile tbls
+        or (off >= 0x0790 and off <= 0x07BF)   -- room/scroll pointers (read hot)
+end
+
+local function tier_for(fxpak)
+    if fxpak >= WRAM_BASE and fxpak <= 0xF6FFFF then
+        local off = fxpak - WRAM_BASE
+        if is_controller(off) then return "realtime" end
+        if is_high_volatility(off) then return "high" end
+        return "normal"
     end
+    -- ROM / level / everything else: large, static-ish -> prefetch in bg.
     return "low"
 end
 
@@ -97,17 +132,33 @@ local function cached_byte(fxpak)
         end
         return v
     end
-    -- First touch: register a 1-byte watch (coalesced by the engine) and
-    -- return 0 until the poll loop fills it in (usually within ~1-2 frames).
+    -- First touch: register a 1-byte watch (the engine coalesces adjacent
+    -- ones into batched reads) at its auto-classified tier, and return 0
+    -- until the poll loop fills it in.
     local w = _watch_of[fxpak]
     if w == nil then
-        w = snes.watch_abs(fxpak, 1, priority_for(fxpak))
+        w = snes.watch_abs(fxpak, 1, tier_for(fxpak))
         _watch_of[fxpak] = w
     end
     local b = snes.u8(w)
     b = b or 0
     _byte_cache[fxpak] = b
     return b
+end
+
+-- Public hook so the script (or our own setup below) can force a tier on a
+-- CPU address. Registers the watch if not seen yet, then upgrades it.
+-- Exposed as xemu.tier / snes_tier for the body to opt into.
+local function tier_cpu(cpu_addr, class)
+    local fx = to_fxpak(cpu_addr)
+    if fx == nil then return end
+    local w = _watch_of[fx]
+    if w == nil then
+        w = snes.watch_abs(fx, 1, class)
+        _watch_of[fx] = w
+    else
+        snes.tier(w, class)
+    end
 end
 
 -- Read 1 or 2 bytes (little-endian) with optional sign extension.
@@ -292,13 +343,31 @@ function emu.removeEventCallback() _paint_cb = nil end
 event = { unregisterbyname = function() end, onframestart = function() end }
 console = { log = function(m) print(tostring(m)) end }
 
+-- Expose the tier hook so the script body (or future scripts) can override
+-- classification, e.g. xemu.tier(0x7E0AF6, "high"). emu.tier mirrors it.
+xemu_tier = tier_cpu          -- picked up if the body's xemu refers to it
+function emu.tier(cpu_addr, class) tier_cpu(cpu_addr, class) end
+
 -- sni-lua lifecycle. The original script body (appended after this prelude)
 -- runs at load: it builds everything and calls emu.addEventCallback(on_paint).
 -- We then pump that callback every frame.
 function on_init()
     print("Super Hitbox running via " .. PRELUDE_VERSION ..
           " (Mesen2 compat over SNI)")
-    print("First frames may be blank while watches populate the cache.")
+
+    -- Pre-register the controller mirror at REALTIME priority so it lands in
+    -- the poll engine's dedicated fast sub-poll from cycle 1 -- not lazily on
+    -- the script's first input read. $7E:008B held, $7E:008F newly-pressed
+    -- (the $4218 mirror + edge bits the script's sm.getInput/getChangedInput
+    -- read). Read-only: we never inject synthetic inputs (SNI write latency
+    -- makes that unsafe for real play); the script just sees the real pad.
+    tier_cpu(0x7E008B, "realtime")
+    tier_cpu(0x7E008C, "realtime")
+    tier_cpu(0x7E008F, "realtime")
+    tier_cpu(0x7E0090, "realtime")
+
+    print("controller mirror @ realtime tier ($7E:008B/$008F)")
+    print("rendering runs at full rate from cache; data streams in by tier")
 end
 
 function on_frame()

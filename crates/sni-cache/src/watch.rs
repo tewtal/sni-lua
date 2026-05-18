@@ -17,32 +17,46 @@ pub type WatchId = u64;
 
 /// How often a watch is refreshed relative to others — the lever that spends
 /// the per-cycle bandwidth budget where it matters.
+/// Ordered most-urgent first so `max()` upgrades a watch correctly when a
+/// script hints a higher tier for an address that's already registered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum WatchPriority {
-    /// Refresh every poll cycle. Use for fast-moving data that drives visuals
-    /// each frame: Samus position for a hitbox, projectile coordinates.
+    /// The freshest tier. Polled every cycle in its OWN tiny coalesced read,
+    /// kept separate from the bulk batch so a few latency-critical bytes
+    /// (controller state) are never queued behind block/level data.
+    Realtime,
+    /// Refresh every poll cycle (in the bulk batch). Fast-moving visuals:
+    /// Samus position, camera, projectile coordinates.
     High,
     /// Refresh every few cycles. Item counts, health, room flags.
     Normal,
-    /// Refresh rarely. Static-ish room metadata; good prefetch candidate so
-    /// it's already cached the moment a script needs it.
+    /// Refresh rarely. Static-ish room/level/block data; good prefetch
+    /// candidate so it's already cached the moment a script needs it.
     Low,
 }
 
 impl WatchPriority {
-    /// Refresh period in poll cycles. High = every cycle.
+    /// Refresh period in poll cycles. Realtime/High = every cycle.
     pub fn period(self) -> u64 {
         match self {
+            WatchPriority::Realtime => 1,
             WatchPriority::High => 1,
             WatchPriority::Normal => 3,
             WatchPriority::Low => 12,
         }
     }
 
+    /// Realtime is served by a separate, tight sub-poll rather than the
+    /// bulk MultiRead batch.
+    pub fn is_realtime(self) -> bool {
+        matches!(self, WatchPriority::Realtime)
+    }
+
     pub fn parse(s: &str) -> WatchPriority {
         match s.to_ascii_lowercase().as_str() {
+            "realtime" | "input" => WatchPriority::Realtime,
             "high" => WatchPriority::High,
-            "low" => WatchPriority::Low,
+            "low" | "prefetch" => WatchPriority::Low,
             _ => WatchPriority::Normal,
         }
     }
@@ -78,6 +92,18 @@ impl WatchRegistry {
         };
         self.inner.write().insert(id, handle.clone());
         handle
+    }
+
+    /// Raise a watch to at least `priority` (never downgrades). Used by
+    /// `snes.tier` so an explicit hint can upgrade an address that was
+    /// already auto-registered, without a later auto-classify clobbering it.
+    /// `WatchPriority` is ordered most-urgent-first, so the upgrade is `min`.
+    pub fn upgrade_priority(&self, id: WatchId, priority: WatchPriority) {
+        if let Some(h) = self.inner.write().get_mut(&id) {
+            if priority < h.priority {
+                h.priority = priority;
+            }
+        }
     }
 
     pub fn unregister(&self, id: WatchId) {
@@ -225,5 +251,30 @@ mod tests {
         b.region.space = sni_client::AddressSpace::SnesABus;
         let reads = coalesce(&[a, b], 64);
         assert_eq!(reads.len(), 2);
+    }
+
+    #[test]
+    fn priority_order_is_realtime_first() {
+        // Ordered most-urgent-first so the engine can split realtime out and
+        // `upgrade_priority` (a min) raises urgency correctly.
+        assert!(WatchPriority::Realtime < WatchPriority::High);
+        assert!(WatchPriority::High < WatchPriority::Normal);
+        assert!(WatchPriority::Normal < WatchPriority::Low);
+        assert!(WatchPriority::Realtime.is_realtime());
+        assert!(!WatchPriority::High.is_realtime());
+        assert_eq!(WatchPriority::parse("input"), WatchPriority::Realtime);
+        assert_eq!(WatchPriority::parse("prefetch"), WatchPriority::Low);
+    }
+
+    #[test]
+    fn upgrade_only_raises_urgency() {
+        let reg = WatchRegistry::new();
+        let w = reg.register(MemRegion::fxpak(0xF5_008B, 1), WatchPriority::Low);
+        // Low -> Realtime: upgrades.
+        reg.upgrade_priority(w.id, WatchPriority::Realtime);
+        assert_eq!(reg.all()[0].priority, WatchPriority::Realtime);
+        // Realtime -> Normal: must NOT downgrade (explicit hint stays).
+        reg.upgrade_priority(w.id, WatchPriority::Normal);
+        assert_eq!(reg.all()[0].priority, WatchPriority::Realtime);
     }
 }

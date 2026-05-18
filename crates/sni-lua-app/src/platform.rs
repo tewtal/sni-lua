@@ -13,16 +13,12 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 /// Make `window` click-through (input passes to whatever is behind it).
 /// Returns whether it was applied, so the UI can report honestly.
-pub fn set_click_through(
-    window: &dyn HasWindowHandle,
-    enabled: bool,
-) -> bool {
+pub fn set_click_through(window: &dyn HasWindowHandle, enabled: bool) -> bool {
     #[cfg(windows)]
     {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
-            GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE,
-            WS_EX_LAYERED, WS_EX_TRANSPARENT,
+            GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT,
         };
 
         let Ok(handle) = window.window_handle() else {
@@ -34,11 +30,10 @@ pub fn set_click_through(
         let hwnd = HWND(h.hwnd.get() as *mut _);
         unsafe {
             let mut ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-            let flags = WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0;
             if enabled {
-                ex |= flags;
+                ex |= WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0;
             } else {
-                ex &= !flags;
+                ex &= !WS_EX_TRANSPARENT.0;
             }
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex as isize);
         }

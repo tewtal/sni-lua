@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use config::Config;
 use eframe::egui;
-use sni_actor::{CmdSender, Cmd, ConnState, SniHandle};
+use sni_actor::{Cmd, CmdSender, ConnState, SniHandle};
 use sni_cache::{PollConfig, PollEngine, WatchHandle, WatchPriority};
 use sni_client::MemRegion;
 use sni_lua_api::{Console, ScriptHost, WriteSink};
@@ -41,6 +41,14 @@ struct SmWatches {
     samus_y: WatchHandle,
     health: WatchHandle,
     missiles: WatchHandle,
+}
+
+fn capture_settings(config: &Config) -> sni_capture::CaptureSettings {
+    sni_capture::CaptureSettings {
+        width: config.capture_width,
+        height: config.capture_height,
+        fps: config.capture_fps,
+    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -112,8 +120,10 @@ struct App {
     /// seq of the frame currently in `capture_tex`, to skip redundant
     /// GPU uploads when the device frame hasn't advanced.
     capture_tex_seq: u64,
-    /// Set once we've applied the transparent-window Win32 styling.
-    transparent_applied: bool,
+    /// Last transparent-overlay window mode pushed to the native viewport.
+    window_overlay_applied: Option<bool>,
+    /// Last click-through mouse state pushed to the native window.
+    click_through_applied: bool,
 }
 
 impl App {
@@ -146,8 +156,7 @@ impl App {
         // Lua host: shares the poll engine (for cached reads) and a write
         // sink that forwards `snes.write` to the SNI actor.
         let sink = Arc::new(ActorWriteSink { tx: sni.sender() });
-        let host = ScriptHost::with_sink(engine.clone(), sink)
-            .expect("LuaJIT init failed");
+        let host = ScriptHost::with_sink(engine.clone(), sink).expect("LuaJIT init failed");
         let console = host.console();
         // M1 LuaJIT health check, now via the real host.
         let lua_status = match host.eval_number("return 2 ^ 10") {
@@ -161,7 +170,10 @@ impl App {
         let capture = if sni_capture::CaptureMode::parse(&config.capture_mode)
             == sni_capture::CaptureMode::Composited
         {
-            Some(sni_capture::CaptureSource::open(config.capture_device))
+            Some(sni_capture::CaptureSource::open(
+                config.capture_device,
+                capture_settings(&config),
+            ))
         } else {
             None
         };
@@ -190,7 +202,8 @@ impl App {
             capture_devices,
             capture_tex: None,
             capture_tex_seq: 0,
-            transparent_applied: false,
+            window_overlay_applied: None,
+            click_through_applied: false,
         };
         // Auto-load the last script if one was remembered.
         if !app.script_path.is_empty() {
@@ -273,16 +286,91 @@ impl App {
         {
             self.capture = Some(sni_capture::CaptureSource::open(
                 self.config.capture_device,
+                capture_settings(&self.config),
             ));
         }
     }
 
+    fn apply_window_mode(&mut self, ctx: &egui::Context, frame: &eframe::Frame, transparent: bool) {
+        if self.window_overlay_applied != Some(transparent) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(transparent));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!transparent));
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if transparent {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            }));
+            self.window_overlay_applied = Some(transparent);
+        }
+
+        let want_click_through = transparent && self.config.overlay_click_through;
+        if self.click_through_applied != want_click_through {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(want_click_through));
+            platform::set_click_through(frame, want_click_through);
+            self.click_through_applied = want_click_through;
+        }
+    }
+
+    fn capture_uv_rect(&self, frame_size: [usize; 2], canvas: sni_render::Canvas) -> egui::Rect {
+        let frame_w = frame_size[0].max(1) as f32;
+        let frame_h = frame_size[1].max(1) as f32;
+
+        let left = self
+            .config
+            .capture_crop_left
+            .min(frame_size[0].saturating_sub(1) as u32) as f32;
+        let top = self
+            .config
+            .capture_crop_top
+            .min(frame_size[1].saturating_sub(1) as u32) as f32;
+        let mut right = frame_w
+            - self
+                .config
+                .capture_crop_right
+                .min(frame_size[0].saturating_sub(1) as u32) as f32;
+        let mut bottom = frame_h
+            - self
+                .config
+                .capture_crop_bottom
+                .min(frame_size[1].saturating_sub(1) as u32) as f32;
+        let mut left = left;
+        let mut top = top;
+        if right <= left {
+            right = (left + 1.0).min(frame_w);
+        }
+        if bottom <= top {
+            bottom = (top + 1.0).min(frame_h);
+        }
+
+        if self.config.capture_crop_mode == "aspect" && canvas.h > 0.0 {
+            let target = canvas.w / canvas.h;
+            let crop_w = right - left;
+            let crop_h = bottom - top;
+            if crop_w > 0.0 && crop_h > 0.0 && target > 0.0 {
+                let current = crop_w / crop_h;
+                if current > target {
+                    let new_w = crop_h * target;
+                    let dx = (crop_w - new_w) * 0.5;
+                    left += dx;
+                    right -= dx;
+                } else if current < target {
+                    let new_h = crop_w / target;
+                    let dy = (crop_h - new_h) * 0.5;
+                    top += dy;
+                    bottom -= dy;
+                }
+            }
+        }
+
+        egui::Rect::from_min_max(
+            egui::pos2(left / frame_w, top / frame_h),
+            egui::pos2(right / frame_w, bottom / frame_h),
+        )
+    }
+
     /// Upload the latest capture frame into an egui texture (only when the
     /// frame actually advanced) and return its handle for drawing.
-    fn capture_texture(
-        &mut self,
-        ctx: &egui::Context,
-    ) -> Option<&egui::TextureHandle> {
+    fn capture_texture(&mut self, ctx: &egui::Context) -> Option<&egui::TextureHandle> {
         let frame = self.capture.as_ref()?.latest()?;
         if self.capture_tex.is_none() || frame.seq != self.capture_tex_seq {
             let img = egui::ColorImage::from_rgba_unmultiplied(
@@ -299,11 +387,7 @@ impl App {
             match &mut self.capture_tex {
                 Some(t) => t.set(img, opts),
                 None => {
-                    self.capture_tex = Some(ctx.load_texture(
-                        "capture",
-                        img,
-                        opts,
-                    ));
+                    self.capture_tex = Some(ctx.load_texture("capture", img, opts));
                 }
             }
             self.capture_tex_seq = frame.seq;
@@ -313,28 +397,34 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.config.capture_mode == "transparent" {
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            egui::Color32::from_rgba_unmultiplied(12, 12, 12, 180).to_normalized_gamma_f32()
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Keep the UI repainting so capture frames / poll snapshots stay live
         // without user input.
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
 
-        // In transparent-overlay mode, apply Win32 click-through once the
-        // window exists. Re-applied if the mode toggles at runtime.
-        let want_transparent =
-            self.config.capture_mode == "transparent";
-        if want_transparent && !self.transparent_applied {
-            if platform::set_click_through(frame, true) {
-                tracing::info!("transparent overlay: click-through enabled");
-            } else {
-                tracing::warn!(
-                    "click-through not available on this platform/build"
-                );
-            }
-            self.transparent_applied = true;
-        } else if !want_transparent && self.transparent_applied {
-            platform::set_click_through(frame, false);
-            self.transparent_applied = false;
+        // Transparent overlay and click-through are separate states: the
+        // window can be transparent and borderless while still letting the
+        // user interact with the app controls.
+        let want_transparent = self.config.capture_mode == "transparent";
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::F10,
+            )
+        }) {
+            self.config.overlay_click_through = false;
+            self.config.save();
+            self.status = "Overlay click-through disabled".to_string();
         }
+        self.apply_window_mode(ctx, frame, want_transparent);
 
         let snap = {
             // Short-lived clone of the actor state; never hold the lock across
@@ -369,8 +459,7 @@ impl eframe::App for App {
                 ui.separator();
                 ui.label("SNI:");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.config.sni_endpoint)
-                        .desired_width(220.0),
+                    egui::TextEdit::singleline(&mut self.config.sni_endpoint).desired_width(220.0),
                 );
 
                 let connected = matches!(conn, ConnState::Connected);
@@ -395,18 +484,16 @@ impl eframe::App for App {
 
                 ui.separator();
                 let (txt, col) = match &conn {
-                    ConnState::Disconnected => {
-                        ("● disconnected".to_string(), egui::Color32::GRAY)
-                    }
-                    ConnState::Connecting => {
-                        ("● connecting…".to_string(), egui::Color32::YELLOW)
-                    }
-                    ConnState::Connected => {
-                        ("● connected".to_string(), egui::Color32::from_rgb(0, 200, 0))
-                    }
-                    ConnState::Error(e) => {
-                        (format!("● error: {e}"), egui::Color32::from_rgb(220, 60, 60))
-                    }
+                    ConnState::Disconnected => ("● disconnected".to_string(), egui::Color32::GRAY),
+                    ConnState::Connecting => ("● connecting…".to_string(), egui::Color32::YELLOW),
+                    ConnState::Connected => (
+                        "● connected".to_string(),
+                        egui::Color32::from_rgb(0, 200, 0),
+                    ),
+                    ConnState::Error(e) => (
+                        format!("● error: {e}"),
+                        egui::Color32::from_rgb(220, 60, 60),
+                    ),
                 };
                 ui.colored_label(col, txt);
             });
@@ -418,11 +505,7 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.heading("Script");
                 ui.separator();
-                ui.label(
-                    egui::RichText::new("Lua file path")
-                        .small()
-                        .weak(),
-                );
+                ui.label(egui::RichText::new("Lua file path").small().weak());
                 ui.add(
                     egui::TextEdit::singleline(&mut self.script_path)
                         .desired_width(f32::INFINITY)
@@ -452,7 +535,10 @@ impl eframe::App for App {
                 } else if self.script_path.trim().is_empty() {
                     ("○ no script", egui::Color32::GRAY)
                 } else {
-                    ("● stopped (see console)", egui::Color32::from_rgb(220, 60, 60))
+                    (
+                        "● stopped (see console)",
+                        egui::Color32::from_rgb(220, 60, 60),
+                    )
                 };
                 ui.colored_label(col, txt);
 
@@ -463,11 +549,8 @@ impl eframe::App for App {
                     ui.label("Text size");
                     if ui
                         .add(
-                            egui::Slider::new(
-                                &mut self.config.text_size,
-                                0.3..=4.0,
-                            )
-                            .fixed_decimals(2),
+                            egui::Slider::new(&mut self.config.text_size, 0.3..=4.0)
+                                .fixed_decimals(2),
                         )
                         .changed()
                     {
@@ -528,9 +611,7 @@ impl eframe::App for App {
                                 "script".into(),
                                 "Script-controlled (gfx.scale/canvas)",
                             );
-                            ui.selectable_value(
-                                &mut m, "native".into(), "Native 256x224",
-                            );
+                            ui.selectable_value(&mut m, "native".into(), "Native 256x224");
                             ui.selectable_value(&mut m, "2x".into(), "2x  512x448");
                             ui.selectable_value(&mut m, "3x".into(), "3x  768x672");
                             ui.selectable_value(&mut m, "4x".into(), "4x  1024x896");
@@ -576,9 +657,12 @@ impl eframe::App for App {
                         });
                     if m != self.config.capture_mode {
                         self.config.capture_mode = m;
+                        if self.config.capture_mode != "transparent" {
+                            self.config.overlay_click_through = false;
+                        }
                         self.config.save();
                         self.restart_capture();
-                        self.transparent_applied = false; // re-apply styling
+                        self.window_overlay_applied = None;
                     }
                 });
 
@@ -590,9 +674,7 @@ impl eframe::App for App {
                             .iter()
                             .find(|d| d.index == self.config.capture_device)
                             .map(|d| d.name.clone())
-                            .unwrap_or_else(|| {
-                                format!("#{}", self.config.capture_device)
-                            });
+                            .unwrap_or_else(|| format!("#{}", self.config.capture_device));
                         let mut chosen = self.config.capture_device;
                         egui::ComboBox::from_id_salt("capture_dev")
                             .selected_text(cur)
@@ -614,6 +696,125 @@ impl eframe::App for App {
                     if ui.small_button("↻ Rescan devices").clicked() {
                         self.capture_devices = sni_capture::list_devices();
                     }
+                    if let Some(frame) = self.capture.as_ref().and_then(|c| c.latest()) {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "current input: {}x{}",
+                                frame.width, frame.height
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Input");
+                        let mut changed = false;
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.config.capture_width)
+                                    .range(0..=7680)
+                                    .speed(16),
+                            )
+                            .changed();
+                        ui.label("x");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.config.capture_height)
+                                    .range(0..=4320)
+                                    .speed(16),
+                            )
+                            .changed();
+                        ui.label("@");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.config.capture_fps)
+                                    .range(0..=240)
+                                    .speed(1),
+                            )
+                            .changed();
+                        ui.label("FPS");
+                        if changed {
+                            self.config.save();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Apply input").clicked() {
+                            self.config.save();
+                            self.restart_capture();
+                        }
+                        if ui.small_button("Auto input").clicked() {
+                            self.config.capture_width = 0;
+                            self.config.capture_height = 0;
+                            self.config.capture_fps = 0;
+                            self.config.save();
+                            self.restart_capture();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Crop mode");
+                        let mut mode = self.config.capture_crop_mode.clone();
+                        let label = if mode == "stretch" {
+                            "Stretch crop"
+                        } else {
+                            "Crop to canvas"
+                        };
+                        egui::ComboBox::from_id_salt("capture_crop_mode")
+                            .selected_text(label)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut mode, "aspect".into(), "Crop to canvas");
+                                ui.selectable_value(&mut mode, "stretch".into(), "Stretch crop");
+                            });
+                        if mode != self.config.capture_crop_mode {
+                            self.config.capture_crop_mode = mode;
+                            self.config.save();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Crop");
+                        let mut changed = false;
+                        ui.label("L");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.config.capture_crop_left)
+                                    .range(0..=8192)
+                                    .speed(1),
+                            )
+                            .changed();
+                        ui.label("T");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.config.capture_crop_top)
+                                    .range(0..=8192)
+                                    .speed(1),
+                            )
+                            .changed();
+                        ui.label("R");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.config.capture_crop_right)
+                                    .range(0..=8192)
+                                    .speed(1),
+                            )
+                            .changed();
+                        ui.label("B");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.config.capture_crop_bottom)
+                                    .range(0..=8192)
+                                    .speed(1),
+                            )
+                            .changed();
+                        if changed {
+                            self.config.save();
+                        }
+                    });
+                    if ui.small_button("Reset crop").clicked() {
+                        self.config.capture_crop_left = 0;
+                        self.config.capture_crop_top = 0;
+                        self.config.capture_crop_right = 0;
+                        self.config.capture_crop_bottom = 0;
+                        self.config.save();
+                    }
                     if self.capture_devices.is_empty() {
                         ui.label(
                             egui::RichText::new(
@@ -625,10 +826,15 @@ impl eframe::App for App {
                         );
                     }
                 } else {
+                    let mut click = self.config.overlay_click_through;
+                    if ui.checkbox(&mut click, "Click-through mouse").changed() {
+                        self.config.overlay_click_through = click;
+                        self.config.save();
+                    }
                     ui.label(
                         egui::RichText::new(
-                            "Window is transparent + always-on-top. Place it \
-                             over your capture software; clicks pass through.",
+                            "Window is transparent + always-on-top. \
+                             Ctrl+Shift+F10 disables click-through.",
                         )
                         .small()
                         .weak(),
@@ -640,9 +846,11 @@ impl eframe::App for App {
                 ui.separator();
                 if devices.is_empty() {
                     ui.label(
-                        egui::RichText::new("No devices. Connect to SNI, start your emulator / FXPAK.")
-                            .italics()
-                            .weak(),
+                        egui::RichText::new(
+                            "No devices. Connect to SNI, start your emulator / FXPAK.",
+                        )
+                        .italics()
+                        .weak(),
                     );
                 } else {
                     let mut chosen = selected_uri.clone();
@@ -651,9 +859,10 @@ impl eframe::App for App {
                             chosen
                                 .as_deref()
                                 .and_then(|u| {
-                                    devices.iter().find(|d| d.uri == u).map(|d| {
-                                        format!("{} ({})", d.display_name, d.kind)
-                                    })
+                                    devices
+                                        .iter()
+                                        .find(|d| d.uri == u)
+                                        .map(|d| format!("{} ({})", d.display_name, d.kind))
                                 })
                                 .unwrap_or_else(|| "— select —".into()),
                         )
@@ -680,17 +889,14 @@ impl eframe::App for App {
                 ui.heading("Live memory probe");
                 ui.separator();
                 ui.label(
-                    egui::RichText::new(
-                        "FxPakPro address (hex). SM Samus X = F50AF6, Y = F50AFA.",
-                    )
-                    .small()
-                    .weak(),
+                    egui::RichText::new("FxPakPro address (hex). SM Samus X = F50AF6, Y = F50AFA.")
+                        .small()
+                        .weak(),
                 );
                 ui.horizontal(|ui| {
                     ui.label("0x");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.probe_addr_hex)
-                            .desired_width(90.0),
+                        egui::TextEdit::singleline(&mut self.probe_addr_hex).desired_width(90.0),
                     );
                     ui.label("size");
                     ui.add(egui::DragValue::new(&mut self.probe_size).range(1..=64));
@@ -722,10 +928,7 @@ impl eframe::App for App {
                         ui.monospace(hex.trim_end());
                         // Little-endian interpretations (SNES is LE).
                         if last_probe.bytes.len() >= 2 {
-                            let v = u16::from_le_bytes([
-                                last_probe.bytes[0],
-                                last_probe.bytes[1],
-                            ]);
+                            let v = u16::from_le_bytes([last_probe.bytes[0], last_probe.bytes[1]]);
                             ui.label(format!("u16 LE = {v}  (0x{v:04X})"));
                         }
                         ui.colored_label(
@@ -770,6 +973,12 @@ impl eframe::App for App {
                             stats.rtt_ms_ewma, stats.last_rtt_ms
                         ));
                         ui.end_row();
+                        ui.label("realtime");
+                        ui.monospace(format!(
+                            "{} w · {} ms sub-poll",
+                            stats.realtime_watches, stats.realtime_rtt_ms
+                        ));
+                        ui.end_row();
                     });
                 if stats.budget_capped {
                     ui.colored_label(
@@ -790,9 +999,7 @@ impl eframe::App for App {
                         .small()
                         .weak(),
                 );
-                let fmt = |v: Option<u16>| {
-                    v.map(|n| n.to_string()).unwrap_or_else(|| "—".into())
-                };
+                let fmt = |v: Option<u16>| v.map(|n| n.to_string()).unwrap_or_else(|| "—".into());
                 egui::Grid::new("sm_watch")
                     .num_columns(2)
                     .spacing([8.0, 2.0])
@@ -858,7 +1065,7 @@ impl eframe::App for App {
         let cap_tex = if transparent {
             None
         } else {
-            self.capture_texture(ctx).map(|t| t.id())
+            self.capture_texture(ctx).map(|t| (t.id(), t.size()))
         };
         let sizing = self.text_sizing();
         let loaded = self.host.is_loaded();
@@ -867,22 +1074,23 @@ impl eframe::App for App {
         if transparent {
             // No backdrop in transparent mode — the desktop/your capture
             // software shows through the window instead.
-            central = central.frame(
-                egui::Frame::none().fill(egui::Color32::TRANSPARENT),
-            );
+            central = central.frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT));
         }
         central.show(ctx, |ui| {
             let avail = ui.available_size();
-            let (rect, _resp) =
-                ui.allocate_exact_size(avail, egui::Sense::hover());
+            let sense = if transparent {
+                egui::Sense::drag()
+            } else {
+                egui::Sense::hover()
+            };
+            let (rect, resp) = ui.allocate_exact_size(avail, sense);
+            if transparent && resp.drag_started() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
             let painter = ui.painter_at(rect);
 
             if !transparent {
-                painter.rect_filled(
-                    rect,
-                    0.0,
-                    egui::Color32::from_rgb(18, 18, 22),
-                );
+                painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 18, 22));
             }
 
             // Map the active script canvas onto the available area,
@@ -899,32 +1107,23 @@ impl eframe::App for App {
                     0.0,
                     egui::Stroke::new(
                         1.0,
-                        egui::Color32::from_rgba_unmultiplied(
-                            120, 120, 120, 60,
-                        ),
+                        egui::Color32::from_rgba_unmultiplied(120, 120, 120, 60),
                     ),
                 );
-            } else if let Some(tex) = cap_tex {
+            } else if let Some((tex, frame_size)) = cap_tex {
                 // Composited: draw the capture feed to fill the canvas rect,
                 // overlay goes on top. Same rect as the overlay viewport so
                 // script pixel coords line up with the game pixels.
                 painter.image(
                     tex,
                     view,
-                    egui::Rect::from_min_max(
-                        egui::pos2(0.0, 0.0),
-                        egui::pos2(1.0, 1.0),
-                    ),
+                    self.capture_uv_rect(frame_size, active_canvas),
                     egui::Color32::WHITE,
                 );
             } else {
                 // No device frame yet — placeholder screen so the overlay
                 // still reads against something.
-                painter.rect_filled(
-                    view,
-                    0.0,
-                    egui::Color32::from_rgb(8, 10, 16),
-                );
+                painter.rect_filled(view, 0.0, egui::Color32::from_rgb(8, 10, 16));
                 painter.rect_stroke(
                     view,
                     0.0,

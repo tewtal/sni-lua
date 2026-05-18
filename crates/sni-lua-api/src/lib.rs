@@ -257,6 +257,23 @@ impl ScriptHost {
             snes.set("age", f)?;
         }
 
+        // snes.tier(watch_id, "realtime"|"high"|"normal"|"low") -> upgrade a
+        // watch's priority. Only ever *raises* urgency (never downgrades), so
+        // an explicit hint wins over later auto-classification. "realtime"
+        // moves the watch into the dedicated fast sub-poll (controller path).
+        {
+            let engine = self.engine.clone();
+            let f = self.lua.create_function(
+                move |_, (id, class): (u64, String)| {
+                    engine
+                        .registry()
+                        .upgrade_priority(id, WatchPriority::parse(&class));
+                    Ok(())
+                },
+            )?;
+            snes.set("tier", f)?;
+        }
+
         // snes.write(fxpak_addr, value, size?) -> fire-and-forget.
         {
             let sink = self.write_sink.clone();

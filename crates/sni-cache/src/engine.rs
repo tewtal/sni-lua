@@ -62,6 +62,11 @@ pub struct PollStats {
     pub bytes_last_cycle: u32,
     pub rtt_ms_ewma: f32,
     pub last_rtt_ms: u32,
+    /// Watches in the Realtime tier and the RTT of their dedicated sub-poll
+    /// (the controller-input fast path). Distinct from the bulk RTT so the
+    /// HUD can show how fresh inputs really are.
+    pub realtime_watches: usize,
+    pub realtime_rtt_ms: u32,
     /// True if the last cycle hit the byte budget and deferred some watches.
     pub budget_capped: bool,
     pub last_error: Option<&'static str>,
@@ -130,20 +135,61 @@ pub fn spawn(
             let watches = registry.all();
             let live_ids: HashSet<u64> = watches.iter().map(|w| w.id).collect();
 
-            // Select watches whose priority period divides this cycle. High
-            // every cycle, Normal every 3, Low every 12 — spends the budget
-            // on what changes fast.
+            // Build the next snapshot on top of the previous one so watches
+            // not refreshed this cycle keep their last value (just age).
+            let prev = current.load_full();
+            let mut builder = SnapshotBuilder::from_prev(&prev);
+            builder.retain_only(&live_ids);
+            let mut last_error: Option<&'static str> = None;
+
+            // --- Tier 1: Realtime sub-poll --------------------------------
+            // A tiny, dedicated MultiRead issued FIRST every cycle for the
+            // latency-critical bytes (controller state). Kept separate so it
+            // is never queued behind the large block/level batch — the whole
+            // point of the Realtime tier.
+            let realtime: Vec<_> = watches
+                .iter()
+                .filter(|w| w.priority.is_realtime())
+                .cloned()
+                .collect();
+            let realtime_count = realtime.len();
+            let mut realtime_rtt = 0u32;
+            if !realtime.is_empty() {
+                let rt_reads = coalesce(&realtime, cfg.coalesce_gap);
+                let rt_regions: Vec<_> =
+                    rt_reads.iter().map(|r| r.region).collect();
+                let t0 = Instant::now();
+                match client.multi_read(&uri, &rt_regions).await {
+                    Ok(blobs) => {
+                        realtime_rtt = t0.elapsed().as_millis() as u32;
+                        apply_reads(&rt_reads, &blobs, &mut builder);
+                    }
+                    Err(e) => {
+                        realtime_rtt = t0.elapsed().as_millis() as u32;
+                        last_error = Some(classify_err(&e));
+                        tracing::debug!("realtime sub-poll failed: {e}");
+                    }
+                }
+            }
+
+            // --- Tier 2: bulk batch ---------------------------------------
+            // Non-realtime watches whose priority period divides this cycle.
+            // High every cycle, Normal every 3, Low every 12 — spends the
+            // byte budget on what changes fast / what's due.
             let due: Vec<_> = watches
                 .iter()
-                .filter(|w| cycle % w.priority.period() == 0)
+                .filter(|w| {
+                    !w.priority.is_realtime()
+                        && cycle % w.priority.period() == 0
+                })
                 .cloned()
                 .collect();
 
             let mut reads = coalesce(&due, cfg.coalesce_gap);
 
-            // Enforce the byte budget: keep reads (already sorted High-ish by
-            // registry id order within coalesce) until the budget is spent.
-            // High-priority data tends to be small and registered early.
+            // Enforce the byte budget. coalesce preserves registry id order,
+            // and the prelude registers hotter data earlier, so trimming the
+            // tail sheds the lowest-priority bulk reads first.
             let mut budget = cfg.byte_budget;
             let mut budget_capped = false;
             reads.retain(|r| {
@@ -158,14 +204,6 @@ pub fn spawn(
 
             let regions: Vec<_> = reads.iter().map(|r| r.region).collect();
             let bytes_requested: u32 = regions.iter().map(|r| r.size).sum();
-
-            // Build the next snapshot on top of the previous one so watches
-            // not due this cycle keep their last value (just age).
-            let prev = current.load_full();
-            let mut builder = SnapshotBuilder::from_prev(&prev);
-            builder.retain_only(&live_ids);
-
-            let mut last_error: Option<&'static str> = None;
             let rtt_ms;
 
             if regions.is_empty() {
@@ -175,21 +213,7 @@ pub fn spawn(
                 match client.multi_read(&uri, &regions).await {
                     Ok(blobs) => {
                         rtt_ms = t0.elapsed().as_millis() as u32;
-                        // Slice each coalesced blob back to its member watches.
-                        for (read, blob) in reads.iter().zip(blobs.iter()) {
-                            for &(wid, off, sz) in &read.members {
-                                let (o, s) = (off as usize, sz as usize);
-                                if blob.len() >= o + s {
-                                    let region = sni_client::MemRegion {
-                                        address: read.region.address + off,
-                                        size: sz,
-                                        space: read.region.space,
-                                        mapping: read.region.mapping,
-                                    };
-                                    builder.set(wid, region, blob[o..o + s].to_vec());
-                                }
-                            }
-                        }
+                        apply_reads(&reads, &blobs, &mut builder);
                     }
                     Err(e) => {
                         rtt_ms = t0.elapsed().as_millis() as u32;
@@ -208,6 +232,8 @@ pub fn spawn(
                 st.watches = watches.len();
                 st.reads_last_cycle = reads.len();
                 st.bytes_last_cycle = bytes_requested;
+                st.realtime_watches = realtime_count;
+                st.realtime_rtt_ms = realtime_rtt;
                 st.last_rtt_ms = rtt_ms;
                 st.rtt_ms_ewma = if st.rtt_ms_ewma == 0.0 {
                     rtt_ms as f32
@@ -232,6 +258,29 @@ pub fn spawn(
     });
 
     engine
+}
+
+/// Slice each coalesced blob back to its member watches and write them into
+/// the snapshot builder. Shared by the Realtime sub-poll and the bulk batch.
+fn apply_reads(
+    reads: &[crate::watch::CoalescedRead],
+    blobs: &[Vec<u8>],
+    builder: &mut SnapshotBuilder,
+) {
+    for (read, blob) in reads.iter().zip(blobs.iter()) {
+        for &(wid, off, sz) in &read.members {
+            let (o, s) = (off as usize, sz as usize);
+            if blob.len() >= o + s {
+                let region = sni_client::MemRegion {
+                    address: read.region.address + off,
+                    size: sz,
+                    space: read.region.space,
+                    mapping: read.region.mapping,
+                };
+                builder.set(wid, region, blob[o..o + s].to_vec());
+            }
+        }
+    }
 }
 
 fn classify_err(e: &sni_client::SniError) -> &'static str {
