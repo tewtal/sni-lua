@@ -136,7 +136,10 @@ impl App {
         let slot = sni.client_slot.clone();
         let engine = sni_cache::spawn(
             move || slot.load_full().as_ref().clone(),
-            PollConfig::default(),
+            PollConfig {
+                frame_budget_ms: config.frame_budget_ms.max(1),
+                ..PollConfig::default()
+            },
         );
 
         // Register Super Metroid demo watches. Samus X/Y move every frame ->
@@ -979,6 +982,12 @@ impl eframe::App for App {
                             stats.realtime_watches, stats.realtime_rtt_ms
                         ));
                         ui.end_row();
+                        ui.label("budget");
+                        ui.monospace(format!(
+                            "{} B (auto) · {:.0} B/ms",
+                            stats.byte_budget, stats.throughput_bpms
+                        ));
+                        ui.end_row();
                     });
                 if stats.budget_capped {
                     ui.colored_label(
@@ -992,6 +1001,40 @@ impl eframe::App for App {
                         format!("last cycle error: {e}"),
                     );
                 }
+
+                ui.horizontal(|ui| {
+                    ui.label("Frame budget");
+                    if ui
+                        .add(
+                            egui::Slider::new(
+                                &mut self.config.frame_budget_ms,
+                                4..=66,
+                            )
+                            .suffix(" ms"),
+                        )
+                        .changed()
+                    {
+                        // Push live to the running engine; the adaptive
+                        // budget re-converges to the new target within a
+                        // few cycles.
+                        self.engine.set_config(sni_cache::PollConfig {
+                            frame_budget_ms: self
+                                .config
+                                .frame_budget_ms
+                                .max(1),
+                            ..sni_cache::PollConfig::default()
+                        });
+                        self.config.save();
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "engine reads as much as it can while keeping bulk \
+                         round-trips under this; backs off hard on overshoot",
+                    )
+                    .small()
+                    .weak(),
+                );
 
                 ui.add_space(6.0);
                 ui.label(

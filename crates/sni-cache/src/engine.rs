@@ -30,9 +30,15 @@ pub struct PollConfig {
     /// Target cycle period. The engine sleeps to hit this; if a cycle's RTT
     /// already exceeds it, the next cycle starts immediately (latency-bound).
     pub target_period: Duration,
-    /// Max bytes to request in a single cycle. Caps worst-case round-trip
-    /// size so a script registering huge watches can't stall the overlay.
-    pub byte_budget: u32,
+    /// Latency target for the *bulk* read: the adaptive budget grows/shrinks
+    /// to keep each bulk MultiRead's round trip at or under this. This is the
+    /// "read as much as we can without exceeding one frame" knob.
+    pub frame_budget_ms: u32,
+    /// Hard floor/ceiling for the adaptive budget (bytes). The floor keeps
+    /// high-priority data flowing even on a bad link; the ceiling caps
+    /// worst-case memory/latency.
+    pub min_byte_budget: u32,
+    pub max_byte_budget: u32,
     /// Coalescing gap: merge same-space reads within this many bytes.
     pub coalesce_gap: u32,
     /// EWMA smoothing for the reported RTT (0..1; higher = snappier).
@@ -42,11 +48,13 @@ pub struct PollConfig {
 impl Default for PollConfig {
     fn default() -> Self {
         // Tuned for the 5-20ms (fast emulator) class measured on this setup,
-        // while staying safe if pointed at a real FXPAK: budget + coalescing
-        // keep round trips small, adaptive pacing absorbs higher RTT.
+        // while staying safe on a real FXPAK: the budget self-tunes from
+        // observed throughput + RTT so it never knowingly overruns a frame.
         Self {
             target_period: Duration::from_millis(16),
-            byte_budget: 16 * 1024,
+            frame_budget_ms: 16,
+            min_byte_budget: 256,
+            max_byte_budget: 64 * 1024,
             coalesce_gap: 16,
             rtt_alpha: 0.25,
         }
@@ -69,6 +77,10 @@ pub struct PollStats {
     pub realtime_rtt_ms: u32,
     /// True if the last cycle hit the byte budget and deferred some watches.
     pub budget_capped: bool,
+    /// Current adaptive bulk-read budget (bytes) and the throughput estimate
+    /// (bytes/ms) it's derived from — so the HUD shows the self-tuning.
+    pub byte_budget: u32,
+    pub throughput_bpms: f32,
     pub last_error: Option<&'static str>,
 }
 
@@ -121,6 +133,19 @@ pub fn spawn(
 
     tokio::spawn(async move {
         let mut cycle: u64 = 0;
+        // Adaptive bulk-read budget state, carried across cycles.
+        //   `budget`     — current cap on bytes per bulk MultiRead.
+        //   `throughput` — EWMA of observed bytes/ms (drives the estimate;
+        //                  None until the first non-trivial measurement).
+        // AIMD on the observed bulk RTT vs the frame budget: a fast
+        // multiplicative cut on overrun (kills the spikes you saw), a slow
+        // additive grow when we have headroom (reclaims bandwidth). Deferred
+        // low-priority reads naturally spread over later cycles.
+        let mut budget: u32 = {
+            let c = config.lock();
+            c.min_byte_budget.max(2048).min(c.max_byte_budget)
+        };
+        let mut throughput: Option<f32> = None;
         loop {
             let cfg = config.lock().clone();
             let cycle_start = Instant::now();
@@ -187,14 +212,17 @@ pub fn spawn(
 
             let mut reads = coalesce(&due, cfg.coalesce_gap);
 
-            // Enforce the byte budget. coalesce preserves registry id order,
-            // and the prelude registers hotter data earlier, so trimming the
-            // tail sheds the lowest-priority bulk reads first.
-            let mut budget = cfg.byte_budget;
+            // Enforce the *adaptive* byte budget. coalesce preserves registry
+            // id order and the prelude registers hotter data earlier, so
+            // trimming the tail sheds the lowest-priority bulk reads first;
+            // those deferred reads are simply picked up on later cycles
+            // (this is what spreads block-data streaming over time instead
+            // of one frame-blowing burst).
+            let mut remaining = budget;
             let mut budget_capped = false;
             reads.retain(|r| {
-                if r.region.size <= budget {
-                    budget -= r.region.size;
+                if r.region.size <= remaining {
+                    remaining -= r.region.size;
                     true
                 } else {
                     budget_capped = true;
@@ -223,6 +251,21 @@ pub fn spawn(
                 }
             }
 
+            // --- Adaptive budget update (AIMD against the frame target) ----
+            // Only adjust on a real measurement (bytes actually moved). The
+            // realtime sub-poll's RTT is excluded — its cost is tiny and
+            // attributing it here would shrink the bulk budget for no reason.
+            if bytes_requested > 0 && last_error.is_none() {
+                let inst_bpms =
+                    bytes_requested as f32 / rtt_ms.max(1) as f32;
+                throughput = Some(match throughput {
+                    Some(t) => cfg.rtt_alpha * inst_bpms
+                        + (1.0 - cfg.rtt_alpha) * t,
+                    None => inst_bpms,
+                });
+                budget = next_budget(budget, rtt_ms, throughput, &cfg);
+            }
+
             let snap = builder.build(cycle, rtt_ms, rtt_ms);
             current.store(Arc::new(snap));
 
@@ -232,6 +275,8 @@ pub fn spawn(
                 st.watches = watches.len();
                 st.reads_last_cycle = reads.len();
                 st.bytes_last_cycle = bytes_requested;
+                st.byte_budget = budget;
+                st.throughput_bpms = throughput.unwrap_or(0.0);
                 st.realtime_watches = realtime_count;
                 st.realtime_rtt_ms = realtime_rtt;
                 st.last_rtt_ms = rtt_ms;
@@ -258,6 +303,36 @@ pub fn spawn(
     });
 
     engine
+}
+
+/// One AIMD step for the adaptive bulk-read budget.
+///
+/// * **Overran the frame** (`rtt > frame_budget_ms`): multiplicative cut,
+///   scaled by how badly we overshot — a big spike drops the budget hard so
+///   the next bulk read fits, instead of repeating the stall.
+/// * **Under budget**: additive grow, capped at what the measured throughput
+///   says fits in 80% of a frame — probe bandwidth back gently rather than
+///   jumping straight back to a spike.
+///
+/// Pure so it can be unit-tested for convergence and backoff.
+fn next_budget(
+    budget: u32,
+    rtt_ms: u32,
+    throughput: Option<f32>,
+    cfg: &PollConfig,
+) -> u32 {
+    let frame_ms = cfg.frame_budget_ms.max(1) as f32;
+    let b = budget as f32;
+    let next = if rtt_ms > cfg.frame_budget_ms {
+        let overshoot = (rtt_ms.max(1) as f32 / frame_ms).min(4.0);
+        (b * (0.5 / overshoot).max(0.2)).max(0.0)
+    } else {
+        let ceil = throughput.map(|t| t * frame_ms * 0.8).unwrap_or(b);
+        let step = (cfg.max_byte_budget as f32 * 0.05).max(256.0);
+        // Grow additively toward the throughput ceiling; never shrink here.
+        (b + step).min(ceil.max(b))
+    };
+    (next as u32).clamp(cfg.min_byte_budget, cfg.max_byte_budget)
 }
 
 /// Slice each coalesced blob back to its member watches and write them into
@@ -297,4 +372,83 @@ fn classify_err(e: &sni_client::SniError) -> &'static str {
 #[allow(unused)]
 fn _priority_doc(p: WatchPriority) -> u64 {
     p.period()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> PollConfig {
+        PollConfig {
+            frame_budget_ms: 16,
+            min_byte_budget: 256,
+            max_byte_budget: 64 * 1024,
+            ..PollConfig::default()
+        }
+    }
+
+    #[test]
+    fn overrun_cuts_budget_hard() {
+        let c = cfg();
+        // 40ms RTT on a 16ms frame: ~2.5x overshoot -> sharp cut.
+        let next = next_budget(16_000, 40, Some(400.0), &c);
+        assert!(next < 16_000 / 2, "spike must drop budget hard: {next}");
+        assert!(next >= c.min_byte_budget);
+    }
+
+    #[test]
+    fn bigger_overshoot_cuts_harder() {
+        let c = cfg();
+        let mild = next_budget(16_000, 20, Some(800.0), &c);
+        let severe = next_budget(16_000, 64, Some(250.0), &c);
+        assert!(
+            severe < mild,
+            "worse overshoot should cut more: {severe} vs {mild}"
+        );
+    }
+
+    #[test]
+    fn under_budget_grows_but_capped_by_throughput() {
+        let c = cfg();
+        // Comfortably under frame; throughput ~500 B/ms -> ceil =
+        // 500 * 16 * 0.8 = 6400 bytes. From 4000 it grows toward that.
+        let next = next_budget(4000, 8, Some(500.0), &c);
+        assert!(next > 4000, "should grow when we have headroom");
+        assert!(next <= 6400, "must not exceed throughput ceiling: {next}");
+    }
+
+    #[test]
+    fn converges_and_is_stable_at_the_throughput_point() {
+        let c = cfg();
+        // Simulate: link does ~500 B/ms, frame target 16ms. Steady state
+        // should settle near the 80%-frame ceiling (~6400) and not oscillate
+        // wildly. Model rtt = bytes / throughput.
+        let tput = 500.0;
+        let mut budget = 2048u32;
+        for _ in 0..200 {
+            let rtt = (budget as f32 / tput).ceil() as u32;
+            budget = next_budget(budget, rtt, Some(tput), &c);
+        }
+        // At ~6400 bytes, rtt ≈ 13ms (< 16) so it stays; allow some band.
+        assert!(
+            (4000..=9000).contains(&budget),
+            "should converge near throughput point, got {budget}"
+        );
+    }
+
+    #[test]
+    fn budget_respects_floor_and_ceiling() {
+        let c = cfg();
+        // Catastrophic RTT from min: clamps at floor, never 0.
+        let lo = next_budget(c.min_byte_budget, 500, Some(1.0), &c);
+        assert_eq!(lo, c.min_byte_budget);
+        // Huge throughput can't push past the ceiling.
+        let hi = next_budget(
+            c.max_byte_budget,
+            1,
+            Some(1_000_000.0),
+            &c,
+        );
+        assert_eq!(hi, c.max_byte_budget);
+    }
 }

@@ -13,6 +13,12 @@ pub struct Config {
     /// watches into one MultiRead per cycle; lower = fresher but more load on
     /// the FXPAK's limited bandwidth.
     pub poll_interval_ms: u64,
+    /// Latency target (ms) for the adaptive bulk-read budget. The engine
+    /// reads as much as it can while keeping each bulk MultiRead's round
+    /// trip at/under this, backing off hard when it overshoots. 16 ≈ one
+    /// 60fps frame; raise it to let block data refresh faster at the cost
+    /// of occasional longer cycles.
+    pub frame_budget_ms: u32,
     /// Capture mode: "composited" or "transparent".
     pub capture_mode: String,
     /// Capture device index (composited mode). Capture cards enumerate as
@@ -54,6 +60,7 @@ impl Default for Config {
         Self {
             sni_endpoint: format!("http://127.0.0.1:{}", sni_client::DEFAULT_GRPC_PORT),
             poll_interval_ms: 16, // ~60 logical poll cycles/sec target
+            frame_budget_ms: 16,  // adaptive budget keeps bulk reads ≤ 1 frame
             capture_mode: "composited".to_string(),
             capture_device: 0,
             capture_width: 0,
