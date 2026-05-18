@@ -28,7 +28,13 @@
       "PowerShell(Get-Process sni-lua -ErrorAction SilentlyContinue)",
       "PowerShell(Stop-Process -Force)",
       "PowerShell(cmd /c '\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\" >nul 2>&1 && set \"NoDefaultCurrentDirectoryInExePath=\" && cargo test -p sni-render 2>&1 | findstr /C:\"test result\" /C:\"test paint\" & cargo build 2>&1')",
-      "PowerShell($p = Start-Process -FilePath \"F:\\\\Code\\\\sni-lua\\\\target\\\\debug\\\\sni-lua.exe\" -PassThru; Start-Sleep -Seconds 4; if \\($p.HasExited\\) { \"EXITED EARLY code=$\\($p.ExitCode\\)\" } else { \"RUNNING ok \\(pid $\\($p.Id\\)\\) — closing\"; $p.CloseMainWindow\\(\\) | Out-Null; Start-Sleep -Seconds 1; if \\(-not $p.HasExited\\) { $p | Stop-Process -Force } })"
+      "PowerShell($p = Start-Process -FilePath \"F:\\\\Code\\\\sni-lua\\\\target\\\\debug\\\\sni-lua.exe\" -PassThru; Start-Sleep -Seconds 4; if \\($p.HasExited\\) { \"EXITED EARLY code=$\\($p.ExitCode\\)\" } else { \"RUNNING ok \\(pid $\\($p.Id\\)\\) — closing\"; $p.CloseMainWindow\\(\\) | Out-Null; Start-Sleep -Seconds 1; if \\(-not $p.HasExited\\) { $p | Stop-Process -Force } })",
+      "PowerShell(\"User PATH len:    \" + \\([Environment]::GetEnvironmentVariable\\('Path','User'\\)\\).Length; \"Machine PATH len: \" + \\([Environment]::GetEnvironmentVariable\\('Path','Machine'\\)\\).Length; \"Combined len:     \" + $env:Path.Length; \"vcvars exists:    \" + \\(Test-Path 'C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat'\\))",
+      "PowerShell($env:NoDefaultCurrentDirectoryInExePath=$null; cargo build -p sni-client 2>&1 | Select-Object -Last 3)",
+      "PowerShell($env:NoDefaultCurrentDirectoryInExePath=$null; cargo clean -p mlua-sys 2>&1 | Out-Null; cargo build -p sni-lua-api 2>&1 | Select-Object -Last 5)",
+      "PowerShell(cargo clean -p mlua-sys 2>&1)",
+      "PowerShell(cmd /c \".\\\\build.cmd build -p sni-lua-api\" 2>&1)",
+      "PowerShell(.\\\\build.ps1 build 2>&1)"
     ]
   }
 }

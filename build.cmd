@@ -1,28 +1,21 @@
 @echo off
-REM Build/run sni-lua inside the MSVC developer environment.
-REM LuaJIT's vendored build (msvcbuild.bat) requires a full MSVC dev shell,
-REM not just cl.exe on PATH -- it invokes the freshly built `minilua` by bare
-REM name. vcvars64 sets up the environment so that works.
-
-set "VCVARS=C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-if not exist "%VCVARS%" (
-  echo [build.cmd] vcvars64.bat not found at "%VCVARS%"
-  exit /b 1
-)
-
-call "%VCVARS%" >nul
-if errorlevel 1 (
-  echo [build.cmd] failed to initialize MSVC environment
-  exit /b 1
-)
-
-REM LuaJIT's vendored msvcbuild.bat invokes the just-built `minilua` by bare
-REM name, relying on cmd.exe resolving it from the current directory. This
-REM machine has NoDefaultCurrentDirectoryInExePath=1 set, which disables that
-REM and breaks the LuaJIT build. Clear it for child processes.
+setlocal
+REM Build/run sni-lua.
+REM
+REM We deliberately do NOT call vcvars64.bat. It prepends ~2KB of tool paths
+REM to PATH every invocation; chained inside cmd it overflows the ~8191-char
+REM command-line limit ("The input line is too long"). It is also unnecessary:
+REM the `cc` crate locates MSVC via the registry on its own, and a clean
+REM LuaJIT (mlua-sys) build succeeds without a full dev shell.
+REM
+REM The ONLY thing the vendored LuaJIT build actually needs is for
+REM NoDefaultCurrentDirectoryInExePath to be unset, so LuaJIT's msvcbuild.bat
+REM can invoke the just-built `minilua` by bare name from the build dir.
+REM (Clearing it here only affects this build's child processes.)
 set "NoDefaultCurrentDirectoryInExePath="
 
 REM Pass all args through to cargo, e.g.:
 REM   build.cmd check --workspace
 REM   build.cmd run --release
 cargo %*
+endlocal
