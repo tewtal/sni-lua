@@ -36,7 +36,14 @@
       "PowerShell(cmd /c \".\\\\build.cmd build -p sni-lua-api\" 2>&1)",
       "PowerShell(.\\\\build.ps1 build 2>&1)",
       "PowerShell(.\\\\build.ps1 build 2>&1 | Select-Object -Last 3; $p = Start-Process -FilePath \"F:\\\\Code\\\\sni-lua\\\\target\\\\debug\\\\sni-lua.exe\" -PassThru; Start-Sleep -Seconds 4; if \\($p.HasExited\\) { \"EXITED EARLY code=$\\($p.ExitCode\\)\" } else { \"RUNNING ok — closing\"; $p.CloseMainWindow\\(\\) | Out-Null; Start-Sleep -Seconds 1; if \\(-not $p.HasExited\\) { $p | Stop-Process -Force } })",
-      "PowerShell(.\\\\build.ps1 build 2>&1 | Select-String -Pattern \"error|warning: unused|Finished\" | Select-Object -Last 4; $p = Start-Process \"F:\\\\Code\\\\sni-lua\\\\target\\\\debug\\\\sni-lua.exe\" -PassThru; Start-Sleep -Seconds 4; if \\($p.HasExited\\) { \"EXITED code=$\\($p.ExitCode\\)\" } else { \"RUNNING ok\"; $p.CloseMainWindow\\(\\)|Out-Null; Start-Sleep 1; if\\(-not $p.HasExited\\){$p|Stop-Process -Force} })"
+      "PowerShell(.\\\\build.ps1 build 2>&1 | Select-String -Pattern \"error|warning: unused|Finished\" | Select-Object -Last 4; $p = Start-Process \"F:\\\\Code\\\\sni-lua\\\\target\\\\debug\\\\sni-lua.exe\" -PassThru; Start-Sleep -Seconds 4; if \\($p.HasExited\\) { \"EXITED code=$\\($p.ExitCode\\)\" } else { \"RUNNING ok\"; $p.CloseMainWindow\\(\\)|Out-Null; Start-Sleep 1; if\\(-not $p.HasExited\\){$p|Stop-Process -Force} })",
+      "WebSearch",
+      "WebFetch(domain:crates.io)",
+      "Bash(curl -s \"https://index.crates.io/no/kh/nokhwa\")",
+      "Bash(python -c \"import sys,json; d=json.loads\\(sys.stdin.read\\(\\)\\); print\\('version:', d['vers']\\); print\\('features:', list\\(d.get\\('features',{}\\).keys\\(\\)\\)\\)\")",
+      "Bash(curl -s \"https://crates.io/api/v1/crates/nokhwa\")",
+      "Bash(python -c \"import sys,json;d=json.load\\(sys.stdin\\);print\\(d['crate']['max_stable_version']\\)\")",
+      "PowerShell($p = Start-Process \"F:\\\\Code\\\\sni-lua\\\\target\\\\debug\\\\sni-lua.exe\" -PassThru; Start-Sleep -Seconds 5; if \\($p.HasExited\\) { \"EXITED EARLY code=$\\($p.ExitCode\\)\" } else { \"RUNNING ok \\(capture thread + UI alive\\)\"; $p.CloseMainWindow\\(\\)|Out-Null; Start-Sleep 2; if\\(-not $p.HasExited\\){$p|Stop-Process -Force; \"force-killed\"} else {\"clean exit\"} })"
     ]
   }
 }

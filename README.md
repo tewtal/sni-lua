@@ -37,7 +37,7 @@ sni-lua is built around that constraint:
 | M3 | Watch registry, snapshot cache, async poll engine | ✅ |
 | M4 | Unified async-aware Lua API (`snes.*`, `gfx.*`, lifecycle) | ✅ |
 | M5 | Overlay renderer (text, rect, line, hitbox; 5x7 + 8x8 fonts) | ✅ |
-| M6 | Capture modes: composited + transparent click-through | ⏳ |
+| M6 | Capture modes: composited + transparent click-through | ✅ |
 
 ## Build & run
 
@@ -78,6 +78,28 @@ See `examples/hires_grid.lua` for a 2x demo.
 
 > Note: there is intentionally no supersampling/AA knob — the overlay is
 > deliberately crisp pixel art; canvas resolution is the higher-res lever.
+
+### Capture background
+
+**Capture → Mode** selects how the game video gets behind the overlay:
+
+* **Composited** — the app opens a capture device (HDMI/USB capture card;
+  these enumerate as webcam-class devices) and draws the overlay on top
+  in-window. Pick the device under **Capture → Device**; *Rescan* re-enumerates.
+  Capture runs on a background thread holding only the newest frame
+  (latest-wins, stale dropped) so a slow device read never stalls the
+  overlay — the same non-blocking philosophy as the SNI pipeline.
+* **Transparent overlay** — the app becomes a borderless, transparent,
+  always-on-top, **click-through** window. Place it over your own capture
+  software (OBS, etc.); no device is opened. Switching mode is live, but the
+  borderless/transparent *window style* is decided at launch, so **restart
+  the app after switching to/from transparent mode** for the window itself to
+  change (click-through styling is applied live).
+
+Caveats: click-through uses Win32 `WS_EX_TRANSPARENT|WS_EX_LAYERED` and is
+**Windows-only** — other platforms run composited fine but the transparent
+window won't be click-through (logged on startup). Some capture cards expose
+only certain resolutions/FPS; the highest-FPS format is requested.
 
 ## Layout
 

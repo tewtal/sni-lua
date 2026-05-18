@@ -15,6 +15,9 @@ pub struct Config {
     pub poll_interval_ms: u64,
     /// Capture mode: "composited" or "transparent".
     pub capture_mode: String,
+    /// Capture device index (composited mode). Capture cards enumerate as
+    /// webcam-class devices.
+    pub capture_device: u32,
     /// Last loaded script path, restored on launch.
     pub last_script: Option<PathBuf>,
     /// Canvas (script coordinate space) policy:
@@ -37,6 +40,7 @@ impl Default for Config {
             sni_endpoint: format!("http://127.0.0.1:{}", sni_client::DEFAULT_GRPC_PORT),
             poll_interval_ms: 16, // ~60 logical poll cycles/sec target
             capture_mode: "composited".to_string(),
+            capture_device: 0,
             last_script: None,
             canvas_mode: "script".to_string(),
             text_sizing_mode: "game".to_string(),

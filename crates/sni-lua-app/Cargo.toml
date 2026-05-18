@@ -26,3 +26,13 @@ serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true
 arc-swap.workspace = true
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+# Applying WS_EX_TRANSPARENT|WS_EX_LAYERED to the HWND for true click-through
+# in transparent-overlay mode (eframe handles transparent/topmost/no-decor,
+# but not click-through).
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }

@@ -6,3 +6,8 @@ license.workspace = true
 
 [dependencies]
 tracing.workspace = true
+parking_lot.workspace = true
+arc-swap.workspace = true
+# input-native -> MediaFoundation on Windows (capture cards present as a
+# webcam-class device). decoding -> MJPEG/YUYV -> RGB (what dongles emit).
+nokhwa = { version = "0.10", features = ["input-native", "decoding"] }

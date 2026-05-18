@@ -8,6 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod platform;
 mod sni_actor;
 
 use std::sync::Arc;
@@ -55,11 +56,25 @@ fn main() -> eframe::Result<()> {
     let rt = Runtime::new().expect("failed to start tokio runtime");
     let _guard = rt.enter();
 
+    // Decide window style up front: transparent-overlay mode needs a
+    // borderless, transparent, always-on-top window (click-through is added
+    // at the Win32 level once the HWND exists).
+    let start_cfg = Config::load();
+    let transparent = start_cfg.capture_mode == "transparent";
+
+    let mut vb = egui::ViewportBuilder::default()
+        .with_inner_size([960.0, 720.0])
+        .with_min_inner_size([640.0, 480.0])
+        .with_title("sni-lua — SNES overlay scripting over SNI");
+    if transparent {
+        vb = vb
+            .with_transparent(true)
+            .with_decorations(false)
+            .with_always_on_top();
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 720.0])
-            .with_min_inner_size([640.0, 480.0])
-            .with_title("sni-lua — SNES overlay scripting over SNI"),
+        viewport: vb,
         ..Default::default()
     };
 
@@ -88,6 +103,17 @@ struct App {
     // Live memory inspector (M2 demo of real reads + latency).
     probe_addr_hex: String,
     probe_size: u32,
+
+    // Capture (M6). Source runs only in composited mode; transparent mode
+    // opens no device and relies on window transparency instead.
+    capture: Option<sni_capture::CaptureSource>,
+    capture_devices: Vec<sni_capture::DeviceDesc>,
+    capture_tex: Option<egui::TextureHandle>,
+    /// seq of the frame currently in `capture_tex`, to skip redundant
+    /// GPU uploads when the device frame hasn't advanced.
+    capture_tex_seq: u64,
+    /// Set once we've applied the transparent-window Win32 styling.
+    transparent_applied: bool,
 }
 
 impl App {
@@ -129,6 +155,17 @@ impl App {
             Err(e) => format!("LuaJIT FAILED: {e}"),
         };
 
+        // Enumerate capture devices once at startup (cheap; refreshable from
+        // the UI). Open the source only in composited mode.
+        let capture_devices = sni_capture::list_devices();
+        let capture = if sni_capture::CaptureMode::parse(&config.capture_mode)
+            == sni_capture::CaptureMode::Composited
+        {
+            Some(sni_capture::CaptureSource::open(config.capture_device))
+        } else {
+            None
+        };
+
         let mut app = Self {
             _rt: rt,
             config: config.clone(),
@@ -149,6 +186,11 @@ impl App {
             // FxPakPro space that's $F5_0AF6.
             probe_addr_hex: "F50AF6".to_string(),
             probe_size: 2,
+            capture,
+            capture_devices,
+            capture_tex: None,
+            capture_tex_seq: 0,
+            transparent_applied: false,
         };
         // Auto-load the last script if one was remembered.
         if !app.script_path.is_empty() {
@@ -217,13 +259,82 @@ impl App {
         self.host.set_canvas(c);
         c
     }
+
+    /// (Re)open the capture source to match the current mode + device.
+    /// Composited opens the device; transparent closes it (the window's
+    /// transparency provides the "background" instead).
+    fn restart_capture(&mut self) {
+        // Dropping the old source stops its thread cleanly first.
+        self.capture = None;
+        self.capture_tex = None;
+        self.capture_tex_seq = 0;
+        if sni_capture::CaptureMode::parse(&self.config.capture_mode)
+            == sni_capture::CaptureMode::Composited
+        {
+            self.capture = Some(sni_capture::CaptureSource::open(
+                self.config.capture_device,
+            ));
+        }
+    }
+
+    /// Upload the latest capture frame into an egui texture (only when the
+    /// frame actually advanced) and return its handle for drawing.
+    fn capture_texture(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<&egui::TextureHandle> {
+        let frame = self.capture.as_ref()?.latest()?;
+        if self.capture_tex.is_none() || frame.seq != self.capture_tex_seq {
+            let img = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width as usize, frame.height as usize],
+                &frame.pixels,
+            );
+            let opts = egui::TextureOptions {
+                // Nearest keeps the captured pixel art crisp, matching the
+                // overlay's deliberate hard-edged look.
+                magnification: egui::TextureFilter::Nearest,
+                minification: egui::TextureFilter::Linear,
+                ..Default::default()
+            };
+            match &mut self.capture_tex {
+                Some(t) => t.set(img, opts),
+                None => {
+                    self.capture_tex = Some(ctx.load_texture(
+                        "capture",
+                        img,
+                        opts,
+                    ));
+                }
+            }
+            self.capture_tex_seq = frame.seq;
+        }
+        self.capture_tex.as_ref()
+    }
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Keep the UI repainting while connected so probe results / future
-        // poll snapshots stay live without user input.
-        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Keep the UI repainting so capture frames / poll snapshots stay live
+        // without user input.
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+
+        // In transparent-overlay mode, apply Win32 click-through once the
+        // window exists. Re-applied if the mode toggles at runtime.
+        let want_transparent =
+            self.config.capture_mode == "transparent";
+        if want_transparent && !self.transparent_applied {
+            if platform::set_click_through(frame, true) {
+                tracing::info!("transparent overlay: click-through enabled");
+            } else {
+                tracing::warn!(
+                    "click-through not available on this platform/build"
+                );
+            }
+            self.transparent_applied = true;
+        } else if !want_transparent && self.transparent_applied {
+            platform::set_click_through(frame, false);
+            self.transparent_applied = false;
+        }
 
         let snap = {
             // Short-lived clone of the actor state; never hold the lock across
@@ -438,6 +549,91 @@ impl eframe::App for App {
                     .small()
                     .weak(),
                 );
+
+                ui.add_space(12.0);
+                ui.heading("Capture");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Mode");
+                    let mut m = self.config.capture_mode.clone();
+                    egui::ComboBox::from_id_salt("capture_mode")
+                        .selected_text(if m == "transparent" {
+                            "Transparent overlay"
+                        } else {
+                            "Composited"
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut m,
+                                "composited".into(),
+                                "Composited (capture feed in-app)",
+                            );
+                            ui.selectable_value(
+                                &mut m,
+                                "transparent".into(),
+                                "Transparent overlay (over your own capture)",
+                            );
+                        });
+                    if m != self.config.capture_mode {
+                        self.config.capture_mode = m;
+                        self.config.save();
+                        self.restart_capture();
+                        self.transparent_applied = false; // re-apply styling
+                    }
+                });
+
+                if self.config.capture_mode == "composited" {
+                    ui.horizontal(|ui| {
+                        ui.label("Device");
+                        let cur = self
+                            .capture_devices
+                            .iter()
+                            .find(|d| d.index == self.config.capture_device)
+                            .map(|d| d.name.clone())
+                            .unwrap_or_else(|| {
+                                format!("#{}", self.config.capture_device)
+                            });
+                        let mut chosen = self.config.capture_device;
+                        egui::ComboBox::from_id_salt("capture_dev")
+                            .selected_text(cur)
+                            .show_ui(ui, |ui| {
+                                for d in &self.capture_devices {
+                                    ui.selectable_value(
+                                        &mut chosen,
+                                        d.index,
+                                        format!("{} (#{})", d.name, d.index),
+                                    );
+                                }
+                            });
+                        if chosen != self.config.capture_device {
+                            self.config.capture_device = chosen;
+                            self.config.save();
+                            self.restart_capture();
+                        }
+                    });
+                    if ui.small_button("↻ Rescan devices").clicked() {
+                        self.capture_devices = sni_capture::list_devices();
+                    }
+                    if self.capture_devices.is_empty() {
+                        ui.label(
+                            egui::RichText::new(
+                                "No capture devices found. Plug in your \
+                                 HDMI/USB capture card and rescan.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "Window is transparent + always-on-top. Place it \
+                             over your capture software; clicks pass through.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
 
                 ui.add_space(12.0);
                 ui.heading("Device");
@@ -655,13 +851,39 @@ impl eframe::App for App {
                 });
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        // Resolve everything that needs &mut self / ctx before the egui
+        // closure (which borrows self immutably).
+        let transparent = sni_capture::CaptureMode::parse(&self.config.capture_mode)
+            == sni_capture::CaptureMode::TransparentOverlay;
+        let cap_tex = if transparent {
+            None
+        } else {
+            self.capture_texture(ctx).map(|t| t.id())
+        };
+        let sizing = self.text_sizing();
+        let loaded = self.host.is_loaded();
+
+        let mut central = egui::CentralPanel::default();
+        if transparent {
+            // No backdrop in transparent mode — the desktop/your capture
+            // software shows through the window instead.
+            central = central.frame(
+                egui::Frame::none().fill(egui::Color32::TRANSPARENT),
+            );
+        }
+        central.show(ctx, |ui| {
             let avail = ui.available_size();
             let (rect, _resp) =
                 ui.allocate_exact_size(avail, egui::Sense::hover());
             let painter = ui.painter_at(rect);
-            // Backdrop behind everything (M6's capture feed will fill here).
-            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 18, 22));
+
+            if !transparent {
+                painter.rect_filled(
+                    rect,
+                    0.0,
+                    egui::Color32::from_rgb(18, 18, 22),
+                );
+            }
 
             // Map the active script canvas onto the available area,
             // letterboxed. A higher-res canvas lands in the same screen
@@ -669,26 +891,64 @@ impl eframe::App for App {
             let vp = sni_render::Viewport::fit(rect, active_canvas);
             let view = vp.screen_rect();
 
-            // Placeholder "screen" so the overlay reads against something
-            // until the capture device is wired in M6.
-            painter.rect_filled(view, 0.0, egui::Color32::from_rgb(8, 10, 16));
-            painter.rect_stroke(
-                view,
-                0.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
-            );
-
-            // Paint the script's draw list in SNES coords with the user's
-            // text sizing preference.
-            sni_render::paint(&painter, &vp, &self.draw_list, self.text_sizing());
-
-            if !self.host.is_loaded() {
+            if transparent {
+                // Faint guide so the user can place the window; not painted
+                // opaque so it stays see-through.
+                painter.rect_stroke(
+                    view,
+                    0.0,
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(
+                            120, 120, 120, 60,
+                        ),
+                    ),
+                );
+            } else if let Some(tex) = cap_tex {
+                // Composited: draw the capture feed to fill the canvas rect,
+                // overlay goes on top. Same rect as the overlay viewport so
+                // script pixel coords line up with the game pixels.
+                painter.image(
+                    tex,
+                    view,
+                    egui::Rect::from_min_max(
+                        egui::pos2(0.0, 0.0),
+                        egui::pos2(1.0, 1.0),
+                    ),
+                    egui::Color32::WHITE,
+                );
+            } else {
+                // No device frame yet — placeholder screen so the overlay
+                // still reads against something.
+                painter.rect_filled(
+                    view,
+                    0.0,
+                    egui::Color32::from_rgb(8, 10, 16),
+                );
+                painter.rect_stroke(
+                    view,
+                    0.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+                );
                 painter.text(
                     view.center(),
                     egui::Align2::CENTER_CENTER,
-                    "No script running.\nSet a Lua path and click Load.",
-                    egui::FontId::proportional(14.0),
+                    "Waiting for capture device…\n(pick one under Capture)",
+                    egui::FontId::proportional(13.0),
                     egui::Color32::from_gray(110),
+                );
+            }
+
+            // Overlay always on top of whatever background.
+            sni_render::paint(&painter, &vp, &self.draw_list, sizing);
+
+            if !loaded && !transparent {
+                painter.text(
+                    egui::pos2(view.center().x, view.min.y + 16.0),
+                    egui::Align2::CENTER_CENTER,
+                    "No script running. Set a Lua path and click Load.",
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_gray(120),
                 );
             }
         });
