@@ -239,8 +239,34 @@ function emu.write16(addr, value, _memType)
     end
 end
 
-emu.framecount_n = 0
-function emu.framecount() return emu.framecount_n end
+-- emu.framecount(): the CONSOLE's frame clock, not our render loop.
+--
+-- Over SNI we are a latency-bound external observer -- we cannot see every
+-- console frame (the poll RTT means we sample ~50/sec of a 60fps game). A
+-- self-incremented render counter would be OUR cadence and would drift vs
+-- the console, breaking any "frames since X" math. Instead we report Super
+-- Metroid's own NMI frame counter at $7E:05B8 (a 16-bit value the engine
+-- bumps every NMI regardless of pause/door/menu state -- monotonic and
+-- console-paced). It is read at REALTIME tier so it tracks as closely as
+-- the link allows; it will jump by 1-3 when RTT lags, but elapsed-frame
+-- arithmetic stays game-accurate (we never invent intermediate values).
+--
+-- $05B8 is the low word; SM also keeps a high word at $05BA for a 32-bit
+-- count that won't wrap for ~828 days of play -- we combine both so long
+-- sessions don't see the 16-bit rollover (~18 min) corrupt a delta.
+local FRAMECOUNT_FALLBACK = 0     -- our tick, used only until SNI fills in
+
+function emu.framecount()
+    local lo = read_n(0x7E05B8, 2, false)
+    local hi = read_n(0x7E05BA, 2, false)
+    local v = hi * 0x10000 + lo
+    if v == 0 then
+        -- Pre-connect / cache cold: fall back to our render tick so the
+        -- value is still monotonic and non-nil for the script's logging.
+        return FRAMECOUNT_FALLBACK
+    end
+    return v
+end
 
 function emu.log(msg) print(tostring(msg)) end
 function emu.displayMessage(_cat, msg) print(tostring(msg)) end
@@ -366,12 +392,22 @@ function on_init()
     tier_cpu(0x7E008F, "realtime")
     tier_cpu(0x7E0090, "realtime")
 
-    print("controller mirror @ realtime tier ($7E:008B/$008F)")
+    -- SM NMI frame counter ($7E:05B8 lo, $05BA hi) at realtime so
+    -- emu.framecount() tracks the console's clock as tightly as the link
+    -- allows (see emu.framecount above for why this, not our render tick).
+    tier_cpu(0x7E05B8, "realtime")
+    tier_cpu(0x7E05B9, "realtime")
+    tier_cpu(0x7E05BA, "realtime")
+    tier_cpu(0x7E05BB, "realtime")
+
+    print("controller mirror @ realtime ($7E:008B/$008F)")
+    print("frame clock = SNES NMI counter $7E:05B8 @ realtime")
     print("rendering runs at full rate from cache; data streams in by tier")
 end
 
 function on_frame()
-    emu.framecount_n = emu.framecount_n + 1
+    -- Advance the pre-connect fallback only (real count comes from $05B8).
+    FRAMECOUNT_FALLBACK = FRAMECOUNT_FALLBACK + 1
     if _paint_cb then
         _paint_cb()
     end
