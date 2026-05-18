@@ -1,0 +1,210 @@
+//! Background SNI actor.
+//!
+//! The egui UI thread must never `.await` or block on the FXPAK. All SNI work
+//! happens on this Tokio task; the UI talks to it over an mpsc command channel
+//! and observes results through a shared, lock-light [`SniState`] snapshot.
+//!
+//! This is the seam the M3 poll engine plugs into: the actor already owns the
+//! connected [`SniClient`] and the selected device URI.
+
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use sni_client::{DeviceInfo, MemRegion, MemoryMapping, SniClient};
+use tokio::sync::mpsc;
+
+/// Connection lifecycle as observed by the UI.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum ConnState {
+    #[default]
+    Disconnected,
+    Connecting,
+    /// Connected; may or may not have a device selected yet.
+    Connected,
+    Error(String),
+}
+
+/// A completed probe read, surfaced to the UI for the live memory inspector.
+#[derive(Debug, Clone, Default)]
+pub struct ProbeResult {
+    pub region: Option<MemRegion>,
+    pub bytes: Vec<u8>,
+    pub error: Option<String>,
+    /// Round-trip time in milliseconds — the number that tells you how much
+    /// the poll engine has to hide.
+    pub rtt_ms: u32,
+}
+
+/// Shared state the UI reads each egui frame. Kept coarse and copy-cheap;
+/// guarded by a short-lived mutex (never held across `.await`).
+#[derive(Debug, Default)]
+pub struct SniState {
+    pub conn: ConnState,
+    pub devices: Vec<DeviceInfo>,
+    pub selected_uri: Option<String>,
+    pub mapping: Option<MemoryMapping>,
+    pub last_probe: ProbeResult,
+}
+
+pub type SharedState = Arc<Mutex<SniState>>;
+
+/// Commands the UI sends to the actor. Fire-and-forget; results land in
+/// [`SharedState`] and the UI polls them (egui is an immediate-mode loop).
+#[derive(Debug)]
+pub enum Cmd {
+    Connect { endpoint: String },
+    Disconnect,
+    RefreshDevices,
+    SelectDevice { uri: String },
+    /// One-shot read used by the live inspector to demonstrate latency.
+    Probe { region: MemRegion },
+}
+
+/// Handle the UI keeps. Dropping it stops the actor.
+pub struct SniHandle {
+    tx: mpsc::UnboundedSender<Cmd>,
+    pub state: SharedState,
+}
+
+impl SniHandle {
+    pub fn send(&self, cmd: Cmd) {
+        // Unbounded + UI-driven: a full channel would mean the actor is wedged;
+        // dropping the command is preferable to blocking the render thread.
+        let _ = self.tx.send(cmd);
+    }
+}
+
+/// Spawn the actor on the current Tokio runtime. Call inside `rt.enter()`.
+pub fn spawn() -> SniHandle {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let state: SharedState = Arc::new(Mutex::new(SniState::default()));
+    let actor_state = state.clone();
+    tokio::spawn(async move {
+        Actor {
+            state: actor_state,
+            client: None,
+        }
+        .run(rx)
+        .await;
+    });
+    SniHandle { tx, state }
+}
+
+struct Actor {
+    state: SharedState,
+    client: Option<SniClient>,
+}
+
+impl Actor {
+    async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Cmd>) {
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                Cmd::Connect { endpoint } => self.connect(endpoint).await,
+                Cmd::Disconnect => {
+                    self.client = None;
+                    let mut s = self.state.lock();
+                    *s = SniState::default();
+                }
+                Cmd::RefreshDevices => self.refresh_devices().await,
+                Cmd::SelectDevice { uri } => self.select_device(uri).await,
+                Cmd::Probe { region } => self.probe(region).await,
+            }
+        }
+        tracing::info!("SNI actor stopped (handle dropped)");
+    }
+
+    fn set_conn(&self, conn: ConnState) {
+        self.state.lock().conn = conn;
+    }
+
+    async fn connect(&mut self, endpoint: String) {
+        self.set_conn(ConnState::Connecting);
+        match SniClient::connect(endpoint.clone()).await {
+            Ok(client) => {
+                self.client = Some(client);
+                self.set_conn(ConnState::Connected);
+                tracing::info!("connected to SNI at {endpoint}");
+                // Auto-list so the UI has something immediately.
+                self.refresh_devices().await;
+            }
+            Err(e) => {
+                tracing::warn!("SNI connect failed: {e}");
+                self.set_conn(ConnState::Error(e.to_string()));
+            }
+        }
+    }
+
+    async fn refresh_devices(&mut self) {
+        let Some(client) = self.client.as_mut() else {
+            return;
+        };
+        match client.list_devices().await {
+            Ok(devices) => {
+                let mut s = self.state.lock();
+                // Keep selection if the device is still present; else pick the
+                // first device automatically (usually the only FXPAK).
+                let keep = s
+                    .selected_uri
+                    .as_ref()
+                    .filter(|u| devices.iter().any(|d| &d.uri == *u))
+                    .cloned();
+                s.selected_uri = keep.or_else(|| devices.first().map(|d| d.uri.clone()));
+                s.devices = devices;
+            }
+            Err(e) => self.set_conn(ConnState::Error(format!("list devices: {e}"))),
+        }
+        // If we just auto-selected, detect its mapping.
+        let sel = self.state.lock().selected_uri.clone();
+        if let Some(uri) = sel {
+            self.detect_mapping(&uri).await;
+        }
+    }
+
+    async fn select_device(&mut self, uri: String) {
+        self.state.lock().selected_uri = Some(uri.clone());
+        self.detect_mapping(&uri).await;
+    }
+
+    async fn detect_mapping(&mut self, uri: &str) {
+        let Some(client) = self.client.as_mut() else {
+            return;
+        };
+        match client.detect_mapping(uri).await {
+            Ok(m) => {
+                self.state.lock().mapping = Some(m);
+                tracing::info!("device {uri} mapping = {m:?}");
+            }
+            Err(e) => tracing::warn!("mapping detect failed for {uri}: {e}"),
+        }
+    }
+
+    async fn probe(&mut self, region: MemRegion) {
+        let uri = self.state.lock().selected_uri.clone();
+        let (Some(client), Some(uri)) = (self.client.as_mut(), uri) else {
+            self.state.lock().last_probe = ProbeResult {
+                region: Some(region),
+                error: Some("not connected / no device selected".into()),
+                ..Default::default()
+            };
+            return;
+        };
+        let t0 = std::time::Instant::now();
+        let result = client.single_read(&uri, region).await;
+        let rtt_ms = t0.elapsed().as_millis() as u32;
+        let probe = match result {
+            Ok(bytes) => ProbeResult {
+                region: Some(region),
+                bytes,
+                error: None,
+                rtt_ms,
+            },
+            Err(e) => ProbeResult {
+                region: Some(region),
+                bytes: Vec::new(),
+                error: Some(e.to_string()),
+                rtt_ms,
+            },
+        };
+        self.state.lock().last_probe = probe;
+    }
+}

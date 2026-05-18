@@ -215,3 +215,30 @@ impl SniClient {
         Ok(MemoryMapping::try_from(resp.memory_mapping).unwrap_or(MemoryMapping::Unknown))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wram_maps_into_fxpak_space() {
+        // SNES WRAM $7E:0000 lives at FxPakPro $F5_0000. Super Metroid's
+        // Samus X position is WRAM $7E:0AF6, so the helper must land at
+        // $F5_0AF6 in the FxPakPro space.
+        let r = MemRegion::wram(0x0AF6, 2);
+        assert_eq!(r.address, 0xF5_0AF6);
+        assert_eq!(r.size, 2);
+        assert_eq!(r.space, AddressSpace::FxPakPro);
+    }
+
+    #[test]
+    fn read_req_carries_space_and_mapping_discriminants() {
+        // The protobuf wire form uses i32 enum discriminants; a mismatch here
+        // would silently read the wrong device address space.
+        let req = MemRegion::fxpak(0x00_FFB0, 0x30).to_read_req();
+        assert_eq!(req.request_address, 0x00_FFB0);
+        assert_eq!(req.size, 0x30);
+        assert_eq!(req.request_address_space, AddressSpace::FxPakPro as i32);
+        assert_eq!(req.request_address_space, 0); // FxPakPro = 0 in sni.proto
+    }
+}
