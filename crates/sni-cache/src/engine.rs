@@ -14,7 +14,7 @@
 //! published snapshot instantly; the cost of talking to the FXPAK is paid
 //! here, amortized across every active watch, off the render thread.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -146,12 +146,12 @@ pub fn spawn(
             c.min_byte_budget.max(2048).min(c.max_byte_budget)
         };
         let mut throughput: Option<f32> = None;
-        // Round-robin cursor over the Low-priority (prefetch) reads. When the
-        // budget can't fit them all, we admit a *rotating* slice each cycle
-        // so the whole map/level streams in over successive cycles instead
-        // of the same low-address prefix always winning and the rest
-        // starving forever.
-        let mut low_cursor: usize = 0;
+        // Per-watch last-refreshed cycle. Drives stalest-first Low selection
+        // so deferred block/level data streams in completely and evenly, and
+        // stays correct as the registry grows mid-stream (a new watch has no
+        // entry → treated as maximally stale → read promptly). GC'd
+        // periodically against the live set so it can't grow unbounded.
+        let mut last_read: HashMap<u64, u64> = HashMap::new();
         loop {
             let cfg = config.lock().clone();
             let cycle_start = Instant::now();
@@ -203,70 +203,115 @@ pub fn spawn(
                 }
             }
 
-            // --- Tier 2: bulk batch ---------------------------------------
-            // Eligibility by tier:
-            //   High   — every cycle (fast-moving visuals).
-            //   Normal — every 3rd cycle.
-            //   Low    — ALWAYS eligible. Prefetch/block data must stream
-            //            continuously; gating it by a 12-cycle period meant
-            //            that when the budget trimmed it, it then waited 12
-            //            cycles to even be reconsidered and never caught up.
-            let due: Vec<_> = watches
+            // --- Tier 2: bulk DRAIN LOOP ----------------------------------
+            // The previous design issued ONE bulk read then slept the rest of
+            // the frame — wasting the whole window while deferred reads
+            // starved. Instead we keep issuing reads back-to-back until the
+            // frame-time budget for this cycle is spent:
+            //
+            //   * High/Normal are always eligible (no fixed cadence; the
+            //     staleness ordering paces Normal naturally — it's just less
+            //     stale than Low after a recent read).
+            //   * Within Low, stalest-first (longest since last refreshed),
+            //     so block/level data streams in completely and evenly; new
+            //     watches (registry grows as the script touches addresses)
+            //     are maximally stale and picked up promptly.
+            //   * Each admitted watch's last-read cycle is recorded so the
+            //     next selection skips what we just got and advances to the
+            //     next stalest — no index cursor to smear.
+            //
+            // Time budget for the whole cycle: frame_budget_ms, minus what
+            // the realtime sub-poll already spent. We stop issuing once
+            // we've used it (or there's nothing left / a single read would
+            // clearly overrun), then the adaptive byte budget is updated
+            // from the aggregate so it converges on "as much as fits".
+            let bulk_eligible: Vec<_> = watches
                 .iter()
-                .filter(|w| {
-                    !w.priority.is_realtime()
-                        && (w.priority == WatchPriority::Low
-                            || cycle % w.priority.period() == 0)
-                })
+                .filter(|w| !w.priority.is_realtime())
                 .cloned()
                 .collect();
 
-            let coalesced = coalesce(&due, cfg.coalesce_gap);
+            let frame_ms = cfg.frame_budget_ms.max(1) as u128;
+            let mut bytes_requested: u32 = 0;
+            let mut reads_issued: usize = 0;
+            let mut budget_capped = false;
+            let mut worst_rtt: u32 = 0;
 
-            // Priority-order, rotate the Low tail by the cursor, and trim to
-            // the adaptive budget. Pure + testable (the round-robin streaming
-            // guarantee is the fix for "burst then nothing").
-            let sel = select_bulk(coalesced, budget, low_cursor);
-            let reads = sel.reads;
-            let budget_capped = sel.capped;
-            low_cursor = sel.next_cursor;
+            loop {
+                // Time remaining in this cycle's window.
+                let spent = cycle_start.elapsed().as_millis();
+                if spent >= frame_ms {
+                    break;
+                }
 
-            let regions: Vec<_> = reads.iter().map(|r| r.region).collect();
-            let bytes_requested: u32 = regions.iter().map(|r| r.size).sum();
-            let rtt_ms;
+                let coalesced =
+                    coalesce(&bulk_eligible, cfg.coalesce_gap);
+                let sel =
+                    select_bulk(coalesced, budget, &last_read, cycle);
+                if sel.reads.is_empty() {
+                    break;
+                }
+                budget_capped |= sel.capped;
 
-            if regions.is_empty() {
-                rtt_ms = 0;
-            } else {
+                let regions: Vec<_> =
+                    sel.reads.iter().map(|r| r.region).collect();
+                let bytes: u32 =
+                    regions.iter().map(|r| r.size).sum();
+
                 let t0 = Instant::now();
                 match client.multi_read(&uri, &regions).await {
                     Ok(blobs) => {
-                        rtt_ms = t0.elapsed().as_millis() as u32;
-                        apply_reads(&reads, &blobs, &mut builder);
+                        let rtt = t0.elapsed().as_millis() as u32;
+                        worst_rtt = worst_rtt.max(rtt);
+                        apply_reads(&sel.reads, &blobs, &mut builder);
+                        // Mark every admitted watch read THIS cycle so the
+                        // next iteration moves on to the next stalest.
+                        for r in &sel.reads {
+                            for &(id, _, _) in &r.members {
+                                last_read.insert(id, cycle);
+                            }
+                        }
+                        bytes_requested =
+                            bytes_requested.saturating_add(bytes);
+                        reads_issued += 1;
+
+                        // Adaptive byte budget: converge so a single batch
+                        // fits the frame. Driven by the per-batch RTT.
+                        let inst_bpms =
+                            bytes as f32 / rtt.max(1) as f32;
+                        throughput = Some(match throughput {
+                            Some(tp) => cfg.rtt_alpha * inst_bpms
+                                + (1.0 - cfg.rtt_alpha) * tp,
+                            None => inst_bpms,
+                        });
+                        budget =
+                            next_budget(budget, rtt, throughput, &cfg);
+
+                        // If that batch already used most of the window,
+                        // don't start another that would overrun.
+                        if cycle_start.elapsed().as_millis() + rtt as u128
+                            >= frame_ms
+                        {
+                            break;
+                        }
                     }
                     Err(e) => {
-                        rtt_ms = t0.elapsed().as_millis() as u32;
+                        worst_rtt = worst_rtt
+                            .max(t0.elapsed().as_millis() as u32);
                         last_error = Some(classify_err(&e));
-                        tracing::debug!("poll multi_read failed: {e}");
+                        tracing::debug!("bulk multi_read failed: {e}");
+                        break;
                     }
+                }
+
+                // Everything caught up this cycle? Stop early; the leftover
+                // window becomes the inter-cycle sleep below.
+                if !sel.capped {
+                    break;
                 }
             }
 
-            // --- Adaptive budget update (AIMD against the frame target) ----
-            // Only adjust on a real measurement (bytes actually moved). The
-            // realtime sub-poll's RTT is excluded — its cost is tiny and
-            // attributing it here would shrink the bulk budget for no reason.
-            if bytes_requested > 0 && last_error.is_none() {
-                let inst_bpms =
-                    bytes_requested as f32 / rtt_ms.max(1) as f32;
-                throughput = Some(match throughput {
-                    Some(t) => cfg.rtt_alpha * inst_bpms
-                        + (1.0 - cfg.rtt_alpha) * t,
-                    None => inst_bpms,
-                });
-                budget = next_budget(budget, rtt_ms, throughput, &cfg);
-            }
-
+            let rtt_ms = worst_rtt;
             let snap = builder.build(cycle, rtt_ms, rtt_ms);
             current.store(Arc::new(snap));
 
@@ -274,7 +319,7 @@ pub fn spawn(
                 let mut st = stats.lock();
                 st.cycle = cycle;
                 st.watches = watches.len();
-                st.reads_last_cycle = reads.len();
+                st.reads_last_cycle = reads_issued;
                 st.bytes_last_cycle = bytes_requested;
                 st.byte_budget = budget;
                 st.throughput_bpms = throughput.unwrap_or(0.0);
@@ -291,12 +336,21 @@ pub fn spawn(
                 st.last_error = last_error;
             }
 
-            // Adaptive pacing: aim for target_period measured wall-to-wall.
-            // If the round trip already blew the budget (FXPAK under load),
-            // don't sleep — we're latency-bound, just go again.
+            // Garbage-collect last_read entries for watches that no longer
+            // exist so it can't grow unbounded across room/script changes.
+            if cycle % 256 == 0 {
+                last_read.retain(|id, _| live_ids.contains(id));
+            }
+
+            // Inter-cycle pacing: only sleep the UNUSED remainder of the
+            // window. If the drain loop already consumed it (or overran —
+            // latency-bound), continue immediately.
             let elapsed = cycle_start.elapsed();
-            if elapsed < cfg.target_period {
-                tokio::time::sleep(cfg.target_period - elapsed).await;
+            let target = cfg.target_period.min(Duration::from_millis(
+                cfg.frame_budget_ms.max(1) as u64,
+            ));
+            if elapsed < target {
+                tokio::time::sleep(target - elapsed).await;
             } else {
                 tokio::task::yield_now().await;
             }
@@ -306,60 +360,62 @@ pub fn spawn(
     engine
 }
 
-/// Result of selecting the bulk reads for one cycle.
+/// Result of selecting the bulk reads for one drain-loop iteration.
 struct BulkSelection {
-    /// Reads admitted this cycle, priority-ordered (urgent first).
+    /// Reads admitted, priority-ordered (urgent first, then stalest Low).
     reads: Vec<crate::watch::CoalescedRead>,
-    /// True if the budget trimmed at least one read.
+    /// True if the budget trimmed at least one read (more deferred work
+    /// remains for the next drain iteration / cycle).
     capped: bool,
-    /// Cursor to use next cycle (advanced past admitted Low reads).
-    next_cursor: usize,
 }
 
-/// Order coalesced reads by priority, rotate the Low (prefetch) tail by
-/// `cursor`, then trim to `budget`.
+/// Pick this iteration's reads from `reads`, urgent-first then *stalest Low
+/// first*, trimmed to `budget`.
 ///
-/// `coalesce` returns *address* order, unrelated to priority — trimming that
-/// by size starves arbitrary reads. Here High/Normal are admitted first (so
-/// fast data is never starved), then a *rotating window* of the Low reads
-/// fills the remaining budget. Advancing the cursor past what we admitted
-/// guarantees every Low read is offered within a bounded number of cycles —
-/// i.e. the whole map/level streams in over time instead of one burst then
-/// nothing.
+/// `coalesce` returns address order (unrelated to priority); trimming that by
+/// size starves arbitrary reads. We sort High→Normal→Low so fast data is
+/// never starved, and within Low we order by **how long since each read's
+/// watches were last refreshed** (oldest first), using `last_read` keyed by
+/// watch id. That is robust to the registry growing mid-stream (new watches
+/// have no entry → treated as maximally stale → read promptly) and
+/// guarantees every Low watch is refreshed within a bounded number of
+/// iterations — no index cursor to smear when the set changes.
 fn select_bulk(
     mut reads: Vec<crate::watch::CoalescedRead>,
     budget: u32,
-    cursor: usize,
+    last_read: &HashMap<crate::watch::WatchId, u64>,
+    cycle: u64,
 ) -> BulkSelection {
     use crate::watch::WatchPriority;
 
-    // Stable sort: urgent first, address order preserved within each tier.
-    reads.sort_by_key(|r| r.priority);
+    // Staleness of a coalesced read = the oldest (smallest) last-read cycle
+    // among its members; never-read => 0 => maximally stale.
+    let staleness = |r: &crate::watch::CoalescedRead| -> u64 {
+        let oldest = r
+            .members
+            .iter()
+            .map(|&(id, _, _)| *last_read.get(&id).unwrap_or(&0))
+            .min()
+            .unwrap_or(0);
+        cycle.saturating_sub(oldest)
+    };
 
-    let split = reads
-        .iter()
-        .position(|r| r.priority == WatchPriority::Low)
-        .unwrap_or(reads.len());
-
-    let mut ordered: Vec<_> = reads[..split].to_vec();
-    let lows = &reads[split..];
-    let low_n = lows.len();
-    if low_n > 0 {
-        let start = cursor % low_n;
-        ordered.extend(lows[start..].iter().cloned());
-        ordered.extend(lows[..start].iter().cloned());
-    }
+    // Urgent tier first; within Low, stalest first (largest staleness).
+    reads.sort_by(|a, b| {
+        a.priority.cmp(&b.priority).then_with(|| {
+            if a.priority == WatchPriority::Low {
+                staleness(b).cmp(&staleness(a))
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+    });
 
     let mut remaining = budget;
     let mut capped = false;
-    let mut lows_admitted = 0usize;
-    ordered.retain(|r| {
-        let is_low = r.priority == WatchPriority::Low;
+    reads.retain(|r| {
         if r.region.size <= remaining {
             remaining -= r.region.size;
-            if is_low {
-                lows_admitted += 1;
-            }
             true
         } else {
             capped = true;
@@ -367,19 +423,9 @@ fn select_bulk(
         }
     });
 
-    let next_cursor = if low_n > 0 {
-        // Advance past what we admitted (at least 1 so we always make
-        // progress even if a single Low read is too big for the budget —
-        // it still rotates out of the way next cycle).
-        cursor.wrapping_add(lows_admitted.max(1))
-    } else {
-        cursor
-    };
-
     BulkSelection {
-        reads: ordered,
+        reads,
         capped,
-        next_cursor,
     }
 }
 
@@ -475,67 +521,110 @@ mod tests {
         }
     }
 
+    // Simulate the engine's drain step: select within budget, then mark
+    // every admitted member read this `cycle` (mirrors the real loop).
+    fn step(
+        reads: Vec<CoalescedRead>,
+        budget: u32,
+        last_read: &mut HashMap<WatchId, u64>,
+        cycle: u64,
+    ) -> Vec<u32> {
+        let sel = select_bulk(reads, budget, last_read, cycle);
+        let mut admitted = Vec::new();
+        for r in &sel.reads {
+            admitted.push(r.region.address);
+            for &(id, _, _) in &r.members {
+                last_read.insert(id, cycle);
+            }
+        }
+        admitted
+    }
+
     #[test]
     fn high_priority_is_never_starved_by_low() {
-        // One small High read + several big Low reads, tiny budget. The
-        // High read must always get in regardless of cursor position.
-        for cursor in 0..8 {
+        // Small High + big Low, budget fits only one big Low. High must
+        // always get in regardless of how stale the Low reads are.
+        let mut lr = HashMap::new();
+        for cycle in 1..8 {
             let reads = vec![
                 cr(0x1000, 64, WatchPriority::High),
                 cr(0x2000, 4096, WatchPriority::Low),
                 cr(0x3000, 4096, WatchPriority::Low),
                 cr(0x4000, 4096, WatchPriority::Low),
             ];
-            let sel = select_bulk(reads, 4096 + 64, cursor);
+            let admitted = step(reads, 4096 + 64, &mut lr, cycle);
             assert!(
-                sel.reads.iter().any(|r| r.priority == WatchPriority::High),
-                "High starved at cursor {cursor}"
+                admitted.contains(&0x1000),
+                "High starved at cycle {cycle}"
             );
         }
     }
 
     #[test]
-    fn low_reads_all_stream_in_over_cycles() {
-        // The bug: under a tight budget the same Low prefix always won and
-        // the rest never streamed in. With the rotating cursor, every Low
-        // read must be admitted within a bounded number of cycles.
+    fn every_low_read_refreshed_within_bounded_cycles() {
+        // The bug: deferred Low data never fully streamed in. With
+        // stalest-first selection every Low watch must be refreshed within
+        // a bounded number of cycles, repeatedly (not just once).
         let lows: Vec<u32> = (0..10).map(|i| 0x2000 + i * 0x1000).collect();
-        // Budget fits High (64) + ~2 Low reads (1000 each) per cycle.
-        let budget = 64 + 2100;
-        let mut cursor = 0usize;
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..20 {
+        let budget = 64 + 2100; // High (64) + ~2 Low (1000 each) per cycle
+        let mut lr = HashMap::new();
+        let mut last_seen: HashMap<u32, u64> = HashMap::new();
+        for cycle in 1..=60 {
             let mut reads = vec![cr(0x1000, 64, WatchPriority::High)];
             for &a in &lows {
                 reads.push(cr(a, 1000, WatchPriority::Low));
             }
-            let sel = select_bulk(reads, budget, cursor);
-            for r in &sel.reads {
-                if r.priority == WatchPriority::Low {
-                    seen.insert(r.region.address);
+            for a in step(reads, budget, &mut lr, cycle) {
+                last_seen.insert(a, cycle);
+            }
+            // Once warmed up, no Low watch may go more than N cycles
+            // without a refresh (10 lows, ~2/cycle => ~5-cycle period;
+            // allow generous slack).
+            if cycle > 12 {
+                for &a in &lows {
+                    let seen = *last_seen.get(&a).unwrap_or(&0);
+                    assert!(
+                        cycle - seen <= 12,
+                        "Low {a:#06x} stale {} cyc at cycle {cycle}",
+                        cycle - seen
+                    );
                 }
             }
-            cursor = sel.next_cursor;
         }
-        assert_eq!(
-            seen.len(),
-            lows.len(),
-            "not all Low reads streamed in: {}/{}",
-            seen.len(),
-            lows.len()
-        );
     }
 
     #[test]
-    fn oversized_low_read_still_rotates_out_of_the_way() {
-        // A single Low read bigger than the whole budget must not wedge the
-        // cursor forever (advance >= 1) so other Low reads still get a turn.
-        let reads = vec![
-            cr(0x2000, 99_999, WatchPriority::Low),
-            cr(0x3000, 100, WatchPriority::Low),
-        ];
-        let sel = select_bulk(reads, 4096, 0);
-        assert!(sel.next_cursor > 0, "cursor must advance past a stuck read");
+    fn registry_growth_midstream_still_streams_all() {
+        // New watches appear as the script touches addresses. A freshly
+        // registered watch has no last_read entry -> maximally stale ->
+        // must be picked up promptly, and existing ones must not starve.
+        let budget = 3000;
+        let mut lr = HashMap::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut addrs: Vec<u32> =
+            (0..5).map(|i| 0x2000 + i * 0x1000).collect();
+        for cycle in 1..=40 {
+            // Grow the set partway through (simulates lazy registration).
+            if cycle == 10 {
+                for i in 5..15 {
+                    addrs.push(0x2000 + i * 0x1000);
+                }
+            }
+            let reads: Vec<_> = addrs
+                .iter()
+                .map(|&a| cr(a, 1000, WatchPriority::Low))
+                .collect();
+            for a in step(reads, budget, &mut lr, cycle) {
+                seen.insert(a);
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            addrs.len(),
+            "not all (incl. late-registered) watches streamed: {}/{}",
+            seen.len(),
+            addrs.len()
+        );
     }
 
     #[test]
