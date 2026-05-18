@@ -194,19 +194,67 @@ function emu.framecount() return emu.framecount_n end
 function emu.log(msg) print(tostring(msg)) end
 function emu.displayMessage(_cat, msg) print(tostring(msg)) end
 
--- Draw-surface API is a no-op here: sni-lua has one overlay canvas. The
--- script's surface selection just falls back to default behaviour.
-emu.drawSurface = nil
-function emu.selectDrawSurface() end
-function emu.getDrawSurfaceSize() return nil end
-function emu.getScreenSize() return { width = 256, height = 224 } end
+-- Draw-surface API. The script's Samus-centered block viewer selects the
+-- "scriptHud" surface at a scale (default 3) and then draws in that scaled
+-- coordinate space (e.g. 768x672). sni-lua's equivalent is the resolution
+-- canvas: selecting the HUD surface at scale N => gfx.scale(N), so the
+-- script's coords map 1:1 onto our canvas. Without this the script falls
+-- back to a 256x224 console-screen space while its layout assumes the
+-- larger one -> everything draws off-canvas / wrong size.
+emu.drawSurface = { scriptHud = "scriptHud", consoleScreen = "consoleScreen" }
 
--- Mesen draw colours are 0xAARRGGBB. sni-lua's gfx.* also take 0xAARRGGBB
--- (gfx.argb / Color::from_argb), so colours pass straight through. Mesen's
--- "filled" boolean for rectangles maps to gfx.box's fill arg.
+local _hud_scale = 1
+function emu.selectDrawSurface(which, scale)
+    if which == "scriptHud" then
+        _hud_scale = math.max(1, math.floor((scale or 1) + 0.5))
+        gfx.scale(_hud_scale)          -- canvas becomes 256*N x 224*N
+    else
+        _hud_scale = 1
+        gfx.scale(1)
+    end
+end
+
+function emu.getDrawSurfaceSize(_which)
+    -- Report the active scaled HUD size so the script's centering math is
+    -- correct. gfx.width()/height() reflect the canvas we just set.
+    return {
+        width = gfx.width(),  height = gfx.height(),
+        visibleWidth = gfx.width(), visibleHeight = gfx.height(),
+    }
+end
+
+function emu.getScreenSize()
+    return { width = gfx.width(), height = gfx.height() }
+end
+
+-- Colour handling. The script's mesenDrawColourFromRgba already encodes
+-- colours as 0xAARRGGBB AND, with CONFIG.drawing.mesenDrawAlphaInverted =
+-- true (the default), it INVERTS alpha (00 = opaque, FF = transparent --
+-- Mesen's convention). sni-lua's gfx.* expect standard 0xAARRGGBB where
+-- FF = opaque. So we must un-invert the alpha byte here, otherwise every
+-- "opaque" thing the script draws arrives as alpha 0x00 = fully
+-- transparent (the "nothing renders" symptom).
+local MESEN_ALPHA_INVERTED = true
+-- NOTE on integer width: LuaJIT's `bit` ops are signed 32-bit, so
+-- bit.lshift(0xFF,24) yields a NEGATIVE number, and `a*0x1000000` for
+-- a>=0x80 exceeds i32. sni-lua's gfx.* take a u32 0xAARRGGBB. So we must
+-- hand back a plain Lua number in the unsigned range [0, 0xFFFFFFFF] and
+-- never a bit-op result for the top byte. Decompose, then recompose with
+-- arithmetic (which stays a double, exact to 2^53).
 local function argb(c)
     if c == nil then return nil end
-    return band(c, 0xFFFFFFFF)
+    -- Pull bytes out of whatever the script gave us (it may itself be a
+    -- signed/negative 32-bit value from its own lshift(a,24)).
+    if c < 0 then c = c + 0x100000000 end
+    local a = math.floor(c / 0x1000000) % 0x100
+    local r = math.floor(c / 0x10000)   % 0x100
+    local g = math.floor(c / 0x100)     % 0x100
+    local b = c % 0x100
+    if MESEN_ALPHA_INVERTED then
+        a = 0xFF - a
+    end
+    -- Recompose as an unsigned double in [0, 0xFFFFFFFF].
+    return a * 0x1000000 + r * 0x10000 + g * 0x100 + b
 end
 
 function emu.drawPixel(x, y, color, _alpha)

@@ -203,9 +203,7 @@ impl ScriptHost {
                         .as_deref()
                         .map(WatchPriority::parse)
                         .unwrap_or(WatchPriority::Normal);
-                    let h = engine
-                        .registry()
-                        .register(MemRegion::fxpak(addr, size), pr);
+                    let h = engine.registry().register(MemRegion::fxpak(addr, size), pr);
                     Ok(h.id)
                 },
             )?;
@@ -253,9 +251,9 @@ impl ScriptHost {
         // Lets scripts dim/flag stale data instead of trusting it blindly.
         {
             let engine = self.engine.clone();
-            let f = self.lua.create_function(move |_, id: u64| {
-                Ok(engine.snapshot().watch_age(id))
-            })?;
+            let f = self
+                .lua
+                .create_function(move |_, id: u64| Ok(engine.snapshot().watch_age(id)))?;
             snes.set("age", f)?;
         }
 
@@ -285,26 +283,27 @@ impl ScriptHost {
         {
             let draw = self.draw.clone();
             let cur_font = self.current_font.clone();
-            let f = self.lua.create_function(
-                move |_,
-                      (x, y, text, color, scale): (
-                    f32,
-                    f32,
-                    String,
-                    Option<u32>,
-                    Option<f32>,
-                )| {
-                    draw.borrow_mut().push(DrawCmd::Text {
-                        x,
-                        y,
-                        text,
-                        color: argb(color, 0xFFFFFFFF),
-                        scale: scale.unwrap_or(1.0),
-                        font: cur_font.get(),
-                    });
-                    Ok(())
-                },
-            )?;
+            let f =
+                self.lua.create_function(
+                    move |_,
+                          (x, y, text, color, scale): (
+                        f32,
+                        f32,
+                        String,
+                        Option<u32>,
+                        Option<f32>,
+                    )| {
+                        draw.borrow_mut().push(DrawCmd::Text {
+                            x,
+                            y,
+                            text,
+                            color: argb(color, 0xFFFFFFFF),
+                            scale: scale.unwrap_or(1.0),
+                            font: cur_font.get(),
+                        });
+                        Ok(())
+                    },
+                )?;
             gfx.set("text", f)?;
         }
 
@@ -313,12 +312,10 @@ impl ScriptHost {
         // noticeably more compact than "normal" (8x8).
         {
             let cur_font = self.current_font.clone();
-            let f = self
-                .lua
-                .create_function(move |_, name: String| {
-                    cur_font.set(Font::parse(&name));
-                    Ok(())
-                })?;
+            let f = self.lua.create_function(move |_, name: String| {
+                cur_font.set(Font::parse(&name));
+                Ok(())
+            })?;
             gfx.set("font", f)?;
         }
 
@@ -327,12 +324,10 @@ impl ScriptHost {
         // effective canvas so positioning code stays correct either way.
         {
             let canvas = self.requested_canvas.clone();
-            let f = self
-                .lua
-                .create_function(move |_, (w, h): (f32, f32)| {
-                    canvas.set(Canvas::custom(w, h));
-                    Ok(())
-                })?;
+            let f = self.lua.create_function(move |_, (w, h): (f32, f32)| {
+                canvas.set(Canvas::custom(w, h));
+                Ok(())
+            })?;
             gfx.set("canvas", f)?;
         }
 
@@ -351,16 +346,12 @@ impl ScriptHost {
         // these for layout; never assume 256x224.
         {
             let canvas = self.requested_canvas.clone();
-            let f = self
-                .lua
-                .create_function(move |_, ()| Ok(canvas.get().w))?;
+            let f = self.lua.create_function(move |_, ()| Ok(canvas.get().w))?;
             gfx.set("width", f)?;
         }
         {
             let canvas = self.requested_canvas.clone();
-            let f = self
-                .lua
-                .create_function(move |_, ()| Ok(canvas.get().h))?;
+            let f = self.lua.create_function(move |_, ()| Ok(canvas.get().h))?;
             gfx.set("height", f)?;
         }
 
@@ -424,29 +415,26 @@ impl ScriptHost {
         // gfx.pixel(x, y, color?)
         {
             let draw = self.draw.clone();
-            let f = self.lua.create_function(
-                move |_, (x, y, color): (f32, f32, Option<u32>)| {
-                    draw.borrow_mut().push(DrawCmd::Pixel {
-                        x,
-                        y,
-                        color: argb(color, 0xFFFFFFFF),
-                    });
-                    Ok(())
-                },
-            )?;
+            let f =
+                self.lua
+                    .create_function(move |_, (x, y, color): (f32, f32, Option<u32>)| {
+                        draw.borrow_mut().push(DrawCmd::Pixel {
+                            x,
+                            y,
+                            color: argb(color, 0xFFFFFFFF),
+                        });
+                        Ok(())
+                    })?;
             gfx.set("pixel", f)?;
         }
 
         // gfx.argb(a,r,g,b) -> packed color int helper.
         {
-            let f = self.lua.create_function(
-                move |_, (a, r, g, b): (u8, u8, u8, u8)| {
-                    Ok(((a as u32) << 24)
-                        | ((r as u32) << 16)
-                        | ((g as u32) << 8)
-                        | b as u32)
-                },
-            )?;
+            let f = self
+                .lua
+                .create_function(move |_, (a, r, g, b): (u8, u8, u8, u8)| {
+                    Ok(((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32)
+                })?;
             gfx.set("argb", f)?;
         }
 
@@ -504,9 +492,7 @@ impl ScriptHost {
         // from a previous frame.
         self.current_font.set(Font::default());
 
-        if let Ok(on_frame) =
-            self.lua.globals().get::<mlua::Function>("on_frame")
-        {
+        if let Ok(on_frame) = self.lua.globals().get::<mlua::Function>("on_frame") {
             if let Err(e) = on_frame.call::<()>(()) {
                 self.console.push(format!("[on_frame error] {e}"));
                 self.loaded = false; // stop running the broken script
@@ -534,9 +520,7 @@ mod tests {
     fn host() -> ScriptHost {
         use std::sync::OnceLock;
         static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-        let rt = RT.get_or_init(|| {
-            tokio::runtime::Runtime::new().expect("test runtime")
-        });
+        let rt = RT.get_or_init(|| tokio::runtime::Runtime::new().expect("test runtime"));
         let _g = rt.enter();
         // Engine with no client: snapshots are empty, watches still register.
         let engine = sni_cache::spawn(|| None, sni_cache::PollConfig::default());
@@ -572,19 +556,39 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../examples/super_hitbox_sni.lua"
         );
-        let src = std::fs::read_to_string(path)
-            .expect("ported script present");
+        let src = std::fs::read_to_string(path).expect("ported script present");
         let mut h = host();
         h.load_script(&src, "super_hitbox_sni.lua")
             .expect("ported script loads without error");
-        for _ in 0..5 {
-            let _ = h.run_frame();
+        let mut last = DrawList::default();
+        for _ in 0..8 {
+            last = h.run_frame();
             assert!(
                 h.is_loaded(),
                 "script disabled itself: {:?}",
                 h.console().snapshot()
             );
         }
+        // It should draw *something* even with no game data (the block
+        // viewer frame / status text). Count by kind for diagnosis.
+        let (mut t, mut r, mut l, mut p) = (0, 0, 0, 0);
+        for c in &last.cmds {
+            match c {
+                DrawCmd::Text { .. } => t += 1,
+                DrawCmd::Rect { .. } => r += 1,
+                DrawCmd::Line { .. } => l += 1,
+                DrawCmd::Pixel { .. } => p += 1,
+            }
+        }
+        eprintln!(
+            "super_hitbox draw: {} cmds (text={t} rect={r} line={l} pixel={p})",
+            last.cmds.len()
+        );
+        assert!(
+            !last.cmds.is_empty(),
+            "ported script produced NO draw commands — console: {:?}",
+            h.console().snapshot()
+        );
     }
 
     #[test]
@@ -627,37 +631,25 @@ mod tests {
             "t",
         )
         .unwrap();
-        let v: Option<i64> =
-            h.lua.globals().get("result").unwrap();
+        let v: Option<i64> = h.lua.globals().get("result").unwrap();
         assert_eq!(v, None);
     }
 
     #[test]
     fn script_error_disables_frame_not_crashes() {
         let mut h = host();
-        h.load_script(
-            r#"function on_frame() error("boom") end"#,
-            "t",
-        )
-        .unwrap();
+        h.load_script(r#"function on_frame() error("boom") end"#, "t")
+            .unwrap();
         let dl = h.run_frame();
         assert!(dl.cmds.is_empty());
         assert!(!h.is_loaded(), "broken script disabled");
-        assert!(h
-            .console()
-            .snapshot()
-            .iter()
-            .any(|l| l.contains("boom")));
+        assert!(h.console().snapshot().iter().any(|l| l.contains("boom")));
     }
 
     #[test]
     fn print_routes_to_console() {
         let mut h = host();
         h.load_script(r#"print("hello", 42)"#, "t").unwrap();
-        assert!(h
-            .console()
-            .snapshot()
-            .iter()
-            .any(|l| l.contains("hello")));
+        assert!(h.console().snapshot().iter().any(|l| l.contains("hello")));
     }
 }
