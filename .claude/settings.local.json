@@ -22,7 +22,11 @@
       "Bash(git -c user.email=backmark@gmail.com -c user.name=sni-lua commit -q -m ' *)",
       "PowerShell(cmd /c '\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\" >nul 2>&1 && set \"NoDefaultCurrentDirectoryInExePath=\" && cargo build 2>&1')",
       "PowerShell(cmd /c '\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\" >nul 2>&1 && set \"NoDefaultCurrentDirectoryInExePath=\" && cargo test -p sni-client 2>&1')",
-      "PowerShell(cmd /c '\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\" >nul 2>&1 && set \"NoDefaultCurrentDirectoryInExePath=\" && cargo test -p sni-cache 2>&1 && cargo build 2>&1')"
+      "PowerShell(cmd /c '\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\" >nul 2>&1 && set \"NoDefaultCurrentDirectoryInExePath=\" && cargo test -p sni-cache 2>&1 && cargo build 2>&1')",
+      "PowerShell(cmd /c '\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\" >nul 2>&1 && set \"NoDefaultCurrentDirectoryInExePath=\" && cargo test -p sni-lua-api 2>&1 && cargo build 2>&1')",
+      "PowerShell(cmd /c '\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\" >nul 2>&1 && set \"NoDefaultCurrentDirectoryInExePath=\" && cargo test -p sni-lua-api 2>&1 | findstr /C:\"test result\" & cargo build 2>&1')",
+      "PowerShell(Get-Process sni-lua -ErrorAction SilentlyContinue)",
+      "PowerShell(Stop-Process -Force)"
     ]
   }
 }

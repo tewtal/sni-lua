@@ -64,6 +64,9 @@ pub enum Cmd {
     SelectDevice { uri: String },
     /// One-shot read used by the live inspector to demonstrate latency.
     Probe { region: MemRegion },
+    /// Fire-and-forget memory write from a script (`snes.write`). Never
+    /// blocks the frame; failures are logged, not surfaced per-call.
+    Write { region: MemRegion, data: Vec<u8> },
 }
 
 /// Handle the UI keeps. Dropping it stops the actor.
@@ -78,6 +81,26 @@ impl SniHandle {
     pub fn send(&self, cmd: Cmd) {
         // Unbounded + UI-driven: a full channel would mean the actor is wedged;
         // dropping the command is preferable to blocking the render thread.
+        let _ = self.tx.send(cmd);
+    }
+
+    /// A cheap, cloneable sender for code that only needs to enqueue commands
+    /// (e.g. the Lua write sink) without holding the whole handle.
+    pub fn sender(&self) -> CmdSender {
+        CmdSender {
+            tx: self.tx.clone(),
+        }
+    }
+}
+
+/// Clone-and-send view of the actor's command channel.
+#[derive(Clone)]
+pub struct CmdSender {
+    tx: mpsc::UnboundedSender<Cmd>,
+}
+
+impl CmdSender {
+    pub fn send(&self, cmd: Cmd) {
         let _ = self.tx.send(cmd);
     }
 }
@@ -127,6 +150,7 @@ impl Actor {
                 Cmd::RefreshDevices => self.refresh_devices().await,
                 Cmd::SelectDevice { uri } => self.select_device(uri).await,
                 Cmd::Probe { region } => self.probe(region).await,
+                Cmd::Write { region, data } => self.write(region, data).await,
             }
         }
         tracing::info!("SNI actor stopped (handle dropped)");
@@ -239,5 +263,19 @@ impl Actor {
             },
         };
         self.state.lock().last_probe = probe;
+    }
+
+    async fn write(&mut self, region: MemRegion, data: Vec<u8>) {
+        let uri = self.state.lock().selected_uri.clone();
+        let (Some(client), Some(uri)) = (self.client.as_mut(), uri) else {
+            tracing::warn!("snes.write dropped: not connected / no device");
+            return;
+        };
+        if let Err(e) = client.single_write(&uri, region, data).await {
+            tracing::warn!(
+                "snes.write to 0x{:06X} failed: {e}",
+                region.address
+            );
+        }
     }
 }

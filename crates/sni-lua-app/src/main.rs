@@ -14,11 +14,23 @@ use std::sync::Arc;
 
 use config::Config;
 use eframe::egui;
-use sni_actor::{Cmd, ConnState, SniHandle};
+use sni_actor::{CmdSender, Cmd, ConnState, SniHandle};
 use sni_cache::{PollConfig, PollEngine, WatchHandle, WatchPriority};
 use sni_client::MemRegion;
+use sni_lua_api::{Console, ScriptHost, WriteSink};
 use sni_render::{DrawList, SNES_H, SNES_W};
 use tokio::runtime::Runtime;
+
+/// Bridges Lua `snes.write(...)` to the SNI actor as a fire-and-forget
+/// command. Lives behind `Arc<dyn WriteSink>` in the script host.
+struct ActorWriteSink {
+    tx: CmdSender,
+}
+impl WriteSink for ActorWriteSink {
+    fn queue_write(&self, region: MemRegion, data: Vec<u8>) {
+        self.tx.send(Cmd::Write { region, data });
+    }
+}
 
 /// Super Metroid demo watches, registered so the poll engine has real,
 /// fast-moving data to batch the moment a device is connected. These move to
@@ -64,9 +76,14 @@ struct App {
     sni: SniHandle,
     engine: Arc<PollEngine>,
     sm: SmWatches,
-    /// Latest draw list. In M4+ the script host writes this; M5 paints it.
-    draw_list: Arc<parking_lot::Mutex<DrawList>>,
+    /// Lua script host. Runs `on_frame` from egui's update loop (UI thread).
+    host: ScriptHost,
+    console: Arc<Console>,
+    /// Latest script-produced draw list (M5 paints it).
+    draw_list: DrawList,
     status: String,
+    script_path: String,
+    show_console: bool,
 
     // Live memory inspector (M2 demo of real reads + latency).
     probe_addr_hex: String,
@@ -76,14 +93,6 @@ struct App {
 impl App {
     fn new(_cc: &eframe::CreationContext<'_>, rt: Runtime) -> Self {
         let config = Config::load();
-
-        let lua_status = match sni_lua_api::ScriptHost::new()
-            .and_then(|h| h.eval_number("return 2 ^ 10"))
-        {
-            Ok(v) => format!("LuaJIT OK (2^10 = {v})"),
-            Err(e) => format!("LuaJIT FAILED: {e}"),
-        };
-
         let sni = sni_actor::spawn();
 
         // Spawn the poll engine. It reads the actor's shared client slot each
@@ -108,18 +117,66 @@ impl App {
             missiles: reg.register(MemRegion::wram(0x09C6, 2), WatchPriority::Normal),
         };
 
-        Self {
+        // Lua host: shares the poll engine (for cached reads) and a write
+        // sink that forwards `snes.write` to the SNI actor.
+        let sink = Arc::new(ActorWriteSink { tx: sni.sender() });
+        let host = ScriptHost::with_sink(engine.clone(), sink)
+            .expect("LuaJIT init failed");
+        let console = host.console();
+        // M1 LuaJIT health check, now via the real host.
+        let lua_status = match host.eval_number("return 2 ^ 10") {
+            Ok(v) => format!("LuaJIT OK (2^10 = {v})"),
+            Err(e) => format!("LuaJIT FAILED: {e}"),
+        };
+
+        let mut app = Self {
             _rt: rt,
-            config,
+            config: config.clone(),
             sni,
             engine,
             sm,
-            draw_list: Arc::new(parking_lot::Mutex::new(DrawList::default())),
+            host,
+            console,
+            draw_list: DrawList::default(),
             status: format!("Ready. {lua_status}"),
+            script_path: config
+                .last_script
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            show_console: true,
             // Super Metroid: WRAM $7E:0AF6 = Samus X position (u16). In the
             // FxPakPro space that's $F5_0AF6.
             probe_addr_hex: "F50AF6".to_string(),
             probe_size: 2,
+        };
+        // Auto-load the last script if one was remembered.
+        if !app.script_path.is_empty() {
+            app.load_script_from_path();
+        }
+        app
+    }
+
+    /// Read the script file at `self.script_path` and (re)load it into the
+    /// host. Errors go to the console + status line, never panic.
+    fn load_script_from_path(&mut self) {
+        let path = self.script_path.clone();
+        match std::fs::read_to_string(&path) {
+            Ok(src) => {
+                let name = std::path::Path::new(&path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.clone());
+                match self.host.load_script(&src, &name) {
+                    Ok(()) => {
+                        self.status = format!("Loaded script: {name}");
+                        self.config.last_script = Some(path.into());
+                        self.config.save();
+                    }
+                    Err(e) => self.status = format!("Script error: {e}"),
+                }
+            }
+            Err(e) => self.status = format!("Cannot read {path}: {e}"),
         }
     }
 
@@ -151,6 +208,11 @@ impl eframe::App for App {
             )
         };
         let (conn, devices, selected_uri, mapping, last_probe) = snap;
+
+        // Run the script's on_frame against the latest cached snapshot. This
+        // is a lock-free snapshot read inside the host — no SNI round trip on
+        // the UI thread. Produces this frame's draw list for the renderer.
+        self.draw_list = self.host.run_frame();
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -205,6 +267,47 @@ impl eframe::App for App {
             .resizable(true)
             .default_width(260.0)
             .show(ctx, |ui| {
+                ui.heading("Script");
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("Lua file path")
+                        .small()
+                        .weak(),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.script_path)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("examples/sm_hud.lua"),
+                );
+                ui.horizontal(|ui| {
+                    let has_path = !self.script_path.trim().is_empty();
+                    if ui
+                        .add_enabled(has_path, egui::Button::new("Load"))
+                        .clicked()
+                    {
+                        self.load_script_from_path();
+                    }
+                    if ui
+                        .add_enabled(
+                            has_path && self.host.is_loaded(),
+                            egui::Button::new("↻ Reload"),
+                        )
+                        .clicked()
+                    {
+                        self.load_script_from_path();
+                    }
+                    ui.checkbox(&mut self.show_console, "Console");
+                });
+                let (txt, col) = if self.host.is_loaded() {
+                    ("● script running", egui::Color32::from_rgb(0, 200, 0))
+                } else if self.script_path.trim().is_empty() {
+                    ("○ no script", egui::Color32::GRAY)
+                } else {
+                    ("● stopped (see console)", egui::Color32::from_rgb(220, 60, 60))
+                };
+                ui.colored_label(col, txt);
+
+                ui.add_space(12.0);
                 ui.heading("Device");
                 ui.separator();
                 if devices.is_empty() {
@@ -396,6 +499,30 @@ impl eframe::App for App {
             });
         });
 
+        if self.show_console {
+            egui::TopBottomPanel::bottom("console")
+                .resizable(true)
+                .default_height(140.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("Console");
+                        if ui.small_button("clear").clicked() {
+                            self.console.lines.lock().clear();
+                        }
+                    });
+                    ui.separator();
+                    let lines = self.console.snapshot();
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for l in &lines {
+                                ui.monospace(l);
+                            }
+                        });
+                });
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let avail = ui.available_size();
             let (rect, _resp) = ui.allocate_exact_size(avail, egui::Sense::hover());
@@ -418,12 +545,15 @@ impl eframe::App for App {
             painter.text(
                 view.center(),
                 egui::Align2::CENTER_CENTER,
-                "SNES overlay viewport (256×224)\ncapture feed → M6 · script draw → M5",
+                format!(
+                    "SNES overlay viewport (256×224)\n\
+                     script emitted {} draw commands this frame\n\
+                     (rendering them lands in M5 · capture feed in M6)",
+                    self.draw_list.cmds.len()
+                ),
                 egui::FontId::proportional(14.0),
                 egui::Color32::from_gray(120),
             );
-
-            let _ = self.draw_list.lock().cmds.len();
         });
     }
 

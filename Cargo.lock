@@ -2828,12 +2828,12 @@ dependencies = [
 name = "sni-lua-api"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "mlua",
  "parking_lot",
  "sni-cache",
  "sni-client",
  "sni-render",
+ "tokio",
  "tracing",
 ]
 

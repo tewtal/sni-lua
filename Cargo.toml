@@ -39,7 +39,10 @@ egui = "0.29"
 egui_extras = "0.29"
 
 # lua
-mlua = { version = "0.10", features = ["luajit", "vendored", "send", "serialize"] }
+# No `send` feature: the ScriptHost is intentionally !Send (lives on the UI
+# thread, driven from egui's update loop), so Lua closures can capture the
+# single-threaded Rc<RefCell<DrawList>> directly.
+mlua = { version = "0.10", features = ["luajit", "vendored", "serialize"] }
 
 # misc
 serde = { version = "1", features = ["derive"] }

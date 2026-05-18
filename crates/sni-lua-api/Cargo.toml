@@ -10,5 +10,7 @@ sni-cache = { path = "../sni-cache" }
 sni-render = { path = "../sni-render" }
 mlua.workspace = true
 parking_lot.workspace = true
-anyhow.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
