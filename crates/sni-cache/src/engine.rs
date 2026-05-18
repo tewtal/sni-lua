@@ -1,14 +1,17 @@
-//! The poll engine: one async task that turns declared watches into batched
+//! The poll engine: one async task that turns active watches into batched
 //! `MultiRead` calls and publishes immutable snapshots.
 //!
 //! Per cycle:
-//!   1. snapshot the watch registry
-//!   2. select watches due this cycle by priority period
-//!   3. coalesce due watches into the fewest reads (subject to a byte budget)
-//!   4. issue a single `MultiRead`
+//!   1. retain set = all registered watches (dormant ones keep their cache)
+//!   2. poll set = active watches (pinned + within the demand window)
+//!   3. Realtime sub-poll first (controller path), kept off the bulk batch
+//!   4. bulk DRAIN LOOP: repeatedly select (urgent-first, then stalest Low),
+//!      excluding watches already refreshed this cycle, issuing batches
+//!      back-to-back until the frame-time window is spent or all caught up
 //!   5. slice results back to each member watch, carry stale data forward
 //!   6. publish via `ArcSwap` (lock-free for readers)
-//!   7. adapt cycle pacing to measured RTT
+//!   7. adaptive byte budget (AIMD vs frame target); sleep only the unused
+//!      remainder of the window
 //!
 //! This is the whole bandwidth strategy in one place: scripts read the
 //! published snapshot instantly; the cost of talking to the FXPAK is paid
@@ -262,18 +265,43 @@ pub fn spawn(
             let mut reads_issued: usize = 0;
             let mut budget_capped = false;
             let mut worst_rtt: u32 = 0;
+            // Watches already refreshed in THIS cycle's drain loop. Each
+            // iteration excludes them, so successive batches advance through
+            // the deferred set instead of re-selecting the same stalest
+            // prefix every time (the "fills then restarts" bug: the old
+            // `!capped` break stopped the loop the moment the remaining
+            // stale set fit one budget, so the tail never got read and the
+            // next cycle just re-read the front).
+            let mut done_this_cycle: HashSet<u64> = HashSet::new();
+            // Coalesce once per cycle; re-filter the cheap members list each
+            // iteration rather than re-coalescing.
+            let coalesced_all =
+                coalesce(&bulk_eligible, cfg.coalesce_gap);
 
             loop {
-                // Time remaining in this cycle's window.
-                let spent = cycle_start.elapsed().as_millis();
-                if spent >= frame_ms {
+                // Stop if the cycle's time window is spent.
+                if cycle_start.elapsed().as_millis() >= frame_ms {
                     break;
                 }
 
-                let coalesced =
-                    coalesce(&bulk_eligible, cfg.coalesce_gap);
+                // Eligible = coalesced reads with at least one member not yet
+                // refreshed this cycle. When none remain, every eligible
+                // watch has been read once this cycle — we're caught up.
+                let pending: Vec<_> = coalesced_all
+                    .iter()
+                    .filter(|r| {
+                        r.members
+                            .iter()
+                            .any(|&(id, _, _)| !done_this_cycle.contains(&id))
+                    })
+                    .cloned()
+                    .collect();
+                if pending.is_empty() {
+                    break; // fully drained this cycle
+                }
+
                 let sel =
-                    select_bulk(coalesced, budget, &last_read, cycle);
+                    select_bulk(pending, budget, &last_read, cycle);
                 if sel.reads.is_empty() {
                     break;
                 }
@@ -281,8 +309,7 @@ pub fn spawn(
 
                 let regions: Vec<_> =
                     sel.reads.iter().map(|r| r.region).collect();
-                let bytes: u32 =
-                    regions.iter().map(|r| r.size).sum();
+                let bytes: u32 = regions.iter().map(|r| r.size).sum();
 
                 let t0 = Instant::now();
                 match client.multi_read(&uri, &regions).await {
@@ -290,11 +317,10 @@ pub fn spawn(
                         let rtt = t0.elapsed().as_millis() as u32;
                         worst_rtt = worst_rtt.max(rtt);
                         apply_reads(&sel.reads, &blobs, &mut builder);
-                        // Mark every admitted watch read THIS cycle so the
-                        // next iteration moves on to the next stalest.
                         for r in &sel.reads {
                             for &(id, _, _) in &r.members {
                                 last_read.insert(id, cycle);
+                                done_this_cycle.insert(id);
                             }
                         }
                         bytes_requested =
@@ -303,8 +329,7 @@ pub fn spawn(
 
                         // Adaptive byte budget: converge so a single batch
                         // fits the frame. Driven by the per-batch RTT.
-                        let inst_bpms =
-                            bytes as f32 / rtt.max(1) as f32;
+                        let inst_bpms = bytes as f32 / rtt.max(1) as f32;
                         throughput = Some(match throughput {
                             Some(tp) => cfg.rtt_alpha * inst_bpms
                                 + (1.0 - cfg.rtt_alpha) * tp,
@@ -313,13 +338,19 @@ pub fn spawn(
                         budget =
                             next_budget(budget, rtt, throughput, &cfg);
 
-                        // If that batch already used most of the window,
-                        // don't start another that would overrun.
+                        // Don't start another batch that would clearly
+                        // overrun the window (use measured RTT as the
+                        // estimate for the next one).
                         if cycle_start.elapsed().as_millis() + rtt as u128
                             >= frame_ms
                         {
                             break;
                         }
+                        // NOTE: deliberately NO `!capped` break here. capped
+                        // just means "budget was full this batch" — exactly
+                        // when we MUST keep going to drain the rest within
+                        // the time window. We stop only on time or when
+                        // nothing pending remains.
                     }
                     Err(e) => {
                         worst_rtt = worst_rtt
@@ -328,12 +359,6 @@ pub fn spawn(
                         tracing::debug!("bulk multi_read failed: {e}");
                         break;
                     }
-                }
-
-                // Everything caught up this cycle? Stop early; the leftover
-                // window becomes the inter-cycle sleep below.
-                if !sel.capped {
-                    break;
                 }
             }
 
@@ -548,29 +573,51 @@ mod tests {
         }
     }
 
-    // Simulate the engine's drain step: select within budget, then mark
-    // every admitted member read this `cycle` (mirrors the real loop).
-    fn step(
-        reads: Vec<CoalescedRead>,
+    // Faithfully model the engine's per-cycle DRAIN LOOP: repeatedly select
+    // within budget, marking admitted watches done-this-cycle and EXCLUDING
+    // them from later iterations, until either nothing pending remains or the
+    // batch cap is hit (`max_batches` stands in for the wall-clock frame
+    // window — a finite number of budget-sized round trips fit per cycle).
+    // Returns every address refreshed during the whole cycle.
+    fn step_drain(
+        all_reads: &[CoalescedRead],
         budget: u32,
         last_read: &mut HashMap<WatchId, u64>,
         cycle: u64,
+        max_batches: usize,
     ) -> Vec<u32> {
-        let sel = select_bulk(reads, budget, last_read, cycle);
-        let mut admitted = Vec::new();
-        for r in &sel.reads {
-            admitted.push(r.region.address);
-            for &(id, _, _) in &r.members {
-                last_read.insert(id, cycle);
+        let mut done: HashSet<WatchId> = HashSet::new();
+        let mut refreshed = Vec::new();
+        for _ in 0..max_batches {
+            let pending: Vec<_> = all_reads
+                .iter()
+                .filter(|r| {
+                    r.members.iter().any(|&(id, _, _)| !done.contains(&id))
+                })
+                .cloned()
+                .collect();
+            if pending.is_empty() {
+                break; // fully drained this cycle
+            }
+            let sel = select_bulk(pending, budget, last_read, cycle);
+            if sel.reads.is_empty() {
+                break;
+            }
+            for r in &sel.reads {
+                refreshed.push(r.region.address);
+                for &(id, _, _) in &r.members {
+                    last_read.insert(id, cycle);
+                    done.insert(id);
+                }
             }
         }
-        admitted
+        refreshed
     }
 
     #[test]
     fn high_priority_is_never_starved_by_low() {
-        // Small High + big Low, budget fits only one big Low. High must
-        // always get in regardless of how stale the Low reads are.
+        // Small High + big Low, budget fits only one big Low per batch.
+        // High must always get in regardless of how stale the Low reads are.
         let mut lr = HashMap::new();
         for cycle in 1..8 {
             let reads = vec![
@@ -579,40 +626,69 @@ mod tests {
                 cr(0x3000, 4096, WatchPriority::Low),
                 cr(0x4000, 4096, WatchPriority::Low),
             ];
-            let admitted = step(reads, 4096 + 64, &mut lr, cycle);
+            // Even with a single batch this cycle, High is admitted first.
+            let refreshed = step_drain(&reads, 4096 + 64, &mut lr, cycle, 1);
             assert!(
-                admitted.contains(&0x1000),
+                refreshed.contains(&0x1000),
                 "High starved at cycle {cycle}"
             );
         }
     }
 
     #[test]
-    fn every_low_read_refreshed_within_bounded_cycles() {
-        // The bug: deferred Low data never fully streamed in. With
-        // stalest-first selection every Low watch must be refreshed within
-        // a bounded number of cycles, repeatedly (not just once).
+    fn drain_loop_refreshes_everything_within_the_window() {
+        // The "fills then restarts" bug: the loop stopped the moment the
+        // remaining stale set fit one budget (!capped break), so the tail
+        // never streamed and each cycle re-read the front. With the
+        // exclude-and-continue drain, given enough batches for the window,
+        // EVERY watch is refreshed EVERY cycle — no perpetual front-restart.
         let lows: Vec<u32> = (0..10).map(|i| 0x2000 + i * 0x1000).collect();
-        let budget = 64 + 2100; // High (64) + ~2 Low (1000 each) per cycle
+        let budget = 64 + 2100; // ~2 Low (1000 each) admitted per batch
         let mut lr = HashMap::new();
-        let mut last_seen: HashMap<u32, u64> = HashMap::new();
-        for cycle in 1..=60 {
+        for cycle in 1..=30 {
             let mut reads = vec![cr(0x1000, 64, WatchPriority::High)];
             for &a in &lows {
                 reads.push(cr(a, 1000, WatchPriority::Low));
             }
-            for a in step(reads, budget, &mut lr, cycle) {
+            // 10 lows at ~2/batch => ~5 batches needed; window allows 8.
+            let refreshed = step_drain(&reads, budget, &mut lr, cycle, 8);
+            // Every Low (and the High) refreshed THIS cycle.
+            for &a in &lows {
+                assert!(
+                    refreshed.contains(&a),
+                    "Low {a:#06x} NOT refreshed in cycle {cycle} \
+                     (drain loop restarting / stalling)"
+                );
+            }
+            assert!(refreshed.contains(&0x1000), "High missed");
+        }
+    }
+
+    #[test]
+    fn tight_window_still_makes_forward_progress_every_cycle() {
+        // When the window only allows ONE batch/cycle, the drain must still
+        // advance through the deferred set (stalest-first) cycle over cycle
+        // and cover everything within a bounded number of cycles — never
+        // re-reading the same prefix forever.
+        let lows: Vec<u32> = (0..10).map(|i| 0x2000 + i * 0x1000).collect();
+        let budget = 2100; // ~2 lows per (single) batch
+        let mut lr = HashMap::new();
+        let mut last_seen: HashMap<u32, u64> = HashMap::new();
+        for cycle in 1..=40 {
+            let reads: Vec<_> = lows
+                .iter()
+                .map(|&a| cr(a, 1000, WatchPriority::Low))
+                .collect();
+            for a in step_drain(&reads, budget, &mut lr, cycle, 1) {
                 last_seen.insert(a, cycle);
             }
-            // Once warmed up, no Low watch may go more than N cycles
-            // without a refresh (10 lows, ~2/cycle => ~5-cycle period;
-            // allow generous slack).
-            if cycle > 12 {
+            if cycle > 10 {
                 for &a in &lows {
                     let seen = *last_seen.get(&a).unwrap_or(&0);
                     assert!(
-                        cycle - seen <= 12,
-                        "Low {a:#06x} stale {} cyc at cycle {cycle}",
+                        cycle - seen <= 8,
+                        "Low {a:#06x} starved {} cyc at cycle {cycle} \
+                         (no forward progress — the restart bug)",
                         cycle - seen
                     );
                 }
@@ -641,7 +717,7 @@ mod tests {
                 .iter()
                 .map(|&a| cr(a, 1000, WatchPriority::Low))
                 .collect();
-            for a in step(reads, budget, &mut lr, cycle) {
+            for a in step_drain(&reads, budget, &mut lr, cycle, 6) {
                 seen.insert(a);
             }
         }
