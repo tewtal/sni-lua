@@ -61,6 +61,24 @@ the `gfx.text` scale arg, and globally via **Overlay → Text size** plus a
 sizing mode: *game-scaled* (zooms with the view, pixel-aligned) or *fixed
 screen px* (constant on-screen size). Settings persist.
 
+### Render resolution (canvas)
+
+The *canvas* is the coordinate space scripts draw into, decoupled from
+on-screen size. Default is native 256x224; a higher-res canvas lets scripts
+place sub-SNES-pixel detail and crisper HUDs (it occupies the same screen
+area — only precision changes).
+
+* Scripts: `gfx.scale(2)` (→512x448), `gfx.canvas(w, h)` (custom).
+  Always read `gfx.width()` / `gfx.height()` for layout — never hardcode
+  256/224, since the app may override the canvas.
+* App: **Overlay → Canvas** = *Script-controlled* (honor the script) or a
+  forced *Native / 2x / 3x / 4x*. Persisted.
+
+See `examples/hires_grid.lua` for a 2x demo.
+
+> Note: there is intentionally no supersampling/AA knob — the overlay is
+> deliberately crisp pixel art; canvas resolution is the higher-res lever.
+
 ## Layout
 
 ```

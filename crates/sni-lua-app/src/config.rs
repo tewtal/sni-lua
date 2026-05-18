@@ -17,6 +17,11 @@ pub struct Config {
     pub capture_mode: String,
     /// Last loaded script path, restored on launch.
     pub last_script: Option<PathBuf>,
+    /// Canvas (script coordinate space) policy:
+    /// "script" = honor the script's gfx.canvas/scale (default native if it
+    /// doesn't ask); "native" / "2x" / "3x" / "4x" = force that, ignoring
+    /// the script's request.
+    pub canvas_mode: String,
     /// Overlay text sizing mode: "game" (scales with viewport/zoom, retro,
     /// pixel-aligned) or "screen" (fixed on-screen size regardless of zoom).
     pub text_sizing_mode: String,
@@ -33,6 +38,7 @@ impl Default for Config {
             poll_interval_ms: 16, // ~60 logical poll cycles/sec target
             capture_mode: "composited".to_string(),
             last_script: None,
+            canvas_mode: "script".to_string(),
             text_sizing_mode: "game".to_string(),
             text_size: 1.0,
         }

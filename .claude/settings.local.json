@@ -35,7 +35,8 @@
       "PowerShell(cargo clean -p mlua-sys 2>&1)",
       "PowerShell(cmd /c \".\\\\build.cmd build -p sni-lua-api\" 2>&1)",
       "PowerShell(.\\\\build.ps1 build 2>&1)",
-      "PowerShell(.\\\\build.ps1 build 2>&1 | Select-Object -Last 3; $p = Start-Process -FilePath \"F:\\\\Code\\\\sni-lua\\\\target\\\\debug\\\\sni-lua.exe\" -PassThru; Start-Sleep -Seconds 4; if \\($p.HasExited\\) { \"EXITED EARLY code=$\\($p.ExitCode\\)\" } else { \"RUNNING ok — closing\"; $p.CloseMainWindow\\(\\) | Out-Null; Start-Sleep -Seconds 1; if \\(-not $p.HasExited\\) { $p | Stop-Process -Force } })"
+      "PowerShell(.\\\\build.ps1 build 2>&1 | Select-Object -Last 3; $p = Start-Process -FilePath \"F:\\\\Code\\\\sni-lua\\\\target\\\\debug\\\\sni-lua.exe\" -PassThru; Start-Sleep -Seconds 4; if \\($p.HasExited\\) { \"EXITED EARLY code=$\\($p.ExitCode\\)\" } else { \"RUNNING ok — closing\"; $p.CloseMainWindow\\(\\) | Out-Null; Start-Sleep -Seconds 1; if \\(-not $p.HasExited\\) { $p | Stop-Process -Force } })",
+      "PowerShell(.\\\\build.ps1 build 2>&1 | Select-String -Pattern \"error|warning: unused|Finished\" | Select-Object -Last 4; $p = Start-Process \"F:\\\\Code\\\\sni-lua\\\\target\\\\debug\\\\sni-lua.exe\" -PassThru; Start-Sleep -Seconds 4; if \\($p.HasExited\\) { \"EXITED code=$\\($p.ExitCode\\)\" } else { \"RUNNING ok\"; $p.CloseMainWindow\\(\\)|Out-Null; Start-Sleep 1; if\\(-not $p.HasExited\\){$p|Stop-Process -Force} })"
     ]
   }
 }

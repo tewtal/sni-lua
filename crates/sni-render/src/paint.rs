@@ -10,7 +10,7 @@
 use egui::{Color32, Painter, Pos2, Rect, Stroke, Vec2};
 
 use crate::font::Font;
-use crate::{Color, DrawCmd, DrawList, SNES_H, SNES_W};
+use crate::{Canvas, Color, DrawCmd, DrawList};
 
 /// How overlay text is sized. The "too big" complaint comes from text being
 /// `viewport_scale × font_scale` tall; this gives the user/script control.
@@ -37,35 +37,54 @@ fn col(c: Color) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
 }
 
-/// Maps SNES pixel space onto a screen rect: uniform scale, centred,
-/// letterboxed. Build one per frame from the viewport the capture occupies.
+/// Maps the active script canvas onto a screen rect: uniform scale, centred,
+/// letterboxed. Build one per frame from the area the capture occupies.
+///
+/// Decoupling the canvas (script coord space) from this fit means a script
+/// drawing in 512x448 lands in exactly the same on-screen place as one
+/// drawing in 256x224 — only the precision differs.
 #[derive(Clone, Copy)]
 pub struct Viewport {
     origin: Pos2,
+    /// Screen pixels per canvas pixel.
     scale: f32,
+    canvas: Canvas,
 }
 
 impl Viewport {
-    /// Fit the 256x224 SNES surface inside `area` (the rect the capture frame
-    /// is drawn in), preserving aspect ratio.
-    pub fn fit(area: Rect) -> Self {
-        let scale = (area.width() / SNES_W).min(area.height() / SNES_H);
-        let w = SNES_W * scale;
-        let h = SNES_H * scale;
+    /// Fit `canvas` inside `area`, preserving aspect ratio.
+    pub fn fit(area: Rect, canvas: Canvas) -> Self {
+        let scale =
+            (area.width() / canvas.w).min(area.height() / canvas.h);
+        let w = canvas.w * scale;
+        let h = canvas.h * scale;
         let origin = Pos2::new(
             area.center().x - w * 0.5,
             area.center().y - h * 0.5,
         );
-        Self { origin, scale }
+        Self {
+            origin,
+            scale,
+            canvas,
+        }
     }
 
-    /// The screen rect the SNES surface actually occupies (for a border /
+    /// Back-compat: fit the native SNES canvas. Prefer [`Viewport::fit`].
+    pub fn fit_native(area: Rect) -> Self {
+        Self::fit(area, Canvas::native())
+    }
+
+    /// The screen rect the canvas actually occupies (for a border /
     /// background fill behind the overlay).
     pub fn screen_rect(&self) -> Rect {
         Rect::from_min_size(
             self.origin,
-            Vec2::new(SNES_W * self.scale, SNES_H * self.scale),
+            Vec2::new(self.canvas.w * self.scale, self.canvas.h * self.scale),
         )
+    }
+
+    pub fn canvas(&self) -> Canvas {
+        self.canvas
     }
 
     #[inline]
@@ -173,8 +192,14 @@ fn paint_text(
     // the per-label multiplier on top. This single value is the whole fix
     // for "text too big": FixedScreen ignores viewport zoom; GameScaled.mult
     // and label_scale shrink it.
+    //
+    // In GameScaled mode we size relative to a *SNES* pixel, not a canvas
+    // pixel, so a HUD looks identical whether the script draws in a 256 or
+    // 512 canvas — only its positioning precision differs. (screen px per
+    // SNES px = vp.scale / snes_ratio = vp.scale * canvas.w / 256.)
+    let snes_px = vp.scale / vp.canvas().snes_ratio();
     let px = match sizing {
-        TextSizing::GameScaled { mult } => vp.scale * mult * label_scale,
+        TextSizing::GameScaled { mult } => snes_px * mult * label_scale,
         TextSizing::FixedScreen { px } => px * label_scale,
     }
     .max(1.0);
@@ -222,22 +247,39 @@ mod tests {
 
     #[test]
     fn viewport_fits_and_centres() {
-        // A 1024x448 area: SNES 256x224 scales by min(4, 2) = 2.
+        // A 1024x448 area: native 256x224 scales by min(4, 2) = 2.
         let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 448.0));
-        let vp = Viewport::fit(area);
+        let vp = Viewport::fit(area, Canvas::native());
         let r = vp.screen_rect();
         assert_eq!(r.width(), 512.0); // 256 * 2
         assert_eq!(r.height(), 448.0); // 224 * 2
-        // Centred horizontally: (1024 - 512) / 2 = 256.
-        assert_eq!(r.min.x, 256.0);
+        assert_eq!(r.min.x, 256.0); // (1024 - 512) / 2
         assert_eq!(r.min.y, 0.0);
     }
 
     #[test]
-    fn snes_origin_maps_to_viewport_origin() {
-        let area = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::splat(512.0));
-        let vp = Viewport::fit(area);
-        // SNES (0,0) must map to the top-left of the fitted surface.
+    fn canvas_origin_maps_to_viewport_origin() {
+        let area =
+            Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::splat(512.0));
+        let vp = Viewport::fit(area, Canvas::native());
         assert_eq!(vp.pt(0.0, 0.0), vp.screen_rect().min);
+    }
+
+    #[test]
+    fn higher_res_canvas_occupies_same_screen_area() {
+        // The whole point of decoupling: a 2x canvas must land in exactly
+        // the same on-screen rect as native — only precision differs.
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 448.0));
+        let native = Viewport::fit(area, Canvas::native());
+        let hi = Viewport::fit(area, Canvas::scaled(2));
+        assert_eq!(native.screen_rect(), hi.screen_rect());
+        // Canvas centre maps to the same screen point in both.
+        assert_eq!(native.pt(128.0, 112.0), hi.pt(256.0, 224.0));
+    }
+
+    #[test]
+    fn scaled_canvas_is_clamped() {
+        assert_eq!(Canvas::scaled(0).w, super::super::SNES_W); // min 1x
+        assert_eq!(Canvas::scaled(9999).w, super::super::SNES_W * 8.0);
     }
 }

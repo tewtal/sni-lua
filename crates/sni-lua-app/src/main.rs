@@ -200,6 +200,23 @@ impl App {
             sni_render::TextSizing::GameScaled { mult: s }
         }
     }
+
+    /// Resolve the canvas to use this frame and push it onto the host so the
+    /// script's `gfx.width()/height()` are correct *during* `on_frame`.
+    /// "script" honors the script's request; anything else overrides it.
+    fn apply_canvas(&self) -> sni_render::Canvas {
+        use sni_render::Canvas;
+        let c = match self.config.canvas_mode.as_str() {
+            "native" => Canvas::native(),
+            "2x" => Canvas::scaled(2),
+            "3x" => Canvas::scaled(3),
+            "4x" => Canvas::scaled(4),
+            // "script": leave whatever the script last requested in place.
+            _ => self.host.requested_canvas(),
+        };
+        self.host.set_canvas(c);
+        c
+    }
 }
 
 impl eframe::App for App {
@@ -222,10 +239,18 @@ impl eframe::App for App {
         };
         let (conn, devices, selected_uri, mapping, last_probe) = snap;
 
-        // Run the script's on_frame against the latest cached snapshot. This
-        // is a lock-free snapshot read inside the host — no SNI round trip on
-        // the UI thread. Produces this frame's draw list for the renderer.
+        // Resolve the canvas before the frame so gfx.width()/height() are
+        // correct inside on_frame, then run the script against the latest
+        // cached snapshot (lock-free; no SNI round trip on the UI thread).
+        // In "script" mode the script may change the canvas during the frame,
+        // so re-read it afterwards for the viewport.
+        self.apply_canvas();
         self.draw_list = self.host.run_frame();
+        let active_canvas = if self.config.canvas_mode == "script" {
+            self.host.requested_canvas()
+        } else {
+            self.apply_canvas()
+        };
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -369,6 +394,47 @@ impl eframe::App for App {
                         "Scripts default to the compact 5x7 font; \
                          gfx.font(\"normal\") selects the larger 8x8.",
                     )
+                    .small()
+                    .weak(),
+                );
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Canvas");
+                    let mut m = self.config.canvas_mode.clone();
+                    let label = match m.as_str() {
+                        "native" => "Native 256x224",
+                        "2x" => "2x  512x448",
+                        "3x" => "3x  768x672",
+                        "4x" => "4x  1024x896",
+                        _ => "Script-controlled",
+                    };
+                    egui::ComboBox::from_id_salt("canvas_mode")
+                        .selected_text(label)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut m,
+                                "script".into(),
+                                "Script-controlled (gfx.scale/canvas)",
+                            );
+                            ui.selectable_value(
+                                &mut m, "native".into(), "Native 256x224",
+                            );
+                            ui.selectable_value(&mut m, "2x".into(), "2x  512x448");
+                            ui.selectable_value(&mut m, "3x".into(), "3x  768x672");
+                            ui.selectable_value(&mut m, "4x".into(), "4x  1024x896");
+                        });
+                    if m != self.config.canvas_mode {
+                        self.config.canvas_mode = m;
+                        self.config.save();
+                    }
+                });
+                let ac = self.host.requested_canvas();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "active canvas: {}x{}  (gfx.width/height report this)",
+                        ac.w as u32, ac.h as u32
+                    ))
                     .small()
                     .weak(),
                 );
@@ -597,8 +663,10 @@ impl eframe::App for App {
             // Backdrop behind everything (M6's capture feed will fill here).
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 18, 22));
 
-            // Map SNES pixel space onto the available area, letterboxed.
-            let vp = sni_render::Viewport::fit(rect);
+            // Map the active script canvas onto the available area,
+            // letterboxed. A higher-res canvas lands in the same screen
+            // rect — only the script's drawing precision changes.
+            let vp = sni_render::Viewport::fit(rect, active_canvas);
             let view = vp.screen_rect();
 
             // Placeholder "screen" so the overlay reads against something

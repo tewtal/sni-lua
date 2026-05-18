@@ -36,7 +36,7 @@ use mlua::{Lua, MultiValue, Value};
 use parking_lot::Mutex;
 use sni_cache::{PollEngine, WatchPriority};
 use sni_client::MemRegion;
-use sni_render::{Color, DrawCmd, DrawList, Font};
+use sni_render::{Canvas, Color, DrawCmd, DrawList, Font};
 
 /// Script-facing error. `mlua::Error` is not `Send + Sync` when mlua is
 /// built without its `send` feature (which we deliberately don't enable, so
@@ -109,6 +109,10 @@ pub struct ScriptHost {
     /// reset to the default at the start of each frame so a script can't
     /// leave it in a surprising state. `Cell` since access is single-threaded.
     current_font: Rc<Cell<Font>>,
+    /// Canvas the script has requested via `gfx.canvas`/`gfx.scale`. The app
+    /// reads this each frame to build the viewport (and may override it with
+    /// a user setting). Shared so `gfx.width()`/`height()` and the app agree.
+    requested_canvas: Rc<Cell<Canvas>>,
     /// True once a script has been loaded without error.
     loaded: bool,
 }
@@ -130,6 +134,7 @@ impl ScriptHost {
             console: Arc::new(Console::default()),
             draw: Rc::new(RefCell::new(DrawList::default())),
             current_font: Rc::new(Cell::new(Font::default())),
+            requested_canvas: Rc::new(Cell::new(Canvas::default())),
             loaded: false,
         };
         host.install_api()?;
@@ -317,6 +322,48 @@ impl ScriptHost {
             gfx.set("font", f)?;
         }
 
+        // gfx.canvas(w, h) — request a custom coordinate space. The app may
+        // override (user setting); gfx.width()/height() always report the
+        // effective canvas so positioning code stays correct either way.
+        {
+            let canvas = self.requested_canvas.clone();
+            let f = self
+                .lua
+                .create_function(move |_, (w, h): (f32, f32)| {
+                    canvas.set(Canvas::custom(w, h));
+                    Ok(())
+                })?;
+            gfx.set("canvas", f)?;
+        }
+
+        // gfx.scale(n) — request an integer multiple of native 256x224
+        // (e.g. 2 -> 512x448) for higher-res overlays.
+        {
+            let canvas = self.requested_canvas.clone();
+            let f = self.lua.create_function(move |_, n: u32| {
+                canvas.set(Canvas::scaled(n));
+                Ok(())
+            })?;
+            gfx.set("scale", f)?;
+        }
+
+        // gfx.width() / gfx.height() — the ACTIVE canvas size. Always read
+        // these for layout; never assume 256x224.
+        {
+            let canvas = self.requested_canvas.clone();
+            let f = self
+                .lua
+                .create_function(move |_, ()| Ok(canvas.get().w))?;
+            gfx.set("width", f)?;
+        }
+        {
+            let canvas = self.requested_canvas.clone();
+            let f = self
+                .lua
+                .create_function(move |_, ()| Ok(canvas.get().h))?;
+            gfx.set("height", f)?;
+        }
+
         // gfx.box(x, y, w, h, color?, fill?, thickness?) — outline + optional
         // fill. The bread-and-butter hitbox primitive.
         {
@@ -431,6 +478,19 @@ impl ScriptHost {
         self.loaded
     }
 
+    /// The canvas the script currently wants (its last `gfx.canvas`/`scale`,
+    /// or native by default). The app reads this to decide the effective
+    /// canvas (it may honor or override it).
+    pub fn requested_canvas(&self) -> Canvas {
+        self.requested_canvas.get()
+    }
+
+    /// Force the active canvas (app override). Call before `run_frame` so the
+    /// script's `gfx.width()`/`height()` report the size actually in use.
+    pub fn set_canvas(&self, c: Canvas) {
+        self.requested_canvas.set(c);
+    }
+
     /// Run one frame: clears the draw list, calls the script's `on_frame()`,
     /// and returns the produced commands for the renderer. A script error is
     /// reported to the console and disables the script (returns empty) so a
@@ -500,6 +560,35 @@ mod tests {
         .unwrap();
         let dl = h.run_frame();
         assert_eq!(dl.cmds.len(), 2, "text + box pushed");
+    }
+
+    #[test]
+    fn gfx_scale_changes_reported_canvas() {
+        let mut h = host();
+        h.load_script(
+            r#"
+            gfx.scale(2)
+            cw, ch = gfx.width(), gfx.height()
+            "#,
+            "t",
+        )
+        .unwrap();
+        let cw: f32 = h.lua.globals().get("cw").unwrap();
+        let ch: f32 = h.lua.globals().get("ch").unwrap();
+        assert_eq!((cw, ch), (512.0, 448.0));
+        assert_eq!(h.requested_canvas().w, 512.0);
+    }
+
+    #[test]
+    fn app_can_override_script_canvas() {
+        let mut h = host();
+        h.load_script(r#"gfx.scale(4)"#, "t").unwrap();
+        assert_eq!(h.requested_canvas().w, 1024.0);
+        // App forces native; gfx.width() inside a later frame must follow.
+        h.set_canvas(Canvas::native());
+        h.load_script(r#"w = gfx.width()"#, "t2").unwrap();
+        let w: f32 = h.lua.globals().get("w").unwrap();
+        assert_eq!(w, 256.0);
     }
 
     #[test]
