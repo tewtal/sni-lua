@@ -4,7 +4,11 @@ option go_package = "github.com/alttpo/sni/protos/sni";
 option csharp_namespace = "SNI";
 option java_package = "com.github.alttpo.sni";
 
-package sni;
+// NOTE: SNI's upstream proto has NO `package` declaration, so its gRPC
+// service paths are `/Devices/ListDevices` etc. with no package prefix.
+// We must match that on the wire — do NOT add `package sni;` here or the
+// server returns "unknown service sni.Devices". The Rust module name is set
+// in build.rs via tonic-build instead.
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
 // services

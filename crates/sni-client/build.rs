@@ -6,6 +6,10 @@ fn main() {
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc");
     env::set_var("PROTOC", protoc);
 
+    // The SNI proto has no `package`, so tonic-build emits the code for the
+    // empty/default package. We point OUT_DIR at a known file and `include!`
+    // it from a hand-declared `pb` module in lib.rs (instead of the
+    // package-name-based `tonic::include_proto!`).
     tonic_build::configure()
         .build_server(false)
         .build_client(true)

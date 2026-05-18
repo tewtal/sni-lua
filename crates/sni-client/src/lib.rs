@@ -5,8 +5,14 @@
 //! protobuf messages at call sites.
 
 pub mod pb {
-    //! Generated SNI protobuf + tonic client code (`package sni;`).
-    tonic::include_proto!("sni");
+    //! Generated SNI protobuf + tonic client code.
+    //!
+    //! SNI's proto has no `package`, so tonic-build emits the default-package
+    //! file (`_.rs`). We include it here under our own module name; this keeps
+    //! the on-wire gRPC service paths exactly `/Devices/...`, `/DeviceMemory/...`
+    //! — adding a proto package would make the server reject calls with
+    //! `unknown service sni.Devices`.
+    include!(concat!(env!("OUT_DIR"), "/_.rs"));
 }
 
 use std::time::Duration;
