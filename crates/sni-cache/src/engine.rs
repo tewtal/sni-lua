@@ -43,6 +43,13 @@ pub struct PollConfig {
     pub coalesce_gap: u32,
     /// EWMA smoothing for the reported RTT (0..1; higher = snappier).
     pub rtt_alpha: f32,
+    /// Demand window: an auto-registered watch the script hasn't read within
+    /// this long stops being actively polled (goes dormant — its last value
+    /// stays cached, but it costs no bandwidth until the script reads it
+    /// again). Stops the watched set growing without bound as the script
+    /// roams (e.g. block data from rooms ago). Pinned watches (controller,
+    /// frame counter, explicit snes.tier) ignore this.
+    pub demand_window: Duration,
 }
 
 impl Default for PollConfig {
@@ -57,6 +64,11 @@ impl Default for PollConfig {
             max_byte_budget: 64 * 1024,
             coalesce_gap: 16,
             rtt_alpha: 0.25,
+            // ~1s: a watch unread for a full second of frames is almost
+            // certainly no longer wanted (the script roamed away). Long
+            // enough that briefly-not-read data (every-few-frames logic)
+            // doesn't thrash dormant/active.
+            demand_window: Duration::from_millis(1000),
         }
     }
 }
@@ -65,7 +77,10 @@ impl Default for PollConfig {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PollStats {
     pub cycle: u64,
+    /// Watches actively polled this cycle (pinned + within demand window).
     pub watches: usize,
+    /// Total registered watches incl. dormant (still cached, not polled).
+    pub watches_total: usize,
     pub reads_last_cycle: usize,
     pub bytes_last_cycle: u32,
     pub rtt_ms_ewma: f32,
@@ -163,8 +178,19 @@ pub fn spawn(
             };
 
             cycle += 1;
-            let watches = registry.all();
-            let live_ids: HashSet<u64> = watches.iter().map(|w| w.id).collect();
+            // Retention set = ALL registered watches: dormant (demand-evicted)
+            // ones must keep their last cached value so the script can still
+            // read stale data without it vanishing.
+            let all_watches = registry.all();
+            let live_ids: HashSet<u64> =
+                all_watches.iter().map(|w| w.id).collect();
+
+            // Poll set = only ACTIVE watches: pinned + read by the script
+            // within the demand window. This is the fix for the watched set
+            // growing without bound — data the script stopped caring about
+            // (blocks from rooms ago) is no longer fetched, freeing the
+            // budget for what's actually wanted.
+            let watches = registry.active(cfg.demand_window);
 
             // Build the next snapshot on top of the previous one so watches
             // not refreshed this cycle keep their last value (just age).
@@ -319,6 +345,7 @@ pub fn spawn(
                 let mut st = stats.lock();
                 st.cycle = cycle;
                 st.watches = watches.len();
+                st.watches_total = all_watches.len();
                 st.reads_last_cycle = reads_issued;
                 st.bytes_last_cycle = bytes_requested;
                 st.byte_budget = budget;

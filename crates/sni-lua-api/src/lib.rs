@@ -213,10 +213,15 @@ impl ScriptHost {
         // Typed cached reads. These read the latest published snapshot — a
         // lock-free load, never a round trip. Return nil if the watch hasn't
         // been populated yet (so scripts can guard the first few frames).
+        // Each value read is also the script's *demand signal*: touching the
+        // watch resets its demand-eviction timer so the engine keeps polling
+        // it. Watches the script stops reading go dormant (cached, not
+        // refreshed) — that's what stops the polled set growing forever.
         macro_rules! reader {
             ($name:literal, $method:ident, $ty:ty) => {{
                 let engine = self.engine.clone();
                 let f = self.lua.create_function(move |_, id: u64| {
+                    engine.registry().touch(id);
                     Ok(engine.snapshot().$method(id).map(|v| v as $ty))
                 })?;
                 snes.set($name, f)?;
@@ -232,6 +237,7 @@ impl ScriptHost {
         {
             let engine = self.engine.clone();
             let f = self.lua.create_function(move |lua, id: u64| {
+                engine.registry().touch(id);
                 let snap = engine.snapshot();
                 match snap.bytes(id) {
                     Some(b) => {
@@ -251,9 +257,11 @@ impl ScriptHost {
         // Lets scripts dim/flag stale data instead of trusting it blindly.
         {
             let engine = self.engine.clone();
-            let f = self
-                .lua
-                .create_function(move |_, id: u64| Ok(engine.snapshot().watch_age(id)))?;
+            let f = self.lua.create_function(move |_, id: u64| {
+                // Checking staleness implies interest -> keep it active.
+                engine.registry().touch(id);
+                Ok(engine.snapshot().watch_age(id))
+            })?;
             snes.set("age", f)?;
         }
 

@@ -19,6 +19,12 @@ pub struct Config {
     /// 60fps frame; raise it to let block data refresh faster at the cost
     /// of occasional longer cycles.
     pub frame_budget_ms: u32,
+    /// Demand window (ms): an auto-registered watch the script hasn't read
+    /// for this long stops being polled (goes dormant — stays cached, costs
+    /// no bandwidth). Stops the watched set growing without bound as the
+    /// script roams. Pinned watches (controller, frame counter, explicit
+    /// snes.tier) are unaffected.
+    pub demand_window_ms: u32,
     /// Capture mode: "composited" or "transparent".
     pub capture_mode: String,
     /// Capture device index (composited mode). Capture cards enumerate as
@@ -61,6 +67,7 @@ impl Default for Config {
             sni_endpoint: format!("http://127.0.0.1:{}", sni_client::DEFAULT_GRPC_PORT),
             poll_interval_ms: 16, // ~60 logical poll cycles/sec target
             frame_budget_ms: 16,  // adaptive budget keeps bulk reads ≤ 1 frame
+            demand_window_ms: 1000, // unread ~1s -> dormant
             capture_mode: "composited".to_string(),
             capture_device: 0,
             capture_width: 0,

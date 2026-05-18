@@ -128,8 +128,11 @@ impl App {
             move || slot.load_full().as_ref().clone(),
             PollConfig {
                 frame_budget_ms: config.frame_budget_ms.max(1),
+                demand_window: std::time::Duration::from_millis(
+                    config.demand_window_ms.max(50) as u64,
+                ),
                 ..PollConfig::default()
-            },
+            }, // (App::poll_config mirrors this; kept inline pre-construction)
         );
 
         // Lua host: shares the poll engine (for cached reads) and a write
@@ -219,6 +222,19 @@ impl App {
             return None;
         }
         Some(MemRegion::fxpak(addr, self.probe_size))
+    }
+
+    /// Build the engine's PollConfig from the persisted settings. One place
+    /// so spawn and every live `set_config` stay consistent (a partial
+    /// `..default()` would silently reset the other tunables).
+    fn poll_config(&self) -> PollConfig {
+        PollConfig {
+            frame_budget_ms: self.config.frame_budget_ms.max(1),
+            demand_window: std::time::Duration::from_millis(
+                self.config.demand_window_ms.max(50) as u64,
+            ),
+            ..PollConfig::default()
+        }
     }
 
     /// Translate the persisted overlay-text settings into the renderer's
@@ -936,7 +952,10 @@ impl eframe::App for App {
                         ui.monospace(stats.cycle.to_string());
                         ui.end_row();
                         ui.label("watches");
-                        ui.monospace(stats.watches.to_string());
+                        ui.monospace(format!(
+                            "{} active / {} total",
+                            stats.watches, stats.watches_total
+                        ));
                         ui.end_row();
                         ui.label("reads/cycle");
                         ui.monospace(format!(
@@ -991,16 +1010,34 @@ impl eframe::App for App {
                         // Push live to the running engine; the adaptive
                         // budget re-converges to the new target within a
                         // few cycles.
-                        self.engine.set_config(sni_cache::PollConfig {
-                            frame_budget_ms: self
-                                .config
-                                .frame_budget_ms
-                                .max(1),
-                            ..sni_cache::PollConfig::default()
-                        });
+                        self.engine.set_config(self.poll_config());
                         self.config.save();
                     }
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Demand window");
+                    if ui
+                        .add(
+                            egui::Slider::new(
+                                &mut self.config.demand_window_ms,
+                                100..=5000,
+                            )
+                            .suffix(" ms"),
+                        )
+                        .changed()
+                    {
+                        self.engine.set_config(self.poll_config());
+                        self.config.save();
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "watches unread this long stop being polled \
+                         (stay cached); frees bandwidth for live data",
+                    )
+                    .small()
+                    .weak(),
+                );
                 ui.label(
                     egui::RichText::new(
                         "engine reads as much as it can while keeping bulk \

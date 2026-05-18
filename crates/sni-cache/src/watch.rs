@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use parking_lot::RwLock;
 use sni_client::MemRegion;
@@ -69,13 +70,31 @@ pub struct WatchHandle {
     pub priority: WatchPriority,
 }
 
+/// Internal registry entry: the handle plus demand-tracking state. The
+/// read-through cache registers a watch on first touch and never explicitly
+/// unregisters, so without this the polled set only grows — eventually the
+/// budget is saturated refreshing data the script no longer reads. Instead
+/// each watch records when the script last *requested* it; the engine only
+/// actively polls watches touched within a demand window. Dormant watches
+/// keep their last cached value (the script can still read stale data) but
+/// cost no bandwidth until touched again.
+struct WatchEntry {
+    handle: WatchHandle,
+    /// Last time a Lua accessor read this watch's value.
+    last_touch: Instant,
+    /// Declared watches (controller mirror, frame counter, explicit
+    /// snes.tier) are pinned: always polled, never demand-evicted. Only the
+    /// auto-registered read-through watches are demand-driven.
+    pinned: bool,
+}
+
 /// Registry shared between the script host (writers) and the poll engine
 /// (reader). Cheap reads of the full set each cycle via a snapshot clone;
 /// registration is rare relative to polling.
 #[derive(Default)]
 pub struct WatchRegistry {
     next_id: AtomicU64,
-    inner: RwLock<BTreeMap<WatchId, WatchHandle>>,
+    inner: RwLock<BTreeMap<WatchId, WatchEntry>>,
 }
 
 impl WatchRegistry {
@@ -90,19 +109,48 @@ impl WatchRegistry {
             region,
             priority,
         };
-        self.inner.write().insert(id, handle.clone());
+        self.inner.write().insert(
+            id,
+            WatchEntry {
+                handle: handle.clone(),
+                last_touch: Instant::now(), // just-registered counts as wanted
+                pinned: false,
+            },
+        );
         handle
+    }
+
+    /// Mark a watch as requested by the script *now*. Called by the Lua value
+    /// accessors so the engine knows the script still cares; resets the
+    /// demand-eviction timer. Cheap (write lock, O(log n)) and only on actual
+    /// reads.
+    pub fn touch(&self, id: WatchId) {
+        if let Some(e) = self.inner.write().get_mut(&id) {
+            e.last_touch = Instant::now();
+        }
+    }
+
+    /// Pin a watch so it is always polled regardless of demand. For declared
+    /// watches (controller mirror, frame counter, explicit `snes.tier`) — the
+    /// script means "keep this fresh" even across frames it doesn't read it.
+    pub fn pin(&self, id: WatchId) {
+        if let Some(e) = self.inner.write().get_mut(&id) {
+            e.pinned = true;
+        }
     }
 
     /// Raise a watch to at least `priority` (never downgrades). Used by
     /// `snes.tier` so an explicit hint can upgrade an address that was
     /// already auto-registered, without a later auto-classify clobbering it.
     /// `WatchPriority` is ordered most-urgent-first, so the upgrade is `min`.
+    /// An explicit tier hint also pins the watch (it's now declared, not
+    /// demand-driven).
     pub fn upgrade_priority(&self, id: WatchId, priority: WatchPriority) {
-        if let Some(h) = self.inner.write().get_mut(&id) {
-            if priority < h.priority {
-                h.priority = priority;
+        if let Some(e) = self.inner.write().get_mut(&id) {
+            if priority < e.handle.priority {
+                e.handle.priority = priority;
             }
+            e.pinned = true;
         }
     }
 
@@ -114,13 +162,43 @@ impl WatchRegistry {
         self.inner.write().clear();
     }
 
-    /// Snapshot of all current watches, ordered by id (stable iteration).
+    /// All watches, ordered by id. Used for snapshot retention so dormant
+    /// (demand-evicted) watches keep their last cached value — the script can
+    /// still read stale data, it just isn't refreshed.
     pub fn all(&self) -> Vec<WatchHandle> {
-        self.inner.read().values().cloned().collect()
+        self.inner.read().values().map(|e| e.handle.clone()).collect()
+    }
+
+    /// Watches the engine should actively poll this cycle: pinned ones, plus
+    /// auto-registered ones the script has read within `window`. This is the
+    /// demand filter that stops us spending bandwidth on data the script
+    /// stopped caring about (e.g. blocks from rooms ago).
+    pub fn active(&self, window: std::time::Duration) -> Vec<WatchHandle> {
+        let now = Instant::now();
+        self.inner
+            .read()
+            .values()
+            .filter(|e| {
+                e.pinned || now.duration_since(e.last_touch) < window
+            })
+            .map(|e| e.handle.clone())
+            .collect()
     }
 
     pub fn len(&self) -> usize {
         self.inner.read().len()
+    }
+
+    /// Count of watches currently active for a given demand window (HUD).
+    pub fn active_len(&self, window: std::time::Duration) -> usize {
+        let now = Instant::now();
+        self.inner
+            .read()
+            .values()
+            .filter(|e| {
+                e.pinned || now.duration_since(e.last_touch) < window
+            })
+            .count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -290,5 +368,42 @@ mod tests {
         // Realtime -> Normal: must NOT downgrade (explicit hint stays).
         reg.upgrade_priority(w.id, WatchPriority::Normal);
         assert_eq!(reg.all()[0].priority, WatchPriority::Realtime);
+    }
+
+    #[test]
+    fn unread_watch_goes_dormant_but_stays_cached() {
+        use std::time::Duration;
+        let reg = WatchRegistry::new();
+        let a = reg.register(MemRegion::fxpak(0xF5_0AF6, 2), WatchPriority::High);
+        let b = reg.register(MemRegion::fxpak(0xF5_8000, 16), WatchPriority::Low);
+
+        // Fresh registrations are active under a generous window.
+        let active: Vec<_> = reg
+            .active(Duration::from_secs(3600))
+            .iter()
+            .map(|w| w.id)
+            .collect();
+        assert!(
+            active.contains(&a.id) && active.contains(&b.id),
+            "fresh registrations are active"
+        );
+
+        // Let time pass, then touch only `a`. With a sub-elapsed window,
+        // `a` (touched just now) survives; `b` (untouched) goes dormant.
+        std::thread::sleep(Duration::from_millis(5));
+        reg.touch(a.id);
+        let win = Duration::from_millis(2);
+        let active: Vec<_> = reg.active(win).iter().map(|w| w.id).collect();
+        assert!(active.contains(&a.id), "touched watch stays active");
+        assert!(!active.contains(&b.id), "unread watch goes dormant");
+
+        // Dormant != gone: it's still registered (cache retained via all()).
+        assert!(reg.all().iter().any(|w| w.id == b.id),
+            "dormant watch keeps its cached value");
+
+        // Pinning overrides demand: pin b, it's active despite being unread.
+        reg.pin(b.id);
+        let active: Vec<_> = reg.active(win).iter().map(|w| w.id).collect();
+        assert!(active.contains(&b.id), "pinned watch ignores demand window");
     }
 }
