@@ -101,6 +101,24 @@ Caveats: click-through uses Win32 `WS_EX_TRANSPARENT|WS_EX_LAYERED` and is
 window won't be click-through (logged on startup). Some capture cards expose
 only certain resolutions/FPS; the highest-FPS format is requested.
 
+### Running existing Mesen2 scripts
+
+`examples/compat/mesen2_prelude.lua` is a compatibility shim that defines a
+fake Mesen2 `emu` API on top of sni-lua's async `snes`/`gfx` API, so an
+**unmodified Mesen2 SNES script** can run over SNI. The interesting part is
+the *read-through cache*: Mesen2's `emu.read()` is synchronous and instant,
+but sni-lua has no synchronous read (the FXPAK is latency-bound). The shim
+turns each `emu.read(addr)` into a cache lookup that, on a miss, lazily
+registers a watch — so within a few frames every address the script touches
+is being batched by the poll engine automatically. The foreign script's
+synchronous-looking code "just works" on the async model.
+
+`examples/super_hitbox_sni.lua` is a real 4500-line Mesen2 hitbox/route
+script ported this way (prelude + the original body, with its six Lua-5.3
+bitwise-operator helper lines rewritten to LuaJIT's `bit.*` — LuaJIT is
+5.1-based). Regenerate it with `examples/compat/build_super_hitbox.lua` if
+you update the upstream script.
+
 ## Layout
 
 ```

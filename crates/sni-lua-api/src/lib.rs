@@ -563,6 +563,31 @@ mod tests {
     }
 
     #[test]
+    fn ported_super_hitbox_loads_and_runs() {
+        // The real test: a 4800-line Mesen2 script ported via the compat
+        // prelude must load and survive several frames on the async model
+        // (no SNI client -> all reads return the cache default of 0, which
+        // the script's guards must tolerate).
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/super_hitbox_sni.lua"
+        );
+        let src = std::fs::read_to_string(path)
+            .expect("ported script present");
+        let mut h = host();
+        h.load_script(&src, "super_hitbox_sni.lua")
+            .expect("ported script loads without error");
+        for _ in 0..5 {
+            let _ = h.run_frame();
+            assert!(
+                h.is_loaded(),
+                "script disabled itself: {:?}",
+                h.console().snapshot()
+            );
+        }
+    }
+
+    #[test]
     fn gfx_scale_changes_reported_canvas() {
         let mut h = host();
         h.load_script(

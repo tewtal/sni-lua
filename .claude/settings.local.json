@@ -43,7 +43,12 @@
       "Bash(python -c \"import sys,json; d=json.loads\\(sys.stdin.read\\(\\)\\); print\\('version:', d['vers']\\); print\\('features:', list\\(d.get\\('features',{}\\).keys\\(\\)\\)\\)\")",
       "Bash(curl -s \"https://crates.io/api/v1/crates/nokhwa\")",
       "Bash(python -c \"import sys,json;d=json.load\\(sys.stdin\\);print\\(d['crate']['max_stable_version']\\)\")",
-      "PowerShell($p = Start-Process \"F:\\\\Code\\\\sni-lua\\\\target\\\\debug\\\\sni-lua.exe\" -PassThru; Start-Sleep -Seconds 5; if \\($p.HasExited\\) { \"EXITED EARLY code=$\\($p.ExitCode\\)\" } else { \"RUNNING ok \\(capture thread + UI alive\\)\"; $p.CloseMainWindow\\(\\)|Out-Null; Start-Sleep 2; if\\(-not $p.HasExited\\){$p|Stop-Process -Force; \"force-killed\"} else {\"clean exit\"} })"
+      "PowerShell($p = Start-Process \"F:\\\\Code\\\\sni-lua\\\\target\\\\debug\\\\sni-lua.exe\" -PassThru; Start-Sleep -Seconds 5; if \\($p.HasExited\\) { \"EXITED EARLY code=$\\($p.ExitCode\\)\" } else { \"RUNNING ok \\(capture thread + UI alive\\)\"; $p.CloseMainWindow\\(\\)|Out-Null; Start-Sleep 2; if\\(-not $p.HasExited\\){$p|Stop-Process -Force; \"force-killed\"} else {\"clean exit\"} })",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test -p sni-lua-api ported_super_hitbox -- --nocapture 2>&1 | Select-String -Pattern \"load error|panicked at|\\\\.lua:|attempt to|nil value|unexpected symbol|syntax|'<eof>'|near \" | Select-Object -First 12)",
+      "Bash(lua -v)",
+      "Bash(luajit -v)",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test -p sni-lua-api ported_super_hitbox -- --nocapture 2>&1 | Select-String -Pattern \"test result|ported script loads|panicked at|\\\\.lua:\\\\d+|attempt to|nil value|disabled itself|on_frame error|on_init error\" | Select-Object -First 12)",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test 2>&1 | Select-String -Pattern \"test result:|FAILED|error\\\\[\" | Select-Object -First 12)"
     ]
   }
 }
