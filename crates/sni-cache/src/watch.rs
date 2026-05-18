@@ -136,6 +136,10 @@ pub struct CoalescedRead {
     pub region: MemRegion,
     /// (watch id, byte offset within `region`, watch size).
     pub members: Vec<(WatchId, u32, u32)>,
+    /// Most-urgent priority among the members. The budgeter sorts by this so
+    /// trimming sheds genuinely-lowest-priority reads (not just high
+    /// addresses, which `coalesce` happens to order by).
+    pub priority: WatchPriority,
 }
 
 /// Merge the given watches into the fewest read requests. Watches in the same
@@ -195,11 +199,21 @@ fn finish_run(start: u32, end: u32, members: &[&WatchHandle]) -> CoalescedRead {
         space: proto.space,
         mapping: proto.mapping,
     };
+    // Most-urgent member wins (WatchPriority is ordered urgent-first, so min).
+    let priority = members
+        .iter()
+        .map(|w| w.priority)
+        .min()
+        .unwrap_or(WatchPriority::Low);
     let members = members
         .iter()
         .map(|w| (w.id, w.region.address - start, w.region.size))
         .collect();
-    CoalescedRead { region, members }
+    CoalescedRead {
+        region,
+        members,
+        priority,
+    }
 }
 
 #[cfg(test)]

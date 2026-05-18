@@ -146,6 +146,12 @@ pub fn spawn(
             c.min_byte_budget.max(2048).min(c.max_byte_budget)
         };
         let mut throughput: Option<f32> = None;
+        // Round-robin cursor over the Low-priority (prefetch) reads. When the
+        // budget can't fit them all, we admit a *rotating* slice each cycle
+        // so the whole map/level streams in over successive cycles instead
+        // of the same low-address prefix always winning and the rest
+        // starving forever.
+        let mut low_cursor: usize = 0;
         loop {
             let cfg = config.lock().clone();
             let cycle_start = Instant::now();
@@ -198,37 +204,32 @@ pub fn spawn(
             }
 
             // --- Tier 2: bulk batch ---------------------------------------
-            // Non-realtime watches whose priority period divides this cycle.
-            // High every cycle, Normal every 3, Low every 12 — spends the
-            // byte budget on what changes fast / what's due.
+            // Eligibility by tier:
+            //   High   — every cycle (fast-moving visuals).
+            //   Normal — every 3rd cycle.
+            //   Low    — ALWAYS eligible. Prefetch/block data must stream
+            //            continuously; gating it by a 12-cycle period meant
+            //            that when the budget trimmed it, it then waited 12
+            //            cycles to even be reconsidered and never caught up.
             let due: Vec<_> = watches
                 .iter()
                 .filter(|w| {
                     !w.priority.is_realtime()
-                        && cycle % w.priority.period() == 0
+                        && (w.priority == WatchPriority::Low
+                            || cycle % w.priority.period() == 0)
                 })
                 .cloned()
                 .collect();
 
-            let mut reads = coalesce(&due, cfg.coalesce_gap);
+            let coalesced = coalesce(&due, cfg.coalesce_gap);
 
-            // Enforce the *adaptive* byte budget. coalesce preserves registry
-            // id order and the prelude registers hotter data earlier, so
-            // trimming the tail sheds the lowest-priority bulk reads first;
-            // those deferred reads are simply picked up on later cycles
-            // (this is what spreads block-data streaming over time instead
-            // of one frame-blowing burst).
-            let mut remaining = budget;
-            let mut budget_capped = false;
-            reads.retain(|r| {
-                if r.region.size <= remaining {
-                    remaining -= r.region.size;
-                    true
-                } else {
-                    budget_capped = true;
-                    false
-                }
-            });
+            // Priority-order, rotate the Low tail by the cursor, and trim to
+            // the adaptive budget. Pure + testable (the round-robin streaming
+            // guarantee is the fix for "burst then nothing").
+            let sel = select_bulk(coalesced, budget, low_cursor);
+            let reads = sel.reads;
+            let budget_capped = sel.capped;
+            low_cursor = sel.next_cursor;
 
             let regions: Vec<_> = reads.iter().map(|r| r.region).collect();
             let bytes_requested: u32 = regions.iter().map(|r| r.size).sum();
@@ -303,6 +304,83 @@ pub fn spawn(
     });
 
     engine
+}
+
+/// Result of selecting the bulk reads for one cycle.
+struct BulkSelection {
+    /// Reads admitted this cycle, priority-ordered (urgent first).
+    reads: Vec<crate::watch::CoalescedRead>,
+    /// True if the budget trimmed at least one read.
+    capped: bool,
+    /// Cursor to use next cycle (advanced past admitted Low reads).
+    next_cursor: usize,
+}
+
+/// Order coalesced reads by priority, rotate the Low (prefetch) tail by
+/// `cursor`, then trim to `budget`.
+///
+/// `coalesce` returns *address* order, unrelated to priority — trimming that
+/// by size starves arbitrary reads. Here High/Normal are admitted first (so
+/// fast data is never starved), then a *rotating window* of the Low reads
+/// fills the remaining budget. Advancing the cursor past what we admitted
+/// guarantees every Low read is offered within a bounded number of cycles —
+/// i.e. the whole map/level streams in over time instead of one burst then
+/// nothing.
+fn select_bulk(
+    mut reads: Vec<crate::watch::CoalescedRead>,
+    budget: u32,
+    cursor: usize,
+) -> BulkSelection {
+    use crate::watch::WatchPriority;
+
+    // Stable sort: urgent first, address order preserved within each tier.
+    reads.sort_by_key(|r| r.priority);
+
+    let split = reads
+        .iter()
+        .position(|r| r.priority == WatchPriority::Low)
+        .unwrap_or(reads.len());
+
+    let mut ordered: Vec<_> = reads[..split].to_vec();
+    let lows = &reads[split..];
+    let low_n = lows.len();
+    if low_n > 0 {
+        let start = cursor % low_n;
+        ordered.extend(lows[start..].iter().cloned());
+        ordered.extend(lows[..start].iter().cloned());
+    }
+
+    let mut remaining = budget;
+    let mut capped = false;
+    let mut lows_admitted = 0usize;
+    ordered.retain(|r| {
+        let is_low = r.priority == WatchPriority::Low;
+        if r.region.size <= remaining {
+            remaining -= r.region.size;
+            if is_low {
+                lows_admitted += 1;
+            }
+            true
+        } else {
+            capped = true;
+            false
+        }
+    });
+
+    let next_cursor = if low_n > 0 {
+        // Advance past what we admitted (at least 1 so we always make
+        // progress even if a single Low read is too big for the budget —
+        // it still rotates out of the way next cycle).
+        cursor.wrapping_add(lows_admitted.max(1))
+    } else {
+        cursor
+    };
+
+    BulkSelection {
+        reads: ordered,
+        capped,
+        next_cursor,
+    }
 }
 
 /// One AIMD step for the adaptive bulk-read budget.
@@ -385,6 +463,79 @@ mod tests {
             max_byte_budget: 64 * 1024,
             ..PollConfig::default()
         }
+    }
+
+    use crate::watch::{CoalescedRead, WatchId, WatchPriority};
+
+    fn cr(addr: u32, size: u32, p: WatchPriority) -> CoalescedRead {
+        CoalescedRead {
+            region: sni_client::MemRegion::fxpak(addr, size),
+            members: vec![(addr as WatchId, 0, size)],
+            priority: p,
+        }
+    }
+
+    #[test]
+    fn high_priority_is_never_starved_by_low() {
+        // One small High read + several big Low reads, tiny budget. The
+        // High read must always get in regardless of cursor position.
+        for cursor in 0..8 {
+            let reads = vec![
+                cr(0x1000, 64, WatchPriority::High),
+                cr(0x2000, 4096, WatchPriority::Low),
+                cr(0x3000, 4096, WatchPriority::Low),
+                cr(0x4000, 4096, WatchPriority::Low),
+            ];
+            let sel = select_bulk(reads, 4096 + 64, cursor);
+            assert!(
+                sel.reads.iter().any(|r| r.priority == WatchPriority::High),
+                "High starved at cursor {cursor}"
+            );
+        }
+    }
+
+    #[test]
+    fn low_reads_all_stream_in_over_cycles() {
+        // The bug: under a tight budget the same Low prefix always won and
+        // the rest never streamed in. With the rotating cursor, every Low
+        // read must be admitted within a bounded number of cycles.
+        let lows: Vec<u32> = (0..10).map(|i| 0x2000 + i * 0x1000).collect();
+        // Budget fits High (64) + ~2 Low reads (1000 each) per cycle.
+        let budget = 64 + 2100;
+        let mut cursor = 0usize;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..20 {
+            let mut reads = vec![cr(0x1000, 64, WatchPriority::High)];
+            for &a in &lows {
+                reads.push(cr(a, 1000, WatchPriority::Low));
+            }
+            let sel = select_bulk(reads, budget, cursor);
+            for r in &sel.reads {
+                if r.priority == WatchPriority::Low {
+                    seen.insert(r.region.address);
+                }
+            }
+            cursor = sel.next_cursor;
+        }
+        assert_eq!(
+            seen.len(),
+            lows.len(),
+            "not all Low reads streamed in: {}/{}",
+            seen.len(),
+            lows.len()
+        );
+    }
+
+    #[test]
+    fn oversized_low_read_still_rotates_out_of_the_way() {
+        // A single Low read bigger than the whole budget must not wedge the
+        // cursor forever (advance >= 1) so other Low reads still get a turn.
+        let reads = vec![
+            cr(0x2000, 99_999, WatchPriority::Low),
+            cr(0x3000, 100, WatchPriority::Low),
+        ];
+        let sel = select_bulk(reads, 4096, 0);
+        assert!(sel.next_cursor > 0, "cursor must advance past a stuck read");
     }
 
     #[test]
