@@ -101,12 +101,20 @@ impl Viewport {
 /// Paint every command in `list` into `painter` using `vp`. `sizing` is the
 /// app-wide text sizing mode/scale; per-label `scale` multiplies on top.
 /// Call inside the egui paint pass for the panel hosting the capture frame.
+///
+/// Drawing is **clipped to the canvas rect** (`vp.screen_rect()`), matching
+/// emulator behaviour: Mesen/BizHawk Lua surfaces clip to their bounds, and
+/// many scripts deliberately over-draw the edges (e.g. a one-block margin on
+/// a block grid) expecting that clip. Without it the overscan spills into the
+/// letterbox / app chrome — and a buggy script could scribble anywhere.
 pub fn paint(
     painter: &Painter,
     vp: &Viewport,
     list: &DrawList,
     sizing: TextSizing,
 ) {
+    // Constrain everything below to the canvas viewport.
+    let painter = &painter.with_clip_rect(vp.screen_rect());
     for cmd in &list.cmds {
         match cmd {
             DrawCmd::Text {
