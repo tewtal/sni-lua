@@ -1,0 +1,22 @@
+[package]
+name = "sni-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tonic.workspace = true
+prost.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
+# Prebuilt protoc binary (no CMake / C++ toolchain needed) so the build does
+# not depend on a system-installed protoc.
+protoc-bin-vendored = "3"

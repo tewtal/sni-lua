@@ -1,0 +1,14 @@
+[package]
+name = "sni-lua-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sni-client = { path = "../sni-client" }
+sni-cache = { path = "../sni-cache" }
+sni-render = { path = "../sni-render" }
+mlua.workspace = true
+parking_lot.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

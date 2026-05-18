@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir f:\\\\Code\\\\sni-lua)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(rustc --version)",
+      "Bash(cargo --version)",
+      "Bash(protoc --version)",
+      "Bash(git init *)",
+      "Bash(echo \"git: $?\")",
+      "Bash(node --version)",
+      "Bash(which protoc *)",
+      "Bash(cargo check *)",
+      "Bash(where cl.exe)",
+      "Read(//c/Program Files/Microsoft Visual Studio/**)",
+      "Read(//c/Program Files \\(x86\\)/Microsoft Visual Studio/**)",
+      "Bash(\"C:/Program Files \\(x86\\)/Microsoft Visual Studio/Installer/vswhere.exe\" -latest -property installationPath)",
+      "PowerShell(cmd /c '\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\" >nul 2>&1 && cargo check --workspace' 2>&1)",
+      "PowerShell($env:NoDefaultCurrentDirectoryInExePath=$null; cmd /c '\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\" >nul 2>&1 && set \"NoDefaultCurrentDirectoryInExePath=\" && cargo build --release' 2>&1 | Select-Object -Last 12; Write-Output \"---EXE---\"; if \\(Test-Path \"F:\\\\Code\\\\sni-lua\\\\target\\\\release\\\\sni-lua.exe\"\\) { Get-Item \"F:\\\\Code\\\\sni-lua\\\\target\\\\release\\\\sni-lua.exe\" | Select-Object Name,@{n='MB';e={[math]::Round\\($_.Length/1MB,1\\)}} })",
+      "PowerShell(if \\(Test-Path \"F:\\\\Code\\\\sni-lua\\\\target\\\\release\\\\sni-lua.exe\"\\) { Get-Item \"F:\\\\Code\\\\sni-lua\\\\target\\\\release\\\\sni-lua.exe\" | Select-Object Name,@{n='MB';e={[math]::Round\\($_.Length/1MB,1\\)}},LastWriteTime } else { Write-Output \"NOT FOUND\" })",
+      "Bash(git add *)",
+      "Bash(git -c user.email=backmark@gmail.com -c user.name=sni-lua commit -q -m ' *)"
+    ]
+  }
+}

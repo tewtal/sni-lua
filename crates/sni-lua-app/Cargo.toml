@@ -1,0 +1,27 @@
+[package]
+name = "sni-lua-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "sni-lua"
+
+[[bin]]
+name = "sni-lua"
+path = "src/main.rs"
+
+[dependencies]
+sni-client = { path = "../sni-client" }
+sni-cache = { path = "../sni-cache" }
+sni-lua-api = { path = "../sni-lua-api" }
+sni-render = { path = "../sni-render" }
+sni-capture = { path = "../sni-capture" }
+
+eframe.workspace = true
+egui.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
