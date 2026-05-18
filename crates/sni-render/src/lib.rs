@@ -9,7 +9,8 @@
 mod font;
 mod paint;
 
-pub use paint::{paint, Viewport};
+pub use font::Font;
+pub use paint::{paint, TextSizing, Viewport};
 
 /// SNES framebuffer is 256x224 (or 256x239). Scripts address pixels in SNES
 /// space; the renderer scales to the capture/overlay viewport.
@@ -47,8 +48,11 @@ pub enum DrawCmd {
         y: f32,
         text: String,
         color: Color,
-        /// 1.0 = native SNES pixel font size.
+        /// Per-label size multiplier on top of the global overlay size.
+        /// 1.0 = the font's native pixel size.
         scale: f32,
+        /// Typeface for this label (script-selectable via `gfx.font`).
+        font: Font,
     },
     Rect {
         x: f32,

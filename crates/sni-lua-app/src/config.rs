@@ -17,6 +17,13 @@ pub struct Config {
     pub capture_mode: String,
     /// Last loaded script path, restored on launch.
     pub last_script: Option<PathBuf>,
+    /// Overlay text sizing mode: "game" (scales with viewport/zoom, retro,
+    /// pixel-aligned) or "screen" (fixed on-screen size regardless of zoom).
+    pub text_sizing_mode: String,
+    /// Size multiplier. In "game" mode: font-pixels per SNES pixel. In
+    /// "screen" mode: screen pixels per font-pixel. Default tuned so the
+    /// compact 5x7 font reads small.
+    pub text_size: f32,
 }
 
 impl Default for Config {
@@ -26,6 +33,8 @@ impl Default for Config {
             poll_interval_ms: 16, // ~60 logical poll cycles/sec target
             capture_mode: "composited".to_string(),
             last_script: None,
+            text_sizing_mode: "game".to_string(),
+            text_size: 1.0,
         }
     }
 }

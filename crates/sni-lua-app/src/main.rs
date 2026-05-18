@@ -187,6 +187,19 @@ impl App {
         }
         Some(MemRegion::fxpak(addr, self.probe_size))
     }
+
+    /// Translate the persisted overlay-text settings into the renderer's
+    /// sizing mode for this frame.
+    fn text_sizing(&self) -> sni_render::TextSizing {
+        let s = self.config.text_size.clamp(0.1, 8.0);
+        if self.config.text_sizing_mode == "screen" {
+            // In screen mode the slider is "small..big"; scale to a sane
+            // screen-pixel range (1px font-pixel is tiny, ~4px is large).
+            sni_render::TextSizing::FixedScreen { px: s * 2.0 }
+        } else {
+            sni_render::TextSizing::GameScaled { mult: s }
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -306,6 +319,59 @@ impl eframe::App for App {
                     ("● stopped (see console)", egui::Color32::from_rgb(220, 60, 60))
                 };
                 ui.colored_label(col, txt);
+
+                ui.add_space(12.0);
+                ui.heading("Overlay");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Text size");
+                    if ui
+                        .add(
+                            egui::Slider::new(
+                                &mut self.config.text_size,
+                                0.3..=4.0,
+                            )
+                            .fixed_decimals(2),
+                        )
+                        .changed()
+                    {
+                        self.config.save();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Sizing");
+                    let mut mode = self.config.text_sizing_mode.clone();
+                    egui::ComboBox::from_id_salt("text_sizing")
+                        .selected_text(if mode == "screen" {
+                            "Fixed screen px"
+                        } else {
+                            "Game-scaled"
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut mode,
+                                "game".to_string(),
+                                "Game-scaled (zooms, pixel-aligned)",
+                            );
+                            ui.selectable_value(
+                                &mut mode,
+                                "screen".to_string(),
+                                "Fixed screen px (constant size)",
+                            );
+                        });
+                    if mode != self.config.text_sizing_mode {
+                        self.config.text_sizing_mode = mode;
+                        self.config.save();
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Scripts default to the compact 5x7 font; \
+                         gfx.font(\"normal\") selects the larger 8x8.",
+                    )
+                    .small()
+                    .weak(),
+                );
 
                 ui.add_space(12.0);
                 ui.heading("Device");
@@ -544,8 +610,9 @@ impl eframe::App for App {
                 egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
             );
 
-            // Paint the script's draw list in SNES coords — the M5 deliverable.
-            sni_render::paint(&painter, &vp, &self.draw_list);
+            // Paint the script's draw list in SNES coords with the user's
+            // text sizing preference.
+            sni_render::paint(&painter, &vp, &self.draw_list, self.text_sizing());
 
             if !self.host.is_loaded() {
                 painter.text(

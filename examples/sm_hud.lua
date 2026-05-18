@@ -38,9 +38,16 @@ end
 
 function on_init()
   print("sm_hud.lua loaded -- move Samus to see the hitbox track")
+  print("tip: adjust Overlay > Text size in the app, or call")
+  print('     gfx.font("normal") for the larger 8x8 face')
 end
 
 function on_frame()
+  -- Default face is the compact 5x7. Switch per-label any time:
+  --   gfx.font("normal")  -> 8x8   gfx.font("small") -> 5x7 (default)
+  -- and/or pass a per-label scale as the 5th gfx.text arg.
+  gfx.font("small")
+
   -- Guard the first few frames: watches are nil until the first poll
   -- cycle has populated the snapshot.
   local hp  = snes.u16(health)

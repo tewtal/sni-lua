@@ -33,21 +33,33 @@ sni-lua is built around that constraint:
 | Milestone | Scope | State |
 |-----------|-------|-------|
 | M1 | Workspace, egui/wgpu window, config, LuaJIT smoke test | ✅ |
-| M2 | SNI gRPC client: connect, list devices, single/multi read | ⏳ |
-| M3 | Watch registry, snapshot cache, async poll engine | ⏳ |
-| M4 | Unified async-aware Lua API (`snes.*`, `gfx.*`, `frame`) | ⏳ |
-| M5 | Overlay renderer (text, rect, line, hitbox) | ⏳ |
+| M2 | SNI gRPC client: connect, list devices, single/multi read | ✅ |
+| M3 | Watch registry, snapshot cache, async poll engine | ✅ |
+| M4 | Unified async-aware Lua API (`snes.*`, `gfx.*`, lifecycle) | ✅ |
+| M5 | Overlay renderer (text, rect, line, hitbox; 5x7 + 8x8 fonts) | ✅ |
 | M6 | Capture modes: composited + transparent click-through | ⏳ |
 
 ## Build & run
 
+Use the wrapper scripts — they set the one environment bit the vendored
+LuaJIT build needs on Windows (see `build.cmd` header for why):
+
 ```sh
-cargo run --release
+.\build.ps1 run --release      # PowerShell
+.\build.cmd run --release      # cmd
 ```
 
-Requires a C compiler/toolchain for the vendored LuaJIT build (MSVC on
-Windows). First build is slow (gRPC + eframe + LuaJIT); subsequent builds are
-incremental.
+Requires the MSVC toolchain (the `cc` crate finds it via the registry; no
+vcvars shell needed). First build is slow (gRPC + eframe + LuaJIT);
+subsequent builds are incremental.
+
+### Overlay text
+
+Scripts draw with two embedded pixel fonts: a compact **5x7** (default) and
+the classic **8x8** (`gfx.font("normal")`). Size is controlled per-label via
+the `gfx.text` scale arg, and globally via **Overlay → Text size** plus a
+sizing mode: *game-scaled* (zooms with the view, pixel-aligned) or *fixed
+screen px* (constant on-screen size). Settings persist.
 
 ## Layout
 

@@ -9,8 +9,29 @@
 
 use egui::{Color32, Painter, Pos2, Rect, Stroke, Vec2};
 
-use crate::font::{glyph, ADVANCE, GLYPH_H, GLYPH_W};
+use crate::font::Font;
 use crate::{Color, DrawCmd, DrawList, SNES_H, SNES_W};
+
+/// How overlay text is sized. The "too big" complaint comes from text being
+/// `viewport_scale × font_scale` tall; this gives the user/script control.
+#[derive(Debug, Clone, Copy)]
+pub enum TextSizing {
+    /// One font-pixel == `mult` SNES pixels, then scaled with the viewport.
+    /// Text stays aligned to game pixels and zooms with the window. This is
+    /// the retro-authentic mode. `mult` defaults to 1.0.
+    GameScaled { mult: f32 },
+    /// One font-pixel == `px` actual screen pixels, independent of viewport
+    /// zoom. Text is the same readable size regardless of window size.
+    FixedScreen { px: f32 },
+}
+
+impl Default for TextSizing {
+    fn default() -> Self {
+        // Compact-friendly default; with the 5x7 font this is much smaller
+        // than the old fixed 8x8 @ full viewport scale.
+        TextSizing::GameScaled { mult: 1.0 }
+    }
+}
 
 fn col(c: Color) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
@@ -58,9 +79,15 @@ impl Viewport {
     }
 }
 
-/// Paint every command in `list` into `painter` using `vp`. Call inside the
-/// egui paint pass for the panel that hosts the capture frame.
-pub fn paint(painter: &Painter, vp: &Viewport, list: &DrawList) {
+/// Paint every command in `list` into `painter` using `vp`. `sizing` is the
+/// app-wide text sizing mode/scale; per-label `scale` multiplies on top.
+/// Call inside the egui paint pass for the panel hosting the capture frame.
+pub fn paint(
+    painter: &Painter,
+    vp: &Viewport,
+    list: &DrawList,
+    sizing: TextSizing,
+) {
     for cmd in &list.cmds {
         match cmd {
             DrawCmd::Text {
@@ -69,7 +96,10 @@ pub fn paint(painter: &Painter, vp: &Viewport, list: &DrawList) {
                 text,
                 color,
                 scale,
-            } => paint_text(painter, vp, *x, *y, text, *color, *scale),
+                font,
+            } => paint_text(
+                painter, vp, *x, *y, text, *color, *scale, *font, sizing,
+            ),
 
             DrawCmd::Rect {
                 x,
@@ -121,9 +151,11 @@ pub fn paint(painter: &Painter, vp: &Viewport, list: &DrawList) {
     }
 }
 
-/// Draw `text` with the embedded 8x8 bitmap font. Each set bit becomes a
-/// filled quad of `vp.scale * font_scale` so it's nearest-neighbour crisp,
-/// never blurred like a vector font would be over a pixel-art capture.
+/// Draw `text` with the selected bitmap `font`. Each set bit becomes a
+/// nearest-neighbour quad so text is crisp at any zoom (never blurred like a
+/// vector font over a pixel-art capture). `\n` starts a new line at the
+/// original x. Screen-space pixel size is decided by `sizing`.
+#[allow(clippy::too_many_arguments)]
 fn paint_text(
     painter: &Painter,
     vp: &Viewport,
@@ -131,29 +163,41 @@ fn paint_text(
     y: f32,
     text: &str,
     color: Color,
-    font_scale: f32,
+    label_scale: f32,
+    font: Font,
+    sizing: TextSizing,
 ) {
     let c = col(color);
-    // Size of one font pixel in screen space.
-    let px = (vp.scale * font_scale).max(1.0);
-    let mut pen_x = vp.pt(x, y).x;
-    let pen_y = vp.pt(x, y).y;
+
+    // Screen-space size of one font pixel, per the global sizing mode, with
+    // the per-label multiplier on top. This single value is the whole fix
+    // for "text too big": FixedScreen ignores viewport zoom; GameScaled.mult
+    // and label_scale shrink it.
+    let px = match sizing {
+        TextSizing::GameScaled { mult } => vp.scale * mult * label_scale,
+        TextSizing::FixedScreen { px } => px * label_scale,
+    }
+    .max(1.0);
+
+    let origin = vp.pt(x, y);
+    let mut pen_x = origin.x;
+    let mut pen_y = origin.y;
+    let advance = font.advance() as f32 * px;
+    let line_advance = font.line_advance() as f32 * px;
 
     for ch in text.chars() {
         if ch == '\n' {
-            // Caller-controlled newlines: simple wrap to start x, next row.
-            pen_x = vp.pt(x, y).x;
-            // (single-line is the common case; multi-line scripts can offset
-            // y themselves — kept minimal on purpose)
+            pen_x = origin.x;
+            pen_y += line_advance;
             continue;
         }
-        let g = glyph(ch);
+        let g = font.glyph(ch);
         for (row, bits) in g.iter().enumerate() {
             if *bits == 0 {
                 continue;
             }
-            for bit in 0..GLYPH_W {
-                // bit 0 is leftmost pixel (LSB-first in this font table).
+            for bit in 0..font.width() {
+                // bit 0 is leftmost pixel (LSB-first, both font tables).
                 if bits & (1 << bit) != 0 {
                     let rx = pen_x + bit as f32 * px;
                     let ry = pen_y + row as f32 * px;
@@ -168,8 +212,7 @@ fn paint_text(
                 }
             }
         }
-        pen_x += ADVANCE as f32 * px;
-        let _ = GLYPH_H;
+        pen_x += advance;
     }
 }
 

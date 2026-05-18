@@ -28,7 +28,7 @@
 //! end
 //! ```
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -36,7 +36,7 @@ use mlua::{Lua, MultiValue, Value};
 use parking_lot::Mutex;
 use sni_cache::{PollEngine, WatchPriority};
 use sni_client::MemRegion;
-use sni_render::{Color, DrawCmd, DrawList};
+use sni_render::{Color, DrawCmd, DrawList, Font};
 
 /// Script-facing error. `mlua::Error` is not `Send + Sync` when mlua is
 /// built without its `send` feature (which we deliberately don't enable, so
@@ -105,6 +105,10 @@ pub struct ScriptHost {
     /// `Rc<RefCell>` because all access is single-threaded (UI thread) and we
     /// need it captured into Lua closures.
     draw: Rc<RefCell<DrawList>>,
+    /// Active typeface for subsequent `gfx.text` calls. Set by `gfx.font`;
+    /// reset to the default at the start of each frame so a script can't
+    /// leave it in a surprising state. `Cell` since access is single-threaded.
+    current_font: Rc<Cell<Font>>,
     /// True once a script has been loaded without error.
     loaded: bool,
 }
@@ -125,6 +129,7 @@ impl ScriptHost {
             write_sink,
             console: Arc::new(Console::default()),
             draw: Rc::new(RefCell::new(DrawList::default())),
+            current_font: Rc::new(Cell::new(Font::default())),
             loaded: false,
         };
         host.install_api()?;
@@ -274,6 +279,7 @@ impl ScriptHost {
         // gfx.text(x, y, str, color?, scale?)
         {
             let draw = self.draw.clone();
+            let cur_font = self.current_font.clone();
             let f = self.lua.create_function(
                 move |_,
                       (x, y, text, color, scale): (
@@ -289,11 +295,26 @@ impl ScriptHost {
                         text,
                         color: argb(color, 0xFFFFFFFF),
                         scale: scale.unwrap_or(1.0),
+                        font: cur_font.get(),
                     });
                     Ok(())
                 },
             )?;
             gfx.set("text", f)?;
+        }
+
+        // gfx.font("small"|"normal") — selects the typeface for subsequent
+        // gfx.text calls this frame. "small" (5x7) is the default and is
+        // noticeably more compact than "normal" (8x8).
+        {
+            let cur_font = self.current_font.clone();
+            let f = self
+                .lua
+                .create_function(move |_, name: String| {
+                    cur_font.set(Font::parse(&name));
+                    Ok(())
+                })?;
+            gfx.set("font", f)?;
         }
 
         // gfx.box(x, y, w, h, color?, fill?, thickness?) — outline + optional
@@ -419,6 +440,9 @@ impl ScriptHost {
             return DrawList::default();
         }
         self.draw.borrow_mut().clear();
+        // Reset per-frame draw state so a script can't leak font selection
+        // from a previous frame.
+        self.current_font.set(Font::default());
 
         if let Ok(on_frame) =
             self.lua.globals().get::<mlua::Function>("on_frame")
