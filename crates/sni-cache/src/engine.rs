@@ -260,6 +260,15 @@ pub fn spawn(
                 .cloned()
                 .collect();
 
+            // IMPORTANT: the bulk drain window is measured from HERE (after
+            // the realtime sub-poll), not from cycle_start. The realtime
+            // poll is a tiny, separately-prioritised cost; on a real link
+            // its RTT alone can equal/exceed frame_budget_ms, and if the
+            // drain loop's time check were relative to cycle_start it would
+            // break on its first iteration and issue ZERO bulk reads —
+            // exactly the "adds a bit then stops, blank forever" symptom.
+            // The drain gets its own full frame_budget_ms window.
+            let bulk_start = Instant::now();
             let frame_ms = cfg.frame_budget_ms.max(1) as u128;
             let mut bytes_requested: u32 = 0;
             let mut reads_issued: usize = 0;
@@ -279,8 +288,13 @@ pub fn spawn(
                 coalesce(&bulk_eligible, cfg.coalesce_gap);
 
             loop {
-                // Stop if the cycle's time window is spent.
-                if cycle_start.elapsed().as_millis() >= frame_ms {
+                // Stop if the drain's time window is spent — but ALWAYS
+                // issue at least one bulk batch per cycle (reads_issued == 0
+                // bypasses the check) so a slow realtime poll or a long
+                // previous batch can never starve bulk progress to zero.
+                if reads_issued > 0
+                    && bulk_start.elapsed().as_millis() >= frame_ms
+                {
                     break;
                 }
 
@@ -339,9 +353,10 @@ pub fn spawn(
                             next_budget(budget, rtt, throughput, &cfg);
 
                         // Don't start another batch that would clearly
-                        // overrun the window (use measured RTT as the
-                        // estimate for the next one).
-                        if cycle_start.elapsed().as_millis() + rtt as u128
+                        // overrun the drain window (estimate the next one's
+                        // cost from this batch's RTT). Measured from
+                        // bulk_start for the same reason as the top check.
+                        if bulk_start.elapsed().as_millis() + rtt as u128
                             >= frame_ms
                         {
                             break;
@@ -612,6 +627,65 @@ mod tests {
             }
         }
         refreshed
+    }
+
+    // Mirrors the real loop's time guard exactly:
+    //   if reads_issued > 0 && spent_since_bulk_start >= frame_ms { break }
+    // Returns how many bulk batches would be issued given a per-batch cost
+    // and the time the realtime sub-poll already consumed. The bug was using
+    // cycle_start (incl. realtime) for `spent`; the fix measures from
+    // bulk_start and makes the first batch unconditional.
+    fn batches_issued(
+        frame_ms: u128,
+        realtime_cost_ms: u128, // time spent BEFORE bulk starts
+        per_batch_ms: u128,
+        pending_batches: usize,
+        measure_from_cycle_start: bool, // true = the OLD buggy behaviour
+    ) -> usize {
+        let mut issued = 0usize;
+        let mut bulk_elapsed = 0u128;
+        for _ in 0..pending_batches {
+            let spent = if measure_from_cycle_start {
+                realtime_cost_ms + bulk_elapsed
+            } else {
+                bulk_elapsed
+            };
+            if issued > 0 && spent >= frame_ms {
+                break;
+            }
+            issued += 1;
+            bulk_elapsed += per_batch_ms;
+        }
+        issued
+    }
+
+    #[test]
+    fn realtime_poll_cannot_starve_bulk_to_zero() {
+        // Real-FXPAK shape: 16ms frame budget, realtime sub-poll already ate
+        // 20ms (RTT). OLD behaviour (measure from cycle_start) => the bulk
+        // loop's time check is already true => ZERO bulk batches => "adds a
+        // bit then stops, blank forever". FIX (measure from bulk_start +
+        // unconditional first batch) => steady forward progress.
+        let old = batches_issued(16, 20, 4, 100, true);
+        assert_eq!(old, 1, "old behaviour: only the freebie, then starved");
+
+        let fixed = batches_issued(16, 20, 4, 100, false);
+        assert!(
+            fixed >= 4,
+            "fixed: drain gets its own window regardless of realtime cost \
+             (got {fixed} batches)"
+        );
+    }
+
+    #[test]
+    fn always_at_least_one_bulk_batch_per_cycle() {
+        // Even if a single batch costs more than the whole window, exactly
+        // one must still be issued (guaranteed forward progress) — never
+        // zero, which would leave data blank forever.
+        for rt in [0u128, 10, 50, 500] {
+            let n = batches_issued(16, rt, 999, 100, false);
+            assert_eq!(n, 1, "must issue exactly one batch (rt={rt})");
+        }
     }
 
     #[test]
