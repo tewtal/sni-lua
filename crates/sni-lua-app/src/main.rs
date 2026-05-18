@@ -18,7 +18,7 @@ use sni_actor::{CmdSender, Cmd, ConnState, SniHandle};
 use sni_cache::{PollConfig, PollEngine, WatchHandle, WatchPriority};
 use sni_client::MemRegion;
 use sni_lua_api::{Console, ScriptHost, WriteSink};
-use sni_render::{DrawList, SNES_H, SNES_W};
+use sni_render::DrawList;
 use tokio::runtime::Runtime;
 
 /// Bridges Lua `snes.write(...)` to the SNI actor as a fire-and-forget
@@ -525,35 +525,37 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let avail = ui.available_size();
-            let (rect, _resp) = ui.allocate_exact_size(avail, egui::Sense::hover());
+            let (rect, _resp) =
+                ui.allocate_exact_size(avail, egui::Sense::hover());
             let painter = ui.painter_at(rect);
+            // Backdrop behind everything (M6's capture feed will fill here).
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 18, 22));
 
-            let scale = (rect.width() / SNES_W).min(rect.height() / SNES_H);
-            let vw = SNES_W * scale;
-            let vh = SNES_H * scale;
-            let origin = egui::pos2(
-                rect.center().x - vw / 2.0,
-                rect.center().y - vh / 2.0,
-            );
-            let view = egui::Rect::from_min_size(origin, egui::vec2(vw, vh));
+            // Map SNES pixel space onto the available area, letterboxed.
+            let vp = sni_render::Viewport::fit(rect);
+            let view = vp.screen_rect();
+
+            // Placeholder "screen" so the overlay reads against something
+            // until the capture device is wired in M6.
+            painter.rect_filled(view, 0.0, egui::Color32::from_rgb(8, 10, 16));
             painter.rect_stroke(
                 view,
                 0.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+                egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
             );
-            painter.text(
-                view.center(),
-                egui::Align2::CENTER_CENTER,
-                format!(
-                    "SNES overlay viewport (256×224)\n\
-                     script emitted {} draw commands this frame\n\
-                     (rendering them lands in M5 · capture feed in M6)",
-                    self.draw_list.cmds.len()
-                ),
-                egui::FontId::proportional(14.0),
-                egui::Color32::from_gray(120),
-            );
+
+            // Paint the script's draw list in SNES coords — the M5 deliverable.
+            sni_render::paint(&painter, &vp, &self.draw_list);
+
+            if !self.host.is_loaded() {
+                painter.text(
+                    view.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "No script running.\nSet a Lua path and click Load.",
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::from_gray(110),
+                );
+            }
         });
     }
 

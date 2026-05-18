@@ -1,10 +1,15 @@
-//! Retained draw-list: the contract between Lua scripts and the overlay
-//! renderer.
+//! Retained draw-list + overlay painter.
 //!
 //! Scripts don't paint directly. Each frame they emit [`DrawCmd`]s into a
-//! [`DrawList`]; the egui paint pass (M5) consumes the latest list. This
-//! decoupling is what lets script execution and screen refresh run at
-//! different rates without tearing.
+//! [`DrawList`]; the egui paint pass consumes the latest list via [`paint`],
+//! mapping SNES pixel coords onto the capture viewport with [`Viewport`].
+//! This decoupling lets script execution and screen refresh run at different
+//! rates without tearing.
+
+mod font;
+mod paint;
+
+pub use paint::{paint, Viewport};
 
 /// SNES framebuffer is 256x224 (or 256x239). Scripts address pixels in SNES
 /// space; the renderer scales to the capture/overlay viewport.
