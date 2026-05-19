@@ -12,9 +12,7 @@ use egui::{Color32, Painter, Pos2, Rect, Rounding, Shape, Stroke, Vec2};
 use geo::{BooleanOps, Coord, LineString, MultiPolygon, Polygon, TriangulateEarcut};
 
 use crate::font::Font;
-use crate::{
-    Canvas, Color, DrawCmd, DrawList, PathPrimitive, ShadowSpec, TextAlign, TextVAlign,
-};
+use crate::{Canvas, Color, DrawCmd, DrawList, PathPrimitive, ShadowSpec, TextAlign, TextVAlign};
 
 /// How overlay text is sized. The "too big" complaint comes from text being
 /// `viewport_scale × font_scale` tall; this gives the user/script control.
@@ -126,18 +124,7 @@ pub fn paint(painter: &Painter, vp: &Viewport, list: &DrawList, sizing: TextSizi
                 align,
                 valign,
             } => paint_text(
-                painter,
-                vp,
-                *x,
-                *y,
-                text,
-                *color,
-                *scale,
-                *font,
-                sizing,
-                *bg,
-                *outline,
-                *align,
+                painter, vp, *x, *y, text, *color, *scale, *font, sizing, *bg, *outline, *align,
                 *valign,
             ),
 
@@ -499,13 +486,9 @@ fn union_shapes(shapes: &[PathPrimitive]) -> MultiPolygon<f32> {
     for shape in shapes {
         let poly = match shape {
             PathPrimitive::Rect { x, y, w, h } => rect_polygon(*x, *y, *w, *h),
-            PathPrimitive::RoundRect {
-                x,
-                y,
-                w,
-                h,
-                radius,
-            } => round_rect_polygon(*x, *y, *w, *h, *radius),
+            PathPrimitive::RoundRect { x, y, w, h, radius } => {
+                round_rect_polygon(*x, *y, *w, *h, *radius)
+            }
             PathPrimitive::Circle { x, y, radius } => circle_polygon(*x, *y, *radius),
         };
         let next = MultiPolygon(vec![poly]);

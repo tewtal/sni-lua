@@ -128,8 +128,7 @@ impl Config {
         if let Ok(s) = serde_json::to_string_pretty(self) {
             let path = Self::path();
             let tmp = path.with_extension("json.tmp");
-            let res = std::fs::write(&tmp, s.as_bytes())
-                .and_then(|_| std::fs::rename(&tmp, &path));
+            let res = std::fs::write(&tmp, s.as_bytes()).and_then(|_| std::fs::rename(&tmp, &path));
             if let Err(e) = res {
                 tracing::warn!("could not save config: {e}");
             }

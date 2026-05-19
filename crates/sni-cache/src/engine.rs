@@ -660,7 +660,12 @@ fn batch_fits_remaining_time(
 ) -> bool {
     let fixed_ms = latency_floor_ms.unwrap_or(0.0).floor() as u128;
     predicted_transfer_ms(bytes, throughput)
-        .map(|predicted| elapsed_ms.saturating_add(fixed_ms).saturating_add(predicted) <= frame_ms)
+        .map(|predicted| {
+            elapsed_ms
+                .saturating_add(fixed_ms)
+                .saturating_add(predicted)
+                <= frame_ms
+        })
         .unwrap_or(true)
 }
 
@@ -1189,7 +1194,10 @@ mod tests {
 
     #[test]
     fn unknown_throughput_keeps_full_iteration_budget() {
-        assert_eq!(budget_for_remaining_time(4096, None, None, 12, 16), Some(4096));
+        assert_eq!(
+            budget_for_remaining_time(4096, None, None, 12, 16),
+            Some(4096)
+        );
     }
 
     #[test]
@@ -1236,10 +1244,13 @@ mod tests {
         let mut c = cfg();
         c.frame_budget_ms = 4;
         let floor = Some(2.0); // 2ms physical latency floor
-        // target_transfer_ms = 4 - 2 = 2ms.
-        // A transfer taking 3ms (total RTT = 5ms > 4ms target) is an overrun!
-        // So the budget must be cut!
+                               // target_transfer_ms = 4 - 2 = 2ms.
+                               // A transfer taking 3ms (total RTT = 5ms > 4ms target) is an overrun!
+                               // So the budget must be cut!
         let next = next_budget(4096, 3, Some(1000.0), floor, &c);
-        assert!(next < 4096, "low budget with real hardware latency floor must detect overrun and cut: {next}");
+        assert!(
+            next < 4096,
+            "low budget with real hardware latency floor must detect overrun and cut: {next}"
+        );
     }
 }

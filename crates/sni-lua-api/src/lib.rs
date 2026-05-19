@@ -774,7 +774,16 @@ impl ScriptHost {
             let draw = self.draw.clone();
             let off = offset.clone();
             let f = self.lua.create_function(
-                move |_, (x, y, w, h, start, end, opts): (f32, f32, f32, f32, u32, u32, Option<Value>)| {
+                move |_,
+                      (x, y, w, h, start, end, opts): (
+                    f32,
+                    f32,
+                    f32,
+                    f32,
+                    u32,
+                    u32,
+                    Option<Value>,
+                )| {
                     let (ox, oy) = off();
                     let opts = parse_gradient_rect_opts(opts)?;
                     let start = Color::from_argb(start);
@@ -829,7 +838,16 @@ impl ScriptHost {
             let draw = self.draw.clone();
             let off = offset.clone();
             let f = self.lua.create_function(
-                move |_, (x1, y1, x2, y2, start, end, thickness): (f32, f32, f32, f32, u32, u32, Option<f32>)| {
+                move |_,
+                      (x1, y1, x2, y2, start, end, thickness): (
+                    f32,
+                    f32,
+                    f32,
+                    f32,
+                    u32,
+                    u32,
+                    Option<f32>,
+                )| {
                     let (ox, oy) = off();
                     draw.borrow_mut().push(DrawCmd::GradientLine {
                         x1: x1 + ox,
@@ -971,16 +989,18 @@ impl ScriptHost {
         {
             let path = self.path_builder.clone();
             let off = offset.clone();
-            let f = self.lua.create_function(move |_, (x, y, w, h): (f32, f32, f32, f32)| {
-                let (ox, oy) = off();
-                path.borrow_mut().push(PathPrimitive::Rect {
-                    x: x + ox,
-                    y: y + oy,
-                    w,
-                    h,
-                });
-                Ok(())
-            })?;
+            let f = self
+                .lua
+                .create_function(move |_, (x, y, w, h): (f32, f32, f32, f32)| {
+                    let (ox, oy) = off();
+                    path.borrow_mut().push(PathPrimitive::Rect {
+                        x: x + ox,
+                        y: y + oy,
+                        w,
+                        h,
+                    });
+                    Ok(())
+                })?;
             gfx.set("path_rect", f)?;
         }
         {
@@ -1004,15 +1024,17 @@ impl ScriptHost {
         {
             let path = self.path_builder.clone();
             let off = offset.clone();
-            let f = self.lua.create_function(move |_, (x, y, radius): (f32, f32, f32)| {
-                let (ox, oy) = off();
-                path.borrow_mut().push(PathPrimitive::Circle {
-                    x: x + ox,
-                    y: y + oy,
-                    radius,
-                });
-                Ok(())
-            })?;
+            let f = self
+                .lua
+                .create_function(move |_, (x, y, radius): (f32, f32, f32)| {
+                    let (ox, oy) = off();
+                    path.borrow_mut().push(PathPrimitive::Circle {
+                        x: x + ox,
+                        y: y + oy,
+                        radius,
+                    });
+                    Ok(())
+                })?;
             gfx.set("path_circle", f)?;
         }
         {
@@ -1038,19 +1060,21 @@ impl ScriptHost {
         {
             let draw = self.draw.clone();
             let path = self.path_builder.clone();
-            let f = self.lua.create_function(move |_, (color, thickness): (Option<u32>, Option<f32>)| {
-                let shapes = path.borrow().clone();
-                if shapes.is_empty() {
-                    return Ok(());
-                }
-                draw.borrow_mut().push(DrawCmd::Path {
-                    shapes,
-                    color: Some(argb(color, 0xFF00FF00)),
-                    fill: None,
-                    thickness: thickness.unwrap_or(1.0),
-                });
-                Ok(())
-            })?;
+            let f = self.lua.create_function(
+                move |_, (color, thickness): (Option<u32>, Option<f32>)| {
+                    let shapes = path.borrow().clone();
+                    if shapes.is_empty() {
+                        return Ok(());
+                    }
+                    draw.borrow_mut().push(DrawCmd::Path {
+                        shapes,
+                        color: Some(argb(color, 0xFF00FF00)),
+                        fill: None,
+                        thickness: thickness.unwrap_or(1.0),
+                    });
+                    Ok(())
+                },
+            )?;
             gfx.set("stroke_path", f)?;
         }
 
@@ -2625,8 +2649,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn ui_button_press_latches_once() {
         let mut h = host();
@@ -2976,10 +2998,11 @@ mod tests {
             .iter()
             .find_map(|c| match c {
                 DrawCmd::Rect {
-                    shadow,
-                    thickness,
-                    ..
-                } => Some((shadow.as_ref().map(|s| (s.dx, s.dy, s.blur, s.spread)), *thickness)),
+                    shadow, thickness, ..
+                } => Some((
+                    shadow.as_ref().map(|s| (s.dx, s.dy, s.blur, s.spread)),
+                    *thickness,
+                )),
                 _ => None,
             })
             .expect("rect emitted");
@@ -3254,8 +3277,6 @@ mod tests {
             );
         }
     }
-
-
 
     #[test]
     fn hires_canvas_example_loads_and_runs() {
