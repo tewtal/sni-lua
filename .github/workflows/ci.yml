@@ -18,18 +18,18 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
-    env:
-      # The vendored LuaJIT build needs this unset so msvcbuild.bat can run
-      # the freshly built `minilua` by bare name (see build.cmd). Harmless
-      # on non-Windows.
-      NoDefaultCurrentDirectoryInExePath: ""
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable + clippy + rustfmt)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      # Install the exact toolchain pinned by rust-toolchain.toml (its
+      # [toolchain] channel + components). Keeps CI clippy identical to
+      # local clippy so a Rust release can't break `-D warnings` on
+      # unchanged code. `rustup show` both installs (rustup ≥1.28) and
+      # prints it for the log.
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup show
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -40,14 +40,31 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libv4l-dev libudev-dev
 
+      # Windows runs cargo through build.ps1, which unsets
+      # NoDefaultCurrentDirectoryInExePath *inside its own process* so the
+      # vendored LuaJIT build can exec `minilua` by bare name. A YAML `env:`
+      # empty string does NOT work — Windows blocks on the variable being
+      # *present*, not on its value. Other OSes use cargo directly.
       - name: Format check
         run: cargo fmt --all --check
 
       - name: Clippy (deny warnings)
+        if: matrix.os != 'windows-latest'
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (deny warnings) [Windows]
+        if: matrix.os == 'windows-latest'
+        run: ./build.ps1 clippy --workspace --all-targets -- -D warnings
 
       - name: Test
+        if: matrix.os != 'windows-latest'
         run: cargo test --workspace
+      - name: Test [Windows]
+        if: matrix.os == 'windows-latest'
+        run: ./build.ps1 test --workspace
 
       - name: Release build (smoke)
+        if: matrix.os != 'windows-latest'
         run: cargo build --release --bin sni-lua
+      - name: Release build (smoke) [Windows]
+        if: matrix.os == 'windows-latest'
+        run: ./build.ps1 build --release --bin sni-lua

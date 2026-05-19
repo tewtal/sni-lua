@@ -1,0 +1,8 @@
+# Pin the toolchain so CI and local builds use the exact same compiler and
+# clippy. `cargo clippy -- -D warnings` is otherwise fragile: every Rust
+# release adds lints that fail previously-clean code on the floating
+# `stable`. Bump this deliberately (and fix any new lints in the same
+# commit) rather than letting a Rust release day break the build.
+[toolchain]
+channel = "1.92.0"
+components = ["clippy", "rustfmt"]

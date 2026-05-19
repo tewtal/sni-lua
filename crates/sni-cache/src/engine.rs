@@ -871,7 +871,7 @@ mod tests {
 
     #[test]
     fn bulk_only_reads_unfulfilled_requests() {
-        let reads = vec![
+        let reads = [
             cr(0x1000, 64, WatchPriority::Normal),
             cr(0x2000, 64, WatchPriority::Normal),
         ];

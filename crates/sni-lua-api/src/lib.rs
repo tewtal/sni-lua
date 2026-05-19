@@ -2186,7 +2186,7 @@ mod tests {
         .unwrap();
         h.run_frame();
         let g = h.lua.globals();
-        assert_eq!(g.get::<bool>("got_show").unwrap(), true);
+        assert!(g.get::<bool>("got_show").unwrap());
         assert_eq!(g.get::<f64>("got_thick").unwrap(), 3.0);
         assert_eq!(g.get::<i64>("got_mode").unwrap(), 2);
         assert_eq!(g.get::<i64>("got_col").unwrap(), 0xFF112233);
@@ -2250,7 +2250,7 @@ mod tests {
         )
         .unwrap();
         h.run_frame();
-        assert_eq!(h.lua.globals().get::<bool>("fired").unwrap(), false);
+        assert!(!h.lua.globals().get::<bool>("fired").unwrap());
 
         // Simulate the app handling a click: flip the latch.
         if let Some(Control::Button { pressed, .. }) = h
@@ -2263,9 +2263,9 @@ mod tests {
             *pressed = true;
         }
         h.run_frame();
-        assert_eq!(h.lua.globals().get::<bool>("fired").unwrap(), true);
+        assert!(h.lua.globals().get::<bool>("fired").unwrap());
         h.run_frame(); // drained — must not re-fire
-        assert_eq!(h.lua.globals().get::<bool>("fired").unwrap(), false);
+        assert!(!h.lua.globals().get::<bool>("fired").unwrap());
     }
 
     #[test]

@@ -34,8 +34,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      # Use the toolchain pinned by rust-toolchain.toml so a release build
+      # is reproducible and matches CI exactly.
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup show
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
