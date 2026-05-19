@@ -61,7 +61,8 @@ impl Default for PollConfig {
     fn default() -> Self {
         // Tuned for the 5-20ms (fast emulator) class measured on this setup,
         // while staying safe on a real FXPAK: the budget self-tunes from
-        // observed throughput + RTT so it never knowingly overruns a frame.
+        // observed throughput + RTT so it avoids repeated overruns while
+        // still making progress when fixed request latency exceeds the target.
         Self {
             target_period: Duration::from_millis(16),
             frame_budget_ms: 16,
@@ -115,8 +116,8 @@ pub struct PollStats {
     pub frame_budget_overrun_ms: u32,
     pub frame_budget_overruns: u64,
     pub frame_budget_overrun_rate: f32,
-    /// Current adaptive bulk-read budget (bytes) and the throughput estimate
-    /// (bytes/ms) it's derived from — so the HUD shows the self-tuning.
+    /// Current adaptive bulk-read budget (bytes) and effective byte-transfer
+    /// throughput estimate (bytes/ms after fixed latency) used for tuning.
     pub byte_budget: u32,
     pub throughput_bpms: f32,
     pub last_error: Option<&'static str>,
@@ -173,17 +174,22 @@ pub fn spawn(
         let mut cycle: u64 = 0;
         // Adaptive bulk-read budget state, carried across cycles.
         //   `budget`     — current cap on bytes per bulk MultiRead.
-        //   `throughput` — EWMA of observed bytes/ms (drives the estimate;
-        //                  None until the first non-trivial measurement).
-        // AIMD on the observed bulk RTT vs the frame budget: a fast
-        // multiplicative cut on overrun (kills the spikes you saw), a slow
-        // additive grow when we have headroom (reclaims bandwidth). Deferred
-        // low-priority reads naturally spread over later cycles.
+        //   `throughput` — EWMA of observed bytes/ms after subtracting the
+        //                  fixed request-latency floor (None until first
+        //                  non-trivial measurement).
+        //   `latency_floor_ms` — the best observed fixed request latency.
+        // On emulators, SNI replies are often frame-bound: a tiny read and a
+        // large-enough read both come back on the next ~16ms frame. Treating
+        // that fixed wait as byte-transfer time makes the budget collapse and
+        // can starve bulk reads after the realtime sub-poll. AIMD therefore
+        // runs against the variable transfer time, while wall-clock cycle
+        // overruns are still reported normally.
         let mut budget: u32 = {
             let c = config.lock();
             c.min_byte_budget.max(2048).min(c.max_byte_budget)
         };
         let mut throughput: Option<f32> = None;
+        let mut latency_floor_ms: Option<f32> = None;
         let mut deferred_drain_bpms_ewma = 0.0f32;
         let mut frame_budget_overruns = 0u64;
         let mut frame_budget_overrun_rate = 0.0f32;
@@ -245,6 +251,7 @@ pub fn spawn(
                 match client.multi_read(&uri, &rt_regions).await {
                     Ok(blobs) => {
                         realtime_rtt = t0.elapsed().as_millis() as u32;
+                        observe_latency_floor(&mut latency_floor_ms, realtime_rtt);
                         apply_reads(&rt_reads, &blobs, &mut builder);
                         mark_fulfilled(&rt_reads, &request_seq, cycle, &mut read_state);
                     }
@@ -277,8 +284,8 @@ pub fn spawn(
                 .collect();
 
             // One frame budget covers both tiers. Realtime is issued first;
-            // if it consumes the window, bulk waits for a later cycle rather
-            // than getting a second full budget.
+            // if fixed latency consumes the window, bulk still gets one
+            // adaptive-budgeted progress batch below so it cannot starve.
             let frame_ms = cfg.frame_budget_ms.max(1) as u128;
             let mut bytes_requested: u32 = 0;
             let mut reads_issued: usize = 0;
@@ -292,19 +299,23 @@ pub fn spawn(
             // iteration rather than re-coalescing.
             let coalesced_all = coalesce(&bulk_eligible, cfg.coalesce_gap);
             loop {
-                // Stop once the shared frame window is spent. A read can
-                // still overrun on transport jitter, but after the first
-                // throughput sample we also shrink this iteration's byte cap
-                // to the time actually left in the frame.
+                // Stop once the shared frame window is spent, unless no bulk
+                // data has moved this cycle yet. Fixed request latency can
+                // exceed the target on frame-bound emulators; shrinking bytes
+                // cannot make that first bulk response arrive before the next
+                // emulator frame, so issue one adaptive-budgeted batch for
+                // forward progress and let the stats record the wall overrun.
                 let elapsed_ms = cycle_start.elapsed().as_millis();
-                if elapsed_ms >= frame_ms {
+                let force_progress = reads_issued == 0;
+                if elapsed_ms >= frame_ms && !force_progress {
                     break;
                 }
-                let Some(iter_budget) =
-                    budget_for_remaining_time(budget, throughput, elapsed_ms, frame_ms)
-                else {
-                    break;
-                };
+                let iter_budget =
+                    match budget_for_remaining_time(budget, throughput, elapsed_ms, frame_ms) {
+                        Some(iter_budget) => iter_budget,
+                        None if force_progress => budget,
+                        None => break,
+                    };
 
                 // Eligible = budget-sized coalesced reads with at least one
                 // member whose latest request marker is still unfulfilled
@@ -327,7 +338,9 @@ pub fn spawn(
 
                 let regions: Vec<_> = sel.reads.iter().map(|r| r.region).collect();
                 let bytes: u32 = regions.iter().map(|r| r.size).sum();
-                if !batch_fits_remaining_time(bytes, throughput, elapsed_ms, frame_ms) {
+                if !force_progress
+                    && !batch_fits_remaining_time(bytes, throughput, elapsed_ms, frame_ms)
+                {
                     break;
                 }
 
@@ -335,6 +348,8 @@ pub fn spawn(
                 match client.multi_read(&uri, &regions).await {
                     Ok(blobs) => {
                         let rtt = t0.elapsed().as_millis() as u32;
+                        let budget_ms = budgeted_transfer_ms(rtt, latency_floor_ms);
+                        observe_latency_floor(&mut latency_floor_ms, rtt);
                         worst_rtt = worst_rtt.max(rtt);
                         apply_reads(&sel.reads, &blobs, &mut builder);
                         mark_fulfilled(&sel.reads, &request_seq, cycle, &mut read_state);
@@ -342,14 +357,15 @@ pub fn spawn(
                         bytes_requested = bytes_requested.saturating_add(bytes);
                         reads_issued += 1;
 
-                        // Adaptive byte budget: converge so a single batch
-                        // fits the frame. Driven by the per-batch RTT.
-                        let inst_bpms = bytes as f32 / rtt.max(1) as f32;
+                        // Adaptive byte budget: converge so a single batch's
+                        // variable transfer time fits the frame. Fixed SNI
+                        // request latency is tracked separately above.
+                        let inst_bpms = bytes as f32 / budget_ms as f32;
                         throughput = Some(match throughput {
                             Some(tp) => cfg.rtt_alpha * inst_bpms + (1.0 - cfg.rtt_alpha) * tp,
                             None => inst_bpms,
                         });
-                        budget = next_budget(budget, rtt, throughput, &cfg);
+                        budget = next_budget(budget, budget_ms, throughput, &cfg);
 
                         // Don't start another batch that would clearly spend
                         // past the shared frame window, estimating the next
@@ -533,21 +549,40 @@ fn select_bulk(
     }
 }
 
+/// Track the fixed request-latency floor. Lower samples replace the floor;
+/// higher samples are left alone because they may include byte-transfer time.
+fn observe_latency_floor(latency_floor_ms: &mut Option<f32>, rtt_ms: u32) {
+    let sample = rtt_ms.max(1) as f32;
+    *latency_floor_ms = Some(match *latency_floor_ms {
+        Some(floor) => floor.min(sample),
+        None => sample,
+    });
+}
+
+/// Milliseconds of a read RTT that count against the byte budget after
+/// subtracting the observed fixed request latency. Always at least 1ms so
+/// throughput stays finite for same-frame / frame-quantized responses.
+fn budgeted_transfer_ms(rtt_ms: u32, latency_floor_ms: Option<f32>) -> u32 {
+    let fixed_ms = latency_floor_ms.unwrap_or(0.0).floor() as u32;
+    rtt_ms.saturating_sub(fixed_ms).max(1)
+}
+
 /// One AIMD step for the adaptive bulk-read budget.
 ///
-/// * **Overran the frame** (`rtt > frame_budget_ms`): multiplicative cut,
-///   scaled by how badly we overshot — a big spike drops the budget hard so
-///   the next bulk read fits, instead of repeating the stall.
+/// * **Overran the byte-transfer budget** (`transfer_ms > frame_budget_ms`):
+///   multiplicative cut, scaled by how badly we overshot — a big spike drops
+///   the budget hard so the next bulk read fits, instead of repeating the
+///   stall.
 /// * **Under budget**: additive grow, capped at what the measured throughput
 ///   says fits in 80% of a frame — probe bandwidth back gently rather than
 ///   jumping straight back to a spike.
 ///
 /// Pure so it can be unit-tested for convergence and backoff.
-fn next_budget(budget: u32, rtt_ms: u32, throughput: Option<f32>, cfg: &PollConfig) -> u32 {
+fn next_budget(budget: u32, transfer_ms: u32, throughput: Option<f32>, cfg: &PollConfig) -> u32 {
     let frame_ms = cfg.frame_budget_ms.max(1) as f32;
     let b = budget as f32;
-    let next = if rtt_ms > cfg.frame_budget_ms {
-        let overshoot = (rtt_ms.max(1) as f32 / frame_ms).min(4.0);
+    let next = if transfer_ms > cfg.frame_budget_ms {
+        let overshoot = (transfer_ms.max(1) as f32 / frame_ms).min(4.0);
         (b * (0.5 / overshoot).max(0.2)).max(0.0)
     } else {
         let ceil = throughput
@@ -584,7 +619,7 @@ fn budget_for_remaining_time(
     }
 }
 
-fn predicted_rtt_ms(bytes: u32, throughput: Option<f32>) -> Option<u128> {
+fn predicted_transfer_ms(bytes: u32, throughput: Option<f32>) -> Option<u128> {
     let tp = throughput.filter(|tp| tp.is_finite() && *tp > 0.0)?;
     Some((bytes as f32 / tp).ceil().max(1.0) as u128)
 }
@@ -595,7 +630,7 @@ fn batch_fits_remaining_time(
     elapsed_ms: u128,
     frame_ms: u128,
 ) -> bool {
-    predicted_rtt_ms(bytes, throughput)
+    predicted_transfer_ms(bytes, throughput)
         .map(|predicted| elapsed_ms.saturating_add(predicted) <= frame_ms)
         .unwrap_or(true)
 }
@@ -838,8 +873,9 @@ mod tests {
         refreshed
     }
 
-    // Mirrors the real loop's shared time guard: realtime spends from the
-    // same frame budget, and bulk starts only while time remains.
+    // Mirrors the real loop's shared time guard plus its progress floor:
+    // realtime spends from the same frame budget, but one bulk batch is still
+    // allowed if fixed request latency already consumed the window.
     fn batches_issued(
         frame_ms: u128,
         realtime_cost_ms: u128,
@@ -849,7 +885,7 @@ mod tests {
         let mut issued = 0usize;
         let mut elapsed = realtime_cost_ms;
         for _ in 0..pending_batches {
-            if elapsed >= frame_ms {
+            if elapsed >= frame_ms && issued > 0 {
                 break;
             }
             issued += 1;
@@ -859,11 +895,13 @@ mod tests {
     }
 
     #[test]
-    fn realtime_poll_spends_the_shared_frame_budget() {
-        // Realtime is always first. If it consumes the whole 16ms window,
-        // bulk does not get an extra private budget.
-        assert_eq!(batches_issued(16, 20, 4, 100), 0);
-        assert_eq!(batches_issued(16, 16, 4, 100), 0);
+    fn first_bulk_batch_can_progress_after_fixed_latency_spends_budget() {
+        // Realtime is always first. If its fixed request latency consumes the
+        // window, bulk still gets one adaptive-budgeted batch so frame-bound
+        // emulator backends don't starve non-realtime data forever.
+        assert_eq!(batches_issued(16, 20, 4, 100), 1);
+        assert_eq!(batches_issued(16, 16, 4, 100), 1);
+        assert_eq!(batches_issued(16, 16, 4, 0), 0);
 
         // If realtime leaves 8ms and batches cost ~4ms, two bulk batches fit.
         assert_eq!(batches_issued(16, 8, 4, 100), 2);
@@ -1065,7 +1103,8 @@ mod tests {
     #[test]
     fn overrun_cuts_budget_hard() {
         let c = cfg();
-        // 40ms RTT on a 16ms frame: ~2.5x overshoot -> sharp cut.
+        // 40ms of byte-transfer time on a 16ms frame: ~2.5x overshoot
+        // -> sharp cut.
         let next = next_budget(16_000, 40, Some(400.0), &c);
         assert!(next < 16_000 / 2, "spike must drop budget hard: {next}");
         assert!(next >= c.min_byte_budget);
@@ -1093,6 +1132,26 @@ mod tests {
     }
 
     #[test]
+    fn frame_quantized_latency_does_not_collapse_throughput() {
+        let c = cfg();
+        let mut floor = None;
+        observe_latency_floor(&mut floor, 16);
+
+        // A frame-bound emulator may return a 2KB batch on the next 16ms
+        // frame even though the bytes themselves were cheap. The scheduler
+        // should budget the variable transfer portion, not conclude that the
+        // link can only move 2KB per frame forever.
+        let transfer_ms = budgeted_transfer_ms(16, floor);
+        assert_eq!(transfer_ms, 1);
+
+        let budget = next_budget(2048, transfer_ms, Some(2048.0), &c);
+        assert!(
+            budget > 2048,
+            "fixed frame latency should still let the byte budget grow: {budget}"
+        );
+    }
+
+    #[test]
     fn remaining_time_caps_iteration_budget_by_throughput() {
         // 8ms left at ~500 B/ms with 20% headroom -> 3200 bytes.
         let capped = budget_for_remaining_time(6400, Some(500.0), 8, 16);
@@ -1106,8 +1165,8 @@ mod tests {
 
     #[test]
     fn predicted_overrun_defers_late_batch() {
-        // 4000 bytes at ~500 B/ms predicts ~8ms RTT, which does not fit in
-        // the last 4ms of a 16ms frame.
+        // 4000 bytes at ~500 B/ms predicts ~8ms of variable transfer, which
+        // does not fit in the last 4ms of a 16ms frame.
         assert!(!batch_fits_remaining_time(4000, Some(500.0), 12, 16));
         assert!(batch_fits_remaining_time(1600, Some(500.0), 12, 16));
     }
@@ -1117,14 +1176,15 @@ mod tests {
         let c = cfg();
         // Simulate: link does ~500 B/ms, frame target 16ms. Steady state
         // should settle near the 80%-frame ceiling (~6400) and not oscillate
-        // wildly. Model rtt = bytes / throughput.
+        // wildly. Model transfer time = bytes / throughput.
         let tput = 500.0;
         let mut budget = 2048u32;
         for _ in 0..200 {
-            let rtt = (budget as f32 / tput).ceil() as u32;
-            budget = next_budget(budget, rtt, Some(tput), &c);
+            let transfer_ms = (budget as f32 / tput).ceil() as u32;
+            budget = next_budget(budget, transfer_ms, Some(tput), &c);
         }
-        // At ~6400 bytes, rtt ≈ 13ms (< 16) so it stays; allow some band.
+        // At ~6400 bytes, transfer time is ~13ms (< 16) so it stays; allow
+        // some band.
         assert!(
             (4000..=9000).contains(&budget),
             "should converge near throughput point, got {budget}"
