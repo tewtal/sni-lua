@@ -1,14 +1,9 @@
 //! Capture-device background.
 //!
-//! Three modes (all selectable):
+//! Two output modes:
 //!
 //! * [`CaptureMode::Composited`] — the app grabs the capture feed and draws
 //!   the overlay on top inside its own window.
-//! * [`CaptureMode::TransparentOverlay`] — the app renders only the overlay
-//!   in a transparent, click-through, always-on-top window placed over the
-//!   user's own capture software (OBS, etc.). No device is opened in this
-//!   mode; the window manager / Win32 layer handles transparency (the app
-//!   crate owns that since it owns the eframe window).
 //! * [`CaptureMode::StreamingOverlay`] — the app renders only the overlay in
 //!   a separate opaque window with a solid chroma-key background so it can be
 //!   captured directly as a normal window and keyed in streaming software.
@@ -31,16 +26,16 @@ use nokhwa::{Camera, FormatDecoder};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CaptureMode {
+    /// Capture device drawn in-app with the overlay composited on top.
     #[default]
     Composited,
-    TransparentOverlay,
+    /// Overlay rendered into a detached, chroma-keyable window for OBS.
     StreamingOverlay,
 }
 
 impl CaptureMode {
     pub fn parse(s: &str) -> CaptureMode {
         match s {
-            "transparent" => CaptureMode::TransparentOverlay,
             "stream" | "streaming" => CaptureMode::StreamingOverlay,
             _ => CaptureMode::Composited,
         }
@@ -163,9 +158,29 @@ impl CaptureSource {
 impl Drop for CaptureSource {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            // The capture call can block briefly; give the thread a moment.
+        let Some(h) = self.handle.take() else {
+            return;
+        };
+        // The thread checks `stop` between frames and exits promptly when
+        // idle. But it can be parked inside a blocking `camera.frame()`
+        // (a hiccupping / unplugged capture card) — joining that directly
+        // would freeze the caller (runtime device/mode switches, and it
+        // contributed to a hung shutdown). Join on a watcher thread with a
+        // short deadline; if the device read is wedged, detach and let that
+        // thread die with the process rather than block the UI.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
             let _ = h.join();
+            let _ = tx.send(());
+        });
+        if rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_err()
+        {
+            tracing::warn!(
+                "capture thread did not stop within 500ms (device read \
+                 likely wedged); detaching"
+            );
         }
     }
 }

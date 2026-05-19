@@ -1,4 +1,4 @@
--- ui.* controls demo
+-- Script-declared settings panel (ui.*).
 --
 -- A script can expose settings the user tweaks from the app — no editing
 -- the script. Declare controls once in on_init; read them any frame with

@@ -25,7 +25,7 @@ pub struct Config {
     /// script roams. Pinned watches (controller, frame counter, explicit
     /// snes.tier) are unaffected.
     pub demand_window_ms: u32,
-    /// Capture mode: "composited", "transparent", or "streaming".
+    /// Output mode: "composited" or "streaming".
     pub capture_mode: String,
     /// Capture device index (composited mode). Capture cards enumerate as
     /// webcam-class devices.
@@ -43,12 +43,23 @@ pub struct Config {
     /// "aspect" = center-crop the source to the canvas aspect after manual
     /// margins; "stretch" = stretch the cropped source into the canvas rect.
     pub capture_crop_mode: String,
-    /// Mouse input should pass through the transparent overlay window.
-    pub overlay_click_through: bool,
     /// RGB key color for the detached streaming-output window.
     pub stream_key_color: [u8; 3],
-    /// Keep showing the overlay canvas inside the main app while streaming.
+    /// Open the detached, chroma-keyable "stream output" window (the one you
+    /// capture in OBS). When false, the keyed overlay is shown only in the
+    /// main app window and no extra window is opened.
+    pub stream_detached_window: bool,
+    /// Keep showing the overlay canvas inside the main app while the detached
+    /// stream window is open. (Ignored when `stream_detached_window` is
+    /// false — the in-app view *is* the output then.)
     pub stream_show_in_app_canvas: bool,
+    /// Size the detached stream window to an integer multiple of the
+    /// script's canvas automatically. When false, `stream_scale` is used.
+    pub stream_auto_scale: bool,
+    /// Integer pixel scale for the stream window (canvas size × this).
+    /// Used as the override when `stream_auto_scale` is false, and as the
+    /// initial pick when it is true.
+    pub stream_scale: u32,
     /// Last loaded script path, restored on launch.
     pub last_script: Option<PathBuf>,
     /// Canvas (script coordinate space) policy:
@@ -82,9 +93,11 @@ impl Default for Config {
             capture_crop_right: 0,
             capture_crop_bottom: 0,
             capture_crop_mode: "aspect".to_string(),
-            overlay_click_through: false,
             stream_key_color: [255, 0, 255],
+            stream_detached_window: true,
             stream_show_in_app_canvas: true,
+            stream_auto_scale: true,
+            stream_scale: 3,
             last_script: None,
             canvas_mode: "script".to_string(),
             text_sizing_mode: "game".to_string(),

@@ -120,6 +120,48 @@ impl TimeState {
     }
 }
 
+/// One frame's raw pointer reading, pushed by the app before `run_frame`.
+/// `pos` is in the script's canvas coordinate space, or `None` when the
+/// pointer is outside the canvas (or there is no pointer).
+#[derive(Clone, Copy, Default)]
+pub struct MouseFrame {
+    pub pos: Option<(f32, f32)>,
+    /// `[left, right, middle]` currently held.
+    pub buttons: [bool; 3],
+    /// Scroll delta this frame (lines/units, positive = up/away).
+    pub wheel: f32,
+}
+
+/// Backs the `mouse.*` table. Holds the latest [`MouseFrame`] plus the
+/// previous frame's held buttons so press/release edges can be derived.
+/// `Cell`/`RefCell` because all access is single-threaded (UI thread).
+#[derive(Default)]
+struct MouseState {
+    cur: RefCell<MouseFrame>,
+    prev_buttons: Cell<[bool; 3]>,
+}
+
+impl MouseState {
+    fn new() -> Rc<Self> {
+        Rc::new(Self::default())
+    }
+
+    /// Take the app's reading for this frame. Called once just before
+    /// `on_frame`; edge queries compare against the buttons stored here.
+    fn feed(&self, f: MouseFrame) {
+        self.prev_buttons.set(self.cur.borrow().buttons);
+        *self.cur.borrow_mut() = f;
+    }
+
+    fn pressed(&self, btn: usize) -> bool {
+        btn < 3 && self.cur.borrow().buttons[btn] && !self.prev_buttons.get()[btn]
+    }
+
+    fn released(&self, btn: usize) -> bool {
+        btn < 3 && !self.cur.borrow().buttons[btn] && self.prev_buttons.get()[btn]
+    }
+}
+
 /// Captured `print()` / error output for the in-app console.
 #[derive(Default)]
 pub struct Console {
@@ -171,6 +213,9 @@ pub struct ScriptHost {
     /// Frame timing for the `time.*` table. `start` is script-load instant;
     /// `frame` increments per `run_frame`; `last_frame` feeds `time.dt()`.
     time: Rc<TimeState>,
+    /// Pointer state behind `mouse.*`. The app feeds one [`MouseFrame`] per
+    /// frame (canvas-space coords) before `run_frame`; the script reads it.
+    mouse: Rc<MouseState>,
     /// Controls the script declared via `ui.*`. The app renders these and
     /// writes user edits back into the same values the script reads with
     /// `ui.get`. `Rc<RefCell>` — single-threaded, captured into Lua closures.
@@ -219,6 +264,7 @@ impl ScriptHost {
             requested_text_sizing: Rc::new(RefCell::new(None)),
             origin_stack: Rc::new(RefCell::new(Vec::new())),
             time: TimeState::new(),
+            mouse: MouseState::new(),
             controls: Controls::shared(),
             store: Store::new(),
             http,
@@ -231,6 +277,13 @@ impl ScriptHost {
     /// The persistent store, so the app can flush it each frame / on exit.
     pub fn store(&self) -> Arc<Store> {
         self.store.clone()
+    }
+
+    /// Push this frame's pointer reading. The app calls this once per frame
+    /// just before [`Self::run_frame`], with the position already mapped into
+    /// the script's canvas coordinate space (`None` = pointer off-canvas).
+    pub fn feed_mouse(&self, frame: MouseFrame) {
+        self.mouse.feed(frame);
     }
 
     /// Point the store at this script's save file and load it. The app calls
@@ -903,6 +956,82 @@ impl ScriptHost {
         }
         globals.set("time", time_tbl)?;
 
+        // --- mouse.* (pointer over the canvas, in canvas coordinates) ------
+        // Position is `nil` when the pointer is outside the script's canvas
+        // (or there's no pointer). Buttons: "left" (default), "right",
+        // "middle". `pressed`/`released` are one-frame edges.
+        let mouse_tbl = self.lua.create_table()?;
+        // "left"|"right"|"middle" -> 0..2, default left, anything else left.
+        fn btn_index(name: Option<String>) -> usize {
+            match name.as_deref() {
+                Some("right") => 1,
+                Some("middle") => 2,
+                _ => 0,
+            }
+        }
+        {
+            let mouse = self.mouse.clone();
+            // mouse.pos() -> x, y  (two nils when off-canvas)
+            let f = self.lua.create_function(move |_, ()| {
+                Ok(match mouse.cur.borrow().pos {
+                    Some((x, y)) => (Some(x), Some(y)),
+                    None => (None, None),
+                })
+            })?;
+            mouse_tbl.set("pos", f)?;
+        }
+        {
+            let mouse = self.mouse.clone();
+            let f = self
+                .lua
+                .create_function(move |_, ()| Ok(mouse.cur.borrow().pos.map(|p| p.0)))?;
+            mouse_tbl.set("x", f)?;
+        }
+        {
+            let mouse = self.mouse.clone();
+            let f = self
+                .lua
+                .create_function(move |_, ()| Ok(mouse.cur.borrow().pos.map(|p| p.1)))?;
+            mouse_tbl.set("y", f)?;
+        }
+        {
+            let mouse = self.mouse.clone();
+            // mouse.over() -> true while the pointer is on the canvas.
+            let f = self
+                .lua
+                .create_function(move |_, ()| Ok(mouse.cur.borrow().pos.is_some()))?;
+            mouse_tbl.set("over", f)?;
+        }
+        {
+            let mouse = self.mouse.clone();
+            let f = self.lua.create_function(move |_, b: Option<String>| {
+                Ok(mouse.cur.borrow().buttons[btn_index(b)])
+            })?;
+            mouse_tbl.set("down", f)?;
+        }
+        {
+            let mouse = self.mouse.clone();
+            let f = self
+                .lua
+                .create_function(move |_, b: Option<String>| Ok(mouse.pressed(btn_index(b))))?;
+            mouse_tbl.set("pressed", f)?;
+        }
+        {
+            let mouse = self.mouse.clone();
+            let f = self
+                .lua
+                .create_function(move |_, b: Option<String>| Ok(mouse.released(btn_index(b))))?;
+            mouse_tbl.set("released", f)?;
+        }
+        {
+            let mouse = self.mouse.clone();
+            let f = self
+                .lua
+                .create_function(move |_, ()| Ok(mouse.cur.borrow().wheel))?;
+            mouse_tbl.set("wheel", f)?;
+        }
+        globals.set("mouse", mouse_tbl)?;
+
         // --- anim.* (pure Lua; tweening + time-driven oscillators) ---------
         // Small stdlib-style helpers so scripts stop hand-rolling
         // math.sin(time.now()*k). Pure Lua: trivial, safe, easy to extend.
@@ -1501,6 +1630,7 @@ impl ScriptHost {
         *self.requested_text_sizing.borrow_mut() = None;
         self.origin_stack.borrow_mut().clear();
         self.time = TimeState::new();
+        self.mouse = MouseState::new();
         // Drop the previous script's declared panel; the new script will
         // re-declare its own (seeding values from the persisted store).
         self.controls.borrow_mut().items.clear();
@@ -1883,28 +2013,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_overlay_example_loads_and_runs() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../examples/sm_stream_overlay.lua"
-        );
-        let src = std::fs::read_to_string(path).expect("stream overlay example present");
-        let mut h = host();
-        h.load_script(&src, "sm_stream_overlay.lua")
-            .expect("stream overlay example loads without error");
-        let dl = h.run_frame();
-        assert!(
-            h.is_loaded(),
-            "script disabled itself: {:?}",
-            h.console().snapshot()
-        );
-        assert!(
-            !dl.cmds.is_empty(),
-            "stream overlay should draw a waiting/status frame"
-        );
-    }
-
-    #[test]
     fn gfx_scale_changes_reported_canvas() {
         let mut h = host();
         h.load_script(
@@ -2091,48 +2199,21 @@ mod tests {
     }
 
     #[test]
-    fn controls_demo_example_loads_and_declares_panel() {
+    fn settings_panel_example_loads_and_declares_panel() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../examples/controls_demo.lua"
+            "/../../examples/settings_panel.lua"
         );
-        let src = std::fs::read_to_string(path).expect("controls demo present");
+        let src = std::fs::read_to_string(path).expect("settings_panel present");
         let mut h = host();
-        h.load_script(&src, "controls_demo.lua")
-            .expect("controls demo loads");
+        h.load_script(&src, "settings_panel.lua")
+            .expect("settings_panel loads");
         h.run_frame();
         assert!(h.is_loaded(), "console: {:?}", h.console().snapshot());
         assert!(
             !h.controls().borrow().is_empty(),
-            "demo should declare a settings panel"
+            "example should declare a settings panel"
         );
-    }
-
-    #[test]
-    fn new_api_demo_example_loads_and_runs() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../examples/new_api_demo.lua"
-        );
-        let src = std::fs::read_to_string(path).expect("new_api_demo present");
-        let mut h = host();
-        h.load_script(&src, "new_api_demo.lua")
-            .expect("new_api_demo loads");
-        for _ in 0..4 {
-            h.run_frame();
-            assert!(h.is_loaded(), "console: {:?}", h.console().snapshot());
-        }
-        // It exercises time/gfx/snes.buttons/ui without a SNES and must
-        // still draw the HUD text + pulsing ring.
-        let dl = h.run_frame();
-        assert!(!dl.cmds.is_empty(), "demo should draw something");
-        // on_unload should fire cleanly on reload (no panic / error).
-        h.load_script("-- replace", "x").unwrap();
-        assert!(h
-            .console()
-            .snapshot()
-            .iter()
-            .any(|l| l.contains("unloading at frame")));
     }
 
     #[test]
@@ -2579,15 +2660,12 @@ mod tests {
     }
 
     #[test]
-    fn draw_anim_demo_example_loads_and_runs() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../examples/draw_anim_demo.lua"
-        );
-        let src = std::fs::read_to_string(path).expect("draw_anim_demo present");
+    fn drawing_example_loads_and_runs() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/drawing.lua");
+        let src = std::fs::read_to_string(path).expect("drawing example present");
         let mut h = host();
-        h.load_script(&src, "draw_anim_demo.lua")
-            .expect("draw_anim_demo loads");
+        h.load_script(&src, "drawing.lua")
+            .expect("drawing example loads");
         for _ in 0..4 {
             h.run_frame();
             assert!(h.is_loaded(), "console: {:?}", h.console().snapshot());
@@ -2601,12 +2679,8 @@ mod tests {
     /// Every shipped example must at least load and survive a few frames, so
     /// an API change can't silently break the docs-by-example.
     fn smoke_example(file: &str) {
-        let path = format!(
-            "{}/../../examples/{file}",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let src =
-            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let path = format!("{}/../../examples/{file}", env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{file}: {e}"));
         let mut h = host();
         h.load_script(&src, file)
             .unwrap_or_else(|e| panic!("{file} failed to load: {e}"));
@@ -2626,13 +2700,110 @@ mod tests {
     }
 
     #[test]
-    fn hires_grid_example_loads_and_runs() {
-        smoke_example("hires_grid.lua");
+    fn hires_canvas_example_loads_and_runs() {
+        smoke_example("hires_canvas.lua");
     }
 
     #[test]
-    fn store_http_demo_example_loads_and_runs() {
-        smoke_example("store_http_demo.lua");
+    fn store_and_http_example_loads_and_runs() {
+        smoke_example("store_and_http.lua");
+    }
+
+    #[test]
+    fn toast_example_loads_and_runs() {
+        smoke_example("toast.lua");
+    }
+
+    #[test]
+    fn toast_example_handles_mouse_clicks() {
+        // Drive the toast example with a click so its mouse-driven paths
+        // (push on click, hover highlight, dismiss) actually execute.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/toast.lua");
+        let src = std::fs::read_to_string(path).expect("toast example present");
+        let mut h = host();
+        h.load_script(&src, "toast.lua").expect("toast loads");
+        h.feed_mouse(MouseFrame {
+            pos: Some((80.0, 60.0)),
+            buttons: [true, false, false],
+            wheel: 0.0,
+        });
+        h.run_frame();
+        for _ in 0..6 {
+            h.feed_mouse(MouseFrame {
+                pos: Some((80.0, 60.0)),
+                buttons: [false, false, false],
+                wheel: 0.0,
+            });
+            h.run_frame();
+            assert!(h.is_loaded(), "console: {:?}", h.console().snapshot());
+        }
+        let dl = h.run_frame();
+        assert!(!dl.cmds.is_empty(), "toast should draw a notification");
+    }
+
+    #[test]
+    fn toast_example_ignores_off_canvas_clicks() {
+        // Regression: a left-click while the pointer is OUTSIDE the canvas
+        // (mouse.pos() == nil) must not spawn a toast.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/toast.lua");
+        let src = std::fs::read_to_string(path).expect("toast example present");
+        let mut h = host();
+        h.load_script(&src, "toast.lua").expect("toast loads");
+        h.run_frame(); // settle (initial "Click the canvas" toast logs once)
+        let before = h
+            .console()
+            .snapshot()
+            .iter()
+            .filter(|l| l.contains("toast [ok] Clicked at"))
+            .count();
+        // Click with no canvas position (pointer off-canvas).
+        h.feed_mouse(MouseFrame {
+            pos: None,
+            buttons: [true, false, false],
+            wheel: 0.0,
+        });
+        h.run_frame();
+        let after = h
+            .console()
+            .snapshot()
+            .iter()
+            .filter(|l| l.contains("toast [ok] Clicked at"))
+            .count();
+        assert_eq!(before, after, "off-canvas click must not spawn a toast");
+    }
+
+    #[test]
+    fn toast_example_demo_button_uses_selected_kind() {
+        // Regression: ui.get on a select returns a 1-based index, not the
+        // option string. The Demo button must map it back to the kind name
+        // so a non-default selection actually changes the toast.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/toast.lua");
+        let src = std::fs::read_to_string(path).expect("toast example present");
+        let mut h = host();
+        h.load_script(&src, "toast.lua").expect("toast loads");
+        h.run_frame();
+
+        // Select "error" (4th option, 1-based index 4) and press Demo.
+        {
+            let controls = h.controls();
+            let mut c = controls.borrow_mut();
+            for item in c.items.iter_mut() {
+                match item {
+                    Control::Select { id, value, .. } if id == "kind" => *value = 3, // 0-based
+                    Control::Button { id, pressed, .. } if id == "demo" => *pressed = true,
+                    _ => {}
+                }
+            }
+        }
+        h.run_frame();
+        // notify() logs the *resolved* kind, so the console shows which
+        // kind the Demo button actually used. The buggy path (passing the
+        // raw select index) would always resolve to "info".
+        let log = h.console().snapshot().join("\n");
+        assert!(
+            log.contains("toast [error] Hello from sni-lua"),
+            "Demo with 'error' selected must use that kind; console was: {log}"
+        );
     }
 
     #[test]
@@ -2663,5 +2834,109 @@ mod tests {
         let s = g.get::<f64>("saw").unwrap();
         assert!((0.0..=1.0).contains(&s));
         assert_eq!(g.get::<f64>("clamped").unwrap(), 100.0);
+    }
+
+    #[test]
+    fn mouse_position_and_over_reflect_fed_frame() {
+        let mut h = host();
+        h.load_script(
+            r#"
+            function on_frame()
+              ox, oy = mouse.pos()
+              over   = mouse.over()
+              mx, my = mouse.x(), mouse.y()
+            end
+            "#,
+            "t",
+        )
+        .unwrap();
+
+        // No frame fed yet -> off-canvas.
+        h.run_frame();
+        let g = h.lua.globals();
+        assert!(g.get::<Value>("ox").unwrap().is_nil());
+        assert!(!g.get::<bool>("over").unwrap());
+
+        h.feed_mouse(MouseFrame {
+            pos: Some((40.0, 22.0)),
+            buttons: [false; 3],
+            wheel: 0.0,
+        });
+        h.run_frame();
+        assert_eq!(h.lua.globals().get::<f32>("mx").unwrap(), 40.0);
+        assert_eq!(h.lua.globals().get::<f32>("my").unwrap(), 22.0);
+        assert!(h.lua.globals().get::<bool>("over").unwrap());
+
+        // Pointer leaves the canvas.
+        h.feed_mouse(MouseFrame::default());
+        h.run_frame();
+        assert!(h.lua.globals().get::<Value>("mx").unwrap().is_nil());
+        assert!(!h.lua.globals().get::<bool>("over").unwrap());
+    }
+
+    #[test]
+    fn mouse_button_edges_fire_once() {
+        let mut h = host();
+        h.load_script(
+            r#"
+            function on_frame()
+              down  = mouse.down("left")
+              press = mouse.pressed("left")
+              rel   = mouse.released("left")
+              rdown = mouse.down("right")
+            end
+            "#,
+            "t",
+        )
+        .unwrap();
+        let lmb = |b| MouseFrame {
+            pos: Some((1.0, 1.0)),
+            buttons: [b, false, false],
+            wheel: 0.0,
+        };
+
+        // Press: down + pressed-edge true, released false.
+        h.feed_mouse(lmb(true));
+        h.run_frame();
+        let g = h.lua.globals();
+        assert!(g.get::<bool>("down").unwrap());
+        assert!(g.get::<bool>("press").unwrap());
+        assert!(!g.get::<bool>("rel").unwrap());
+        assert!(!g.get::<bool>("rdown").unwrap());
+
+        // Held: still down, but the pressed edge is consumed.
+        h.feed_mouse(lmb(true));
+        h.run_frame();
+        assert!(h.lua.globals().get::<bool>("down").unwrap());
+        assert!(!h.lua.globals().get::<bool>("press").unwrap());
+
+        // Release: released-edge true exactly one frame.
+        h.feed_mouse(lmb(false));
+        h.run_frame();
+        assert!(!h.lua.globals().get::<bool>("down").unwrap());
+        assert!(h.lua.globals().get::<bool>("rel").unwrap());
+        h.feed_mouse(lmb(false));
+        h.run_frame();
+        assert!(!h.lua.globals().get::<bool>("rel").unwrap());
+    }
+
+    #[test]
+    fn mouse_wheel_and_reset_on_reload() {
+        let mut h = host();
+        h.load_script(r#"function on_frame() w = mouse.wheel() end"#, "t")
+            .unwrap();
+        h.feed_mouse(MouseFrame {
+            pos: None,
+            buttons: [false; 3],
+            wheel: -3.5,
+        });
+        h.run_frame();
+        assert_eq!(h.lua.globals().get::<f32>("w").unwrap(), -3.5);
+
+        // Reloading a script must clear stale pointer state.
+        h.load_script(r#"function on_frame() w = mouse.wheel() end"#, "t2")
+            .unwrap();
+        h.run_frame();
+        assert_eq!(h.lua.globals().get::<f32>("w").unwrap(), 0.0);
     }
 }

@@ -9,7 +9,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
-mod platform;
 mod sni_actor;
 
 use std::sync::Arc;
@@ -19,7 +18,7 @@ use eframe::egui;
 use sni_actor::{Cmd, CmdSender, ConnState, SniHandle};
 use sni_cache::{PollConfig, PollEngine};
 use sni_client::MemRegion;
-use sni_lua_api::{Console, Control, ScriptHost, WriteSink};
+use sni_lua_api::{Console, Control, MouseFrame, ScriptHost, WriteSink};
 use sni_render::DrawList;
 use tokio::runtime::Runtime;
 
@@ -55,22 +54,10 @@ fn main() -> eframe::Result<()> {
     let rt = Runtime::new().expect("failed to start tokio runtime");
     let _guard = rt.enter();
 
-    // Decide window style up front: transparent-overlay mode needs a
-    // borderless, transparent, always-on-top window (click-through is added
-    // at the Win32 level once the HWND exists).
-    let start_cfg = Config::load();
-    let transparent = start_cfg.capture_mode == "transparent";
-
-    let mut vb = egui::ViewportBuilder::default()
+    let vb = egui::ViewportBuilder::default()
         .with_inner_size([960.0, 720.0])
         .with_min_inner_size([640.0, 480.0])
         .with_title("sni-lua — SNES overlay scripting over SNI");
-    if transparent {
-        vb = vb
-            .with_transparent(true)
-            .with_decorations(false)
-            .with_always_on_top();
-    }
 
     let native_options = eframe::NativeOptions {
         viewport: vb,
@@ -85,14 +72,16 @@ fn main() -> eframe::Result<()> {
 }
 
 /// Side-panel tabs. Setup carries everything a user needs day to day;
-/// Capture and Debug hide the dense tuning/diagnostics that previously made
+/// Output and Debug hide the dense tuning/diagnostics that previously made
 /// the single panel overwhelming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Setup,
     /// Shown only when the loaded script declared `ui.*` controls.
     Script,
-    Capture,
+    /// Output destination tuning: capture device (composited) or the
+    /// detached stream window (streaming).
+    Output,
     Debug,
 }
 
@@ -154,20 +143,21 @@ struct App {
     probe_addr_hex: String,
     probe_size: u32,
 
-    // Capture. Source runs only in composited mode; transparent mode
-    // opens no device and relies on window transparency instead.
+    // Capture. The device source runs only in composited mode; streaming
+    // mode opens no device and renders the overlay over a keyed background.
     capture: Option<sni_capture::CaptureSource>,
     capture_devices: Vec<sni_capture::DeviceDesc>,
     capture_tex: Option<egui::TextureHandle>,
     /// seq of the frame currently in `capture_tex`, to skip redundant
     /// GPU uploads when the device frame hasn't advanced.
     capture_tex_seq: u64,
-    /// Last transparent-overlay window mode pushed to the native viewport.
-    window_overlay_applied: Option<bool>,
-    /// Last click-through mouse state pushed to the native window.
-    click_through_applied: bool,
     /// Whether the detached stream viewport has been given its initial size.
     stream_viewport_initialized: bool,
+    /// The canvas viewport computed while painting the previous frame. The
+    /// script runs *before* this frame's viewport is known, so mouse input
+    /// is mapped through last frame's viewport — one frame of latency, which
+    /// is imperceptible for pointer interaction.
+    last_viewport: Option<sni_render::Viewport>,
 }
 
 impl App {
@@ -194,10 +184,11 @@ impl App {
         let sink = Arc::new(ActorWriteSink { tx: sni.sender() });
         let host = ScriptHost::with_sink(engine.clone(), sink).expect("LuaJIT init failed");
         let console = host.console();
-        // LuaJIT health check: prove the VM evaluates before loading scripts.
-        let lua_status = match host.eval_number("return 2 ^ 10") {
-            Ok(v) => format!("LuaJIT OK (2^10 = {v})"),
-            Err(e) => format!("LuaJIT FAILED: {e}"),
+        // Sanity-check the LuaJIT VM before loading any script. On success
+        // stay quiet; only a failure is worth surfacing in the status line.
+        let lua_status = match host.eval_number("return 1") {
+            Ok(_) => "Ready.".to_string(),
+            Err(e) => format!("LuaJIT init failed: {e}"),
         };
 
         // Enumerate capture devices once at startup (cheap; refreshable from
@@ -222,7 +213,7 @@ impl App {
             host,
             console,
             draw_list: DrawList::default(),
-            status: format!("Ready. {lua_status}"),
+            status: lua_status,
             script_path: config
                 .last_script
                 .as_ref()
@@ -238,9 +229,8 @@ impl App {
             capture_devices,
             capture_tex: None,
             capture_tex_seq: 0,
-            window_overlay_applied: None,
-            click_through_applied: false,
             stream_viewport_initialized: false,
+            last_viewport: None,
         };
         // Auto-load the last script if one was remembered.
         if !app.script_path.is_empty() {
@@ -480,6 +470,20 @@ impl App {
         format!("#{r:02X}{g:02X}{b:02X}")
     }
 
+    /// Integer pixel scale for the detached stream window, given the script's
+    /// `canvas`. Always integer so the pixel-art overlay stays crisp for the
+    /// chroma keyer. Auto: largest scale whose window fits within a ~960x900
+    /// budget (so it isn't bigger than the screen), min 1x. Manual: the saved
+    /// `stream_scale`, clamped 1..=8.
+    fn stream_scale_for(&self, canvas: sni_render::Canvas) -> u32 {
+        if !self.config.stream_auto_scale {
+            return self.config.stream_scale.clamp(1, 8);
+        }
+        let (cw, ch) = (canvas.w.max(1.0), canvas.h.max(1.0));
+        let fit = ((960.0 / cw).floor() as u32).min((900.0 / ch).floor() as u32);
+        fit.clamp(1, 8)
+    }
+
     /// Build the engine's PollConfig from the persisted settings. One place
     /// so spawn and every live `set_config` stay consistent (a partial
     /// `..default()` would silently reset the other tunables).
@@ -524,8 +528,8 @@ impl App {
     }
 
     /// (Re)open the capture source to match the current mode + device.
-    /// Composited opens the device; overlay-only modes close it and render
-    /// against either true transparency or a keyed background instead.
+    /// Composited opens the device; streaming mode closes it and renders the
+    /// overlay over a keyed background instead.
     fn restart_capture(&mut self) {
         // Dropping the old source stops its thread cleanly first.
         self.capture = None;
@@ -539,24 +543,28 @@ impl App {
         }
     }
 
-    fn apply_window_mode(&mut self, ctx: &egui::Context, frame: &eframe::Frame, transparent: bool) {
-        if self.window_overlay_applied != Some(transparent) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(transparent));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!transparent));
-            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if transparent {
-                egui::WindowLevel::AlwaysOnTop
-            } else {
-                egui::WindowLevel::Normal
-            }));
-            self.window_overlay_applied = Some(transparent);
-        }
-
-        let want_click_through = transparent && self.config.overlay_click_through;
-        if self.click_through_applied != want_click_through {
-            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(want_click_through));
-            platform::set_click_through(frame, want_click_through);
-            self.click_through_applied = want_click_through;
-        }
+    /// Read this frame's pointer and hand it to the script host in canvas
+    /// coordinates. Mapped through *last* frame's viewport (the script runs
+    /// before this frame's is known) — one frame of latency, imperceptible
+    /// for pointer use. Position is `None` when there's no pointer or it's
+    /// outside the canvas, so a script can distinguish "over the game".
+    fn feed_mouse(&self, ctx: &egui::Context) {
+        let frame = ctx.input(|i| {
+            let pos = i
+                .pointer
+                .latest_pos()
+                .and_then(|p| self.last_viewport.and_then(|vp| vp.screen_to_canvas(p)));
+            MouseFrame {
+                pos,
+                buttons: [
+                    i.pointer.button_down(egui::PointerButton::Primary),
+                    i.pointer.button_down(egui::PointerButton::Secondary),
+                    i.pointer.button_down(egui::PointerButton::Middle),
+                ],
+                wheel: i.raw_scroll_delta.y,
+            }
+        });
+        self.host.feed_mouse(frame);
     }
 
     // Private paint helper: every argument is one facet of a single paint
@@ -565,49 +573,29 @@ impl App {
     fn paint_overlay_canvas(
         &self,
         ui: &mut egui::Ui,
-        ctx: &egui::Context,
         active_canvas: sni_render::Canvas,
         capture_mode: sni_capture::CaptureMode,
         cap_tex: Option<(egui::TextureId, [usize; 2])>,
         sizing: sni_render::TextSizing,
         loaded: bool,
-    ) {
-        let transparent = capture_mode == sni_capture::CaptureMode::TransparentOverlay;
+    ) -> sni_render::Viewport {
         let streaming = capture_mode == sni_capture::CaptureMode::StreamingOverlay;
 
         let avail = ui.available_size();
-        let sense = if transparent {
-            egui::Sense::drag()
-        } else {
-            egui::Sense::hover()
-        };
-        let (rect, resp) = ui.allocate_exact_size(avail, sense);
-        if transparent && resp.drag_started() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
+        let (rect, _resp) = ui.allocate_exact_size(avail, egui::Sense::hover());
         let painter = ui.painter_at(rect);
 
         if streaming {
+            // Solid key color the user chroma-keys out in OBS.
             painter.rect_filled(rect, 0.0, self.stream_key_color());
-        } else if !transparent {
+        } else {
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 18, 22));
         }
 
         let vp = sni_render::Viewport::fit(rect, active_canvas);
         let view = vp.screen_rect();
 
-        if transparent {
-            // Faint guide so the user can place the window; not painted
-            // opaque so it stays see-through.
-            painter.rect_stroke(
-                view,
-                0.0,
-                egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(120, 120, 120, 60),
-                ),
-            );
-        } else if let Some((tex, frame_size)) = cap_tex {
+        if let Some((tex, frame_size)) = cap_tex {
             // Composited: draw the capture feed to fill the canvas rect,
             // overlay goes on top. Same rect as the overlay viewport so
             // script pixel coords line up with the game pixels.
@@ -629,7 +617,7 @@ impl App {
             painter.text(
                 view.center(),
                 egui::Align2::CENTER_CENTER,
-                "Waiting for capture device…\n(pick one under Capture)",
+                "Waiting for capture device…\n(pick one under Output)",
                 egui::FontId::proportional(13.0),
                 egui::Color32::from_gray(110),
             );
@@ -647,6 +635,7 @@ impl App {
                 egui::Color32::from_gray(120),
             );
         }
+        vp
     }
 
     fn show_stream_viewport(
@@ -656,21 +645,29 @@ impl App {
         sizing: sni_render::TextSizing,
         loaded: bool,
     ) {
+        // Size the window to an exact integer multiple of the script's
+        // canvas so the keyed overlay is pixel-perfect for OBS.
+        let scale = self.stream_scale_for(active_canvas);
+        let win = egui::vec2(
+            active_canvas.w * scale as f32,
+            active_canvas.h * scale as f32,
+        );
+
         let mut builder = egui::ViewportBuilder::default()
             .with_title("sni-lua stream output")
-            .with_min_inner_size([256.0, 224.0]);
+            .with_min_inner_size([active_canvas.w, active_canvas.h]);
         if !self.stream_viewport_initialized {
-            builder = builder.with_inner_size([768.0, 672.0]);
+            builder = builder.with_inner_size(win);
         }
 
+        let key = self.stream_key_color();
         ctx.show_viewport_immediate(Self::stream_viewport_id(), builder, |ctx, class| {
             if class == egui::ViewportClass::Embedded {
                 egui::Window::new("Stream output")
-                    .default_size([768.0, 672.0])
+                    .default_size(win)
                     .show(ctx, |ui| {
                         self.paint_overlay_canvas(
                             ui,
-                            ctx,
                             active_canvas,
                             sni_capture::CaptureMode::StreamingOverlay,
                             None,
@@ -679,12 +676,16 @@ impl App {
                         );
                     });
             } else {
+                // Resize a deferred viewport to the canvas multiple too, so a
+                // canvas/scale change re-snaps the OS window.
+                if !self.stream_viewport_initialized {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(win));
+                }
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::none().fill(self.stream_key_color()))
+                    .frame(egui::Frame::none().fill(key))
                     .show(ctx, |ui| {
                         self.paint_overlay_canvas(
                             ui,
-                            ctx,
                             active_canvas,
                             sni_capture::CaptureMode::StreamingOverlay,
                             None,
@@ -784,33 +785,13 @@ impl App {
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        if self.capture_mode() == sni_capture::CaptureMode::TransparentOverlay {
-            [0.0, 0.0, 0.0, 0.0]
-        } else {
-            egui::Color32::from_rgba_unmultiplied(12, 12, 12, 180).to_normalized_gamma_f32()
-        }
+        egui::Color32::from_rgba_unmultiplied(12, 12, 12, 180).to_normalized_gamma_f32()
     }
 
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Keep the UI repainting so capture frames / poll snapshots stay live
         // without user input.
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
-
-        // Transparent overlay and click-through are separate states: the
-        // window can be transparent and borderless while still letting the
-        // user interact with the app controls.
-        let want_transparent = self.capture_mode() == sni_capture::CaptureMode::TransparentOverlay;
-        if ctx.input_mut(|i| {
-            i.consume_key(
-                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-                egui::Key::F10,
-            )
-        }) {
-            self.config.overlay_click_through = false;
-            self.config.save();
-            self.status = "Overlay click-through disabled".to_string();
-        }
-        self.apply_window_mode(ctx, frame, want_transparent);
 
         let snap = {
             // Short-lived clone of the actor state; never hold the lock across
@@ -832,6 +813,7 @@ impl eframe::App for App {
         // In "script" mode the script may change the canvas during the frame,
         // so re-read it afterwards for the viewport.
         self.apply_canvas();
+        self.feed_mouse(ctx);
         self.draw_list = self.host.run_frame();
         // Persist script state if it changed this frame. No-op (one atomic
         // flag check) when the script didn't touch the store.
@@ -899,7 +881,7 @@ impl eframe::App for App {
             .resizable(true)
             .default_width(280.0)
             .show(ctx, |ui| {
-                // Tab bar: Setup is the everyday view; Capture and Debug hold
+                // Tab bar: Setup is the everyday view; Output and Debug hold
                 // the dense controls that used to crowd a single scroll. The
                 // Script tab only appears when the loaded script declared a
                 // settings panel via `ui.*`.
@@ -914,7 +896,7 @@ impl eframe::App for App {
                     if has_controls {
                         ui.selectable_value(&mut self.tab, Tab::Script, "  Script  ");
                     }
-                    ui.selectable_value(&mut self.tab, Tab::Capture, "  Capture  ");
+                    ui.selectable_value(&mut self.tab, Tab::Output, "  Output  ");
                     ui.selectable_value(&mut self.tab, Tab::Debug, "  Debug  ");
                 });
                 ui.add_space(4.0);
@@ -922,656 +904,794 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                // A little breathing room from the panel edges; every tab
-                // body renders inside this inset.
-                ui.add_space(6.0);
-                egui::Frame::none()
-                    .inner_margin(egui::Margin::symmetric(8.0, 0.0))
-                    .show(ui, |ui| {
+                        // A little breathing room from the panel edges; every tab
+                        // body renders inside this inset.
+                        ui.add_space(6.0);
+                        egui::Frame::none()
+                            .inner_margin(egui::Margin::symmetric(8.0, 0.0))
+                            .show(ui, |ui| {
+                                if self.tab == Tab::Script {
+                                    self.render_script_tab(ui);
+                                }
 
-                if self.tab == Tab::Script {
-                    self.render_script_tab(ui);
-                }
+                                if self.tab == Tab::Setup {
+                                    section(ui, "Script");
+                                    hint(ui, "Lua script");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.script_path)
+                                            .desired_width(f32::INFINITY)
+                                            .hint_text("Click Browse… or type a path"),
+                                    );
+                                    ui.horizontal(|ui| {
+                                        if ui.button("📂 Browse…").clicked() {
+                                            self.pick_script_file();
+                                        }
+                                        let has_path = !self.script_path.trim().is_empty();
+                                        if ui
+                                            .add_enabled(has_path, egui::Button::new("Load"))
+                                            .clicked()
+                                        {
+                                            self.load_script_from_path();
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                has_path && self.host.is_loaded(),
+                                                egui::Button::new("↻ Reload"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.load_script_from_path();
+                                        }
+                                    });
+                                    let (txt, col) = if self.host.is_loaded() {
+                                        ("● script running", egui::Color32::from_rgb(0, 200, 0))
+                                    } else if self.script_path.trim().is_empty() {
+                                        ("○ no script", egui::Color32::GRAY)
+                                    } else {
+                                        (
+                                            "● stopped (see console)",
+                                            egui::Color32::from_rgb(220, 60, 60),
+                                        )
+                                    };
+                                    ui.colored_label(col, txt);
+                                    ui.checkbox(&mut self.show_console, "Show console");
 
-                if self.tab == Tab::Setup {
-                section(ui, "Script");
-                hint(ui, "Lua script");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.script_path)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Click Browse… or type a path"),
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("📂 Browse…").clicked() {
-                        self.pick_script_file();
-                    }
-                    let has_path = !self.script_path.trim().is_empty();
-                    if ui
-                        .add_enabled(has_path, egui::Button::new("Load"))
-                        .clicked()
-                    {
-                        self.load_script_from_path();
-                    }
-                    if ui
-                        .add_enabled(
-                            has_path && self.host.is_loaded(),
-                            egui::Button::new("↻ Reload"),
-                        )
-                        .clicked()
-                    {
-                        self.load_script_from_path();
-                    }
-                });
-                let (txt, col) = if self.host.is_loaded() {
-                    ("● script running", egui::Color32::from_rgb(0, 200, 0))
-                } else if self.script_path.trim().is_empty() {
-                    ("○ no script", egui::Color32::GRAY)
-                } else {
-                    (
-                        "● stopped (see console)",
-                        egui::Color32::from_rgb(220, 60, 60),
-                    )
-                };
-                ui.colored_label(col, txt);
-                ui.checkbox(&mut self.show_console, "Show console");
-
-                section(ui, "Overlay");
-                if row(ui, "Text size", |ui| {
-                    ui.add(
-                        egui::Slider::new(&mut self.config.text_size, 0.3..=4.0)
-                            .fixed_decimals(2),
-                    )
-                    .changed()
-                }) {
-                    self.config.save();
-                }
-                let mut mode = self.config.text_sizing_mode.clone();
-                row(ui, "Sizing", |ui| {
-                    egui::ComboBox::from_id_salt("text_sizing")
-                        .width(170.0)
-                        .selected_text(if mode == "screen" {
-                            "Fixed screen px"
-                        } else {
-                            "Game-scaled"
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut mode,
-                                "game".to_string(),
-                                "Game-scaled (zooms, pixel-aligned)",
-                            );
-                            ui.selectable_value(
-                                &mut mode,
-                                "screen".to_string(),
-                                "Fixed screen px (constant size)",
-                            );
-                        });
-                });
-                if mode != self.config.text_sizing_mode {
-                    self.config.text_sizing_mode = mode;
-                    self.config.save();
-                }
-                hint(
-                    ui,
-                    "Scripts default to the compact 5x7 font; \
+                                    section(ui, "Overlay");
+                                    if row(ui, "Text size", |ui| {
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut self.config.text_size,
+                                                0.3..=4.0,
+                                            )
+                                            .fixed_decimals(2),
+                                        )
+                                        .changed()
+                                    }) {
+                                        self.config.save();
+                                    }
+                                    let mut mode = self.config.text_sizing_mode.clone();
+                                    row(ui, "Sizing", |ui| {
+                                        egui::ComboBox::from_id_salt("text_sizing")
+                                            .width(170.0)
+                                            .selected_text(if mode == "screen" {
+                                                "Fixed screen px"
+                                            } else {
+                                                "Game-scaled"
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut mode,
+                                                    "game".to_string(),
+                                                    "Game-scaled (zooms, pixel-aligned)",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut mode,
+                                                    "screen".to_string(),
+                                                    "Fixed screen px (constant size)",
+                                                );
+                                            });
+                                    });
+                                    if mode != self.config.text_sizing_mode {
+                                        self.config.text_sizing_mode = mode;
+                                        self.config.save();
+                                    }
+                                    hint(
+                                        ui,
+                                        "Scripts default to the compact 5x7 font; \
                      gfx.font(\"normal\") selects the larger 8x8. \
                      A loaded script may seed this setting with gfx.text_sizing.",
-                );
-
-                ui.add_space(6.0);
-                let mut m = self.config.canvas_mode.clone();
-                row(ui, "Canvas", |ui| {
-                    let label = match m.as_str() {
-                        "native" => "Native 256x224",
-                        "2x" => "2x  512x448",
-                        "3x" => "3x  768x672",
-                        "4x" => "4x  1024x896",
-                        _ => "Script-controlled",
-                    };
-                    egui::ComboBox::from_id_salt("canvas_mode")
-                        .width(170.0)
-                        .selected_text(label)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut m,
-                                "script".into(),
-                                "Script-controlled (gfx.scale/canvas)",
-                            );
-                            ui.selectable_value(&mut m, "native".into(), "Native 256x224");
-                            ui.selectable_value(&mut m, "2x".into(), "2x  512x448");
-                            ui.selectable_value(&mut m, "3x".into(), "3x  768x672");
-                            ui.selectable_value(&mut m, "4x".into(), "4x  1024x896");
-                        });
-                });
-                if m != self.config.canvas_mode {
-                    self.config.canvas_mode = m;
-                    self.config.save();
-                }
-                let ac = self.host.requested_canvas();
-                hint(
-                    ui,
-                    &format!(
-                        "active canvas: {}x{}  (gfx.width/height report this)",
-                        ac.w as u32, ac.h as u32
-                    ),
-                );
-
-                } // end Tab::Setup (Script + Overlay)
-
-                if self.tab == Tab::Capture {
-                section(ui, "Capture");
-                ui.horizontal(|ui| {
-                    ui.label("Mode");
-                    let mut m = self.config.capture_mode.clone();
-                    egui::ComboBox::from_id_salt("capture_mode")
-                        .selected_text(match m.as_str() {
-                            "transparent" => "Transparent overlay",
-                            "streaming" => "Streaming output",
-                            _ => "Composited",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut m,
-                                "composited".into(),
-                                "Composited (capture feed in-app)",
-                            );
-                            ui.selectable_value(
-                                &mut m,
-                                "streaming".into(),
-                                "Streaming output (detached keyed window)",
-                            );
-                            ui.selectable_value(
-                                &mut m,
-                                "transparent".into(),
-                                "Transparent overlay (over your own capture)",
-                            );
-                        });
-                    if m != self.config.capture_mode {
-                        self.config.capture_mode = m;
-                        if self.config.capture_mode != "transparent" {
-                            self.config.overlay_click_through = false;
-                        }
-                        self.config.save();
-                        self.restart_capture();
-                        self.window_overlay_applied = None;
-                        self.stream_viewport_initialized = false;
-                    }
-                });
-
-                if self.config.capture_mode == "composited" {
-                    ui.horizontal(|ui| {
-                        ui.label("Device");
-                        let cur = self
-                            .capture_devices
-                            .iter()
-                            .find(|d| d.index == self.config.capture_device)
-                            .map(|d| d.name.clone())
-                            .unwrap_or_else(|| format!("#{}", self.config.capture_device));
-                        let mut chosen = self.config.capture_device;
-                        egui::ComboBox::from_id_salt("capture_dev")
-                            .selected_text(cur)
-                            .show_ui(ui, |ui| {
-                                for d in &self.capture_devices {
-                                    ui.selectable_value(
-                                        &mut chosen,
-                                        d.index,
-                                        format!("{} (#{})", d.name, d.index),
                                     );
-                                }
-                            });
-                        if chosen != self.config.capture_device {
-                            self.config.capture_device = chosen;
-                            self.config.save();
-                            self.restart_capture();
-                        }
-                    });
-                    if ui.small_button("↻ Rescan devices").clicked() {
-                        self.capture_devices = sni_capture::list_devices();
-                    }
-                    if let Some(frame) = self.capture.as_ref().and_then(|c| c.latest()) {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "current input: {}x{}",
-                                frame.width, frame.height
-                            ))
-                            .small()
-                            .weak(),
-                        );
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label("Input");
-                        let mut changed = false;
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut self.config.capture_width)
-                                    .range(0..=7680)
-                                    .speed(16),
-                            )
-                            .changed();
-                        ui.label("x");
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut self.config.capture_height)
-                                    .range(0..=4320)
-                                    .speed(16),
-                            )
-                            .changed();
-                        ui.label("@");
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut self.config.capture_fps)
-                                    .range(0..=240)
-                                    .speed(1),
-                            )
-                            .changed();
-                        ui.label("FPS");
-                        if changed {
-                            self.config.save();
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Apply input").clicked() {
-                            self.config.save();
-                            self.restart_capture();
-                        }
-                        if ui.small_button("Auto input").clicked() {
-                            self.config.capture_width = 0;
-                            self.config.capture_height = 0;
-                            self.config.capture_fps = 0;
-                            self.config.save();
-                            self.restart_capture();
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Crop mode");
-                        let mut mode = self.config.capture_crop_mode.clone();
-                        let label = if mode == "stretch" {
-                            "Stretch crop"
-                        } else {
-                            "Crop to canvas"
-                        };
-                        egui::ComboBox::from_id_salt("capture_crop_mode")
-                            .selected_text(label)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut mode, "aspect".into(), "Crop to canvas");
-                                ui.selectable_value(&mut mode, "stretch".into(), "Stretch crop");
-                            });
-                        if mode != self.config.capture_crop_mode {
-                            self.config.capture_crop_mode = mode;
-                            self.config.save();
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Crop");
-                        let mut changed = false;
-                        ui.label("L");
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut self.config.capture_crop_left)
-                                    .range(0..=8192)
-                                    .speed(1),
-                            )
-                            .changed();
-                        ui.label("T");
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut self.config.capture_crop_top)
-                                    .range(0..=8192)
-                                    .speed(1),
-                            )
-                            .changed();
-                        ui.label("R");
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut self.config.capture_crop_right)
-                                    .range(0..=8192)
-                                    .speed(1),
-                            )
-                            .changed();
-                        ui.label("B");
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut self.config.capture_crop_bottom)
-                                    .range(0..=8192)
-                                    .speed(1),
-                            )
-                            .changed();
-                        if changed {
-                            self.config.save();
-                        }
-                    });
-                    if ui.small_button("Reset crop").clicked() {
-                        self.config.capture_crop_left = 0;
-                        self.config.capture_crop_top = 0;
-                        self.config.capture_crop_right = 0;
-                        self.config.capture_crop_bottom = 0;
-                        self.config.save();
-                    }
-                    if self.capture_devices.is_empty() {
-                        ui.label(
-                            egui::RichText::new(
-                                "No capture devices found. Plug in your \
-                                 HDMI/USB capture card and rescan.",
-                            )
-                            .small()
-                            .weak(),
-                        );
-                    }
-                } else if self.config.capture_mode == "transparent" {
-                    let mut click = self.config.overlay_click_through;
-                    if ui.checkbox(&mut click, "Click-through mouse").changed() {
-                        self.config.overlay_click_through = click;
-                        self.config.save();
-                    }
-                    ui.label(
-                        egui::RichText::new(
-                            "Window is transparent + always-on-top. \
-                             Ctrl+Shift+F10 disables click-through.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.label("Key color");
-                        let mut changed = false;
-                        ui.label("R");
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut self.config.stream_key_color[0])
-                                    .range(0..=255)
-                                    .speed(1),
-                            )
-                            .changed();
-                        ui.label("G");
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut self.config.stream_key_color[1])
-                                    .range(0..=255)
-                                    .speed(1),
-                            )
-                            .changed();
-                        ui.label("B");
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut self.config.stream_key_color[2])
-                                    .range(0..=255)
-                                    .speed(1),
-                            )
-                            .changed();
-                        let (swatch, _) =
-                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
-                        ui.painter().rect_filled(swatch, 2.0, self.stream_key_color());
-                        ui.monospace(self.stream_key_color_hex());
-                        if changed {
-                            self.config.save();
-                        }
-                    });
-                    if ui
-                        .checkbox(
-                            &mut self.config.stream_show_in_app_canvas,
-                            "Show in-app canvas preview",
-                        )
-                        .changed()
-                    {
-                        self.config.save();
-                    }
-                    ui.label(
-                        egui::RichText::new(
-                            "A detached \"sni-lua stream output\" window stays open in this mode. \
-                             Capture that window in OBS, then chroma-key the selected background color.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                }
-                } // end Tab::Capture
 
-                if self.tab == Tab::Setup {
-                section(ui, "Device");
-                if devices.is_empty() {
-                    ui.label(
+                                    ui.add_space(6.0);
+                                    let mut m = self.config.canvas_mode.clone();
+                                    row(ui, "Canvas", |ui| {
+                                        let label = match m.as_str() {
+                                            "native" => "Native 256x224",
+                                            "2x" => "2x  512x448",
+                                            "3x" => "3x  768x672",
+                                            "4x" => "4x  1024x896",
+                                            _ => "Script-controlled",
+                                        };
+                                        egui::ComboBox::from_id_salt("canvas_mode")
+                                            .width(170.0)
+                                            .selected_text(label)
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut m,
+                                                    "script".into(),
+                                                    "Script-controlled (gfx.scale/canvas)",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut m,
+                                                    "native".into(),
+                                                    "Native 256x224",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut m,
+                                                    "2x".into(),
+                                                    "2x  512x448",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut m,
+                                                    "3x".into(),
+                                                    "3x  768x672",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut m,
+                                                    "4x".into(),
+                                                    "4x  1024x896",
+                                                );
+                                            });
+                                    });
+                                    if m != self.config.canvas_mode {
+                                        self.config.canvas_mode = m;
+                                        self.config.save();
+                                    }
+                                    let ac = self.host.requested_canvas();
+                                    hint(
+                                        ui,
+                                        &format!(
+                                            "active canvas: {}x{}  (gfx.width/height report this)",
+                                            ac.w as u32, ac.h as u32
+                                        ),
+                                    );
+
+                                    section(ui, "Output");
+                                    let mut m = self.config.capture_mode.clone();
+                                    row(ui, "Mode", |ui| {
+                                        egui::ComboBox::from_id_salt("output_mode")
+                                            .width(190.0)
+                                            .selected_text(match m.as_str() {
+                                                "streaming" => "Streaming window",
+                                                _ => "Composited",
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut m,
+                                                    "composited".into(),
+                                                    "Composited (capture feed in-app)",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut m,
+                                                    "streaming".into(),
+                                                    "Streaming window (keyed, for OBS)",
+                                                );
+                                            });
+                                    });
+                                    if m != self.config.capture_mode {
+                                        self.config.capture_mode = m;
+                                        self.config.save();
+                                        self.restart_capture();
+                                        self.stream_viewport_initialized = false;
+                                    }
+                                    hint(
+                                        ui,
+                                        if self.config.capture_mode == "streaming" {
+                                            "Overlay renders into a detached, chroma-keyable \
+                         window. Tune it in the Output tab."
+                                        } else {
+                                            "Capture feed drawn in-app with the overlay on top. \
+                         Pick the device in the Output tab."
+                                        },
+                                    );
+                                } // end Tab::Setup (Script + Overlay + Output mode)
+
+                                if self.tab == Tab::Output {
+                                    if self.config.capture_mode == "composited" {
+                                        section(ui, "Capture device");
+                                        ui.horizontal(|ui| {
+                                            ui.label("Device");
+                                            let cur = self
+                                                .capture_devices
+                                                .iter()
+                                                .find(|d| d.index == self.config.capture_device)
+                                                .map(|d| d.name.clone())
+                                                .unwrap_or_else(|| {
+                                                    format!("#{}", self.config.capture_device)
+                                                });
+                                            let mut chosen = self.config.capture_device;
+                                            egui::ComboBox::from_id_salt("capture_dev")
+                                                .selected_text(cur)
+                                                .show_ui(ui, |ui| {
+                                                    for d in &self.capture_devices {
+                                                        ui.selectable_value(
+                                                            &mut chosen,
+                                                            d.index,
+                                                            format!("{} (#{})", d.name, d.index),
+                                                        );
+                                                    }
+                                                });
+                                            if chosen != self.config.capture_device {
+                                                self.config.capture_device = chosen;
+                                                self.config.save();
+                                                self.restart_capture();
+                                            }
+                                        });
+                                        if ui.small_button("↻ Rescan devices").clicked() {
+                                            self.capture_devices = sni_capture::list_devices();
+                                        }
+                                        if let Some(frame) =
+                                            self.capture.as_ref().and_then(|c| c.latest())
+                                        {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "current input: {}x{}",
+                                                    frame.width, frame.height
+                                                ))
+                                                .small()
+                                                .weak(),
+                                            );
+                                        }
+                                        ui.horizontal(|ui| {
+                                            ui.label("Input");
+                                            let mut changed = false;
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut self.config.capture_width,
+                                                    )
+                                                    .range(0..=7680)
+                                                    .speed(16),
+                                                )
+                                                .changed();
+                                            ui.label("x");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut self.config.capture_height,
+                                                    )
+                                                    .range(0..=4320)
+                                                    .speed(16),
+                                                )
+                                                .changed();
+                                            ui.label("@");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut self.config.capture_fps,
+                                                    )
+                                                    .range(0..=240)
+                                                    .speed(1),
+                                                )
+                                                .changed();
+                                            ui.label("FPS");
+                                            if changed {
+                                                self.config.save();
+                                            }
+                                        });
+                                        ui.horizontal(|ui| {
+                                            if ui.small_button("Apply input").clicked() {
+                                                self.config.save();
+                                                self.restart_capture();
+                                            }
+                                            if ui.small_button("Auto input").clicked() {
+                                                self.config.capture_width = 0;
+                                                self.config.capture_height = 0;
+                                                self.config.capture_fps = 0;
+                                                self.config.save();
+                                                self.restart_capture();
+                                            }
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.label("Crop mode");
+                                            let mut mode = self.config.capture_crop_mode.clone();
+                                            let label = if mode == "stretch" {
+                                                "Stretch crop"
+                                            } else {
+                                                "Crop to canvas"
+                                            };
+                                            egui::ComboBox::from_id_salt("capture_crop_mode")
+                                                .selected_text(label)
+                                                .show_ui(ui, |ui| {
+                                                    ui.selectable_value(
+                                                        &mut mode,
+                                                        "aspect".into(),
+                                                        "Crop to canvas",
+                                                    );
+                                                    ui.selectable_value(
+                                                        &mut mode,
+                                                        "stretch".into(),
+                                                        "Stretch crop",
+                                                    );
+                                                });
+                                            if mode != self.config.capture_crop_mode {
+                                                self.config.capture_crop_mode = mode;
+                                                self.config.save();
+                                            }
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.label("Crop");
+                                            let mut changed = false;
+                                            ui.label("L");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut self.config.capture_crop_left,
+                                                    )
+                                                    .range(0..=8192)
+                                                    .speed(1),
+                                                )
+                                                .changed();
+                                            ui.label("T");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut self.config.capture_crop_top,
+                                                    )
+                                                    .range(0..=8192)
+                                                    .speed(1),
+                                                )
+                                                .changed();
+                                            ui.label("R");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut self.config.capture_crop_right,
+                                                    )
+                                                    .range(0..=8192)
+                                                    .speed(1),
+                                                )
+                                                .changed();
+                                            ui.label("B");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut self.config.capture_crop_bottom,
+                                                    )
+                                                    .range(0..=8192)
+                                                    .speed(1),
+                                                )
+                                                .changed();
+                                            if changed {
+                                                self.config.save();
+                                            }
+                                        });
+                                        if ui.small_button("Reset crop").clicked() {
+                                            self.config.capture_crop_left = 0;
+                                            self.config.capture_crop_top = 0;
+                                            self.config.capture_crop_right = 0;
+                                            self.config.capture_crop_bottom = 0;
+                                            self.config.save();
+                                        }
+                                        if self.capture_devices.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "No capture devices found. Plug in your \
+                                 HDMI/USB capture card and rescan.",
+                                                )
+                                                .small()
+                                                .weak(),
+                                            );
+                                        }
+                                    } else {
+                                        section(ui, "Stream window");
+                                        ui.horizontal(|ui| {
+                                            ui.label("Key color");
+                                            let mut changed = false;
+                                            ui.label("R");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut self.config.stream_key_color[0],
+                                                    )
+                                                    .range(0..=255)
+                                                    .speed(1),
+                                                )
+                                                .changed();
+                                            ui.label("G");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut self.config.stream_key_color[1],
+                                                    )
+                                                    .range(0..=255)
+                                                    .speed(1),
+                                                )
+                                                .changed();
+                                            ui.label("B");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut self.config.stream_key_color[2],
+                                                    )
+                                                    .range(0..=255)
+                                                    .speed(1),
+                                                )
+                                                .changed();
+                                            let (swatch, _) = ui.allocate_exact_size(
+                                                egui::vec2(18.0, 18.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().rect_filled(
+                                                swatch,
+                                                2.0,
+                                                self.stream_key_color(),
+                                            );
+                                            ui.monospace(self.stream_key_color_hex());
+                                            if changed {
+                                                self.config.save();
+                                            }
+                                        });
+
+                                        // Where the keyed output goes: a
+                                        // detached OBS-capture window, or just
+                                        // the in-app view.
+                                        if ui
+                                            .checkbox(
+                                                &mut self.config.stream_detached_window,
+                                                "Detached window (for OBS)",
+                                            )
+                                            .changed()
+                                        {
+                                            self.config.save();
+                                            self.stream_viewport_initialized = false;
+                                        }
+
+                                        if self.config.stream_detached_window {
+                                            // Window size: by default an
+                                            // integer multiple of the script's
+                                            // canvas (pixel-perfect for the
+                                            // keyer). The override still snaps
+                                            // to integer scales — a fractional
+                                            // scale would blur the overlay.
+                                            let canvas = self.host.requested_canvas();
+                                            if ui
+                                                .checkbox(
+                                                    &mut self.config.stream_auto_scale,
+                                                    "Auto-size to canvas (integer scale)",
+                                                )
+                                                .changed()
+                                            {
+                                                self.config.save();
+                                                self.stream_viewport_initialized = false;
+                                            }
+                                            if !self.config.stream_auto_scale {
+                                                row(ui, "Scale", |ui| {
+                                                    if ui
+                                                        .add(
+                                                            egui::Slider::new(
+                                                                &mut self.config.stream_scale,
+                                                                1..=8,
+                                                            )
+                                                            .suffix("x"),
+                                                        )
+                                                        .changed()
+                                                    {
+                                                        self.config.save();
+                                                        self.stream_viewport_initialized = false;
+                                                    }
+                                                });
+                                            }
+                                            let eff = self.stream_scale_for(canvas);
+                                            hint(
+                                                ui,
+                                                &format!(
+                                                    "window size: {}x{}  ({}x of {}x{} canvas)",
+                                                    (canvas.w as u32) * eff,
+                                                    (canvas.h as u32) * eff,
+                                                    eff,
+                                                    canvas.w as u32,
+                                                    canvas.h as u32
+                                                ),
+                                            );
+
+                                            if ui
+                                                .checkbox(
+                                                    &mut self.config.stream_show_in_app_canvas,
+                                                    "Show in-app canvas preview",
+                                                )
+                                                .changed()
+                                            {
+                                                self.config.save();
+                                            }
+                                            hint(
+                                                ui,
+                                                "A detached \"sni-lua stream \
+                                                 output\" window stays open. \
+                                                 Capture it in OBS, then \
+                                                 chroma-key the background color.",
+                                            );
+                                        } else {
+                                            hint(
+                                                ui,
+                                                "No extra window — the keyed \
+                                                 overlay is shown here. Capture \
+                                                 this window in OBS and \
+                                                 chroma-key the background color.",
+                                            );
+                                        }
+                                    }
+                                } // end Tab::Output
+
+                                if self.tab == Tab::Setup {
+                                    section(ui, "Device");
+                                    if devices.is_empty() {
+                                        ui.label(
                         egui::RichText::new(
                             "No devices. Connect to SNI, start your emulator / FXPAK.",
                         )
                         .italics()
                         .weak(),
                     );
-                } else {
-                    let mut chosen = selected_uri.clone();
-                    egui::ComboBox::from_id_salt("device")
-                        .selected_text(
-                            chosen
-                                .as_deref()
-                                .and_then(|u| {
-                                    devices
-                                        .iter()
-                                        .find(|d| d.uri == u)
-                                        .map(|d| format!("{} ({})", d.display_name, d.kind))
-                                })
-                                .unwrap_or_else(|| "— select —".into()),
-                        )
-                        .show_ui(ui, |ui| {
-                            for d in &devices {
-                                let label = format!("{} ({})", d.display_name, d.kind);
-                                ui.selectable_value(&mut chosen, Some(d.uri.clone()), label);
-                            }
-                        });
-                    if chosen != selected_uri {
-                        if let Some(uri) = chosen {
-                            self.sni.send(Cmd::SelectDevice { uri });
-                        }
-                    }
-                    ui.label(format!(
-                        "Mapping: {}",
-                        mapping
-                            .map(|m| format!("{m:?}"))
-                            .unwrap_or_else(|| "—".into())
-                    ));
-                }
-                } // end Tab::Setup (Device)
+                                    } else {
+                                        let mut chosen = selected_uri.clone();
+                                        egui::ComboBox::from_id_salt("device")
+                                            .selected_text(
+                                                chosen
+                                                    .as_deref()
+                                                    .and_then(|u| {
+                                                        devices.iter().find(|d| d.uri == u).map(
+                                                            |d| {
+                                                                format!(
+                                                                    "{} ({})",
+                                                                    d.display_name, d.kind
+                                                                )
+                                                            },
+                                                        )
+                                                    })
+                                                    .unwrap_or_else(|| "— select —".into()),
+                                            )
+                                            .show_ui(ui, |ui| {
+                                                for d in &devices {
+                                                    let label =
+                                                        format!("{} ({})", d.display_name, d.kind);
+                                                    ui.selectable_value(
+                                                        &mut chosen,
+                                                        Some(d.uri.clone()),
+                                                        label,
+                                                    );
+                                                }
+                                            });
+                                        if chosen != selected_uri {
+                                            if let Some(uri) = chosen {
+                                                self.sni.send(Cmd::SelectDevice { uri });
+                                            }
+                                        }
+                                        ui.label(format!(
+                                            "Mapping: {}",
+                                            mapping
+                                                .map(|m| format!("{m:?}"))
+                                                .unwrap_or_else(|| "—".into())
+                                        ));
+                                    }
+                                } // end Tab::Setup (Device)
 
-                if self.tab == Tab::Debug {
-                ui.add_space(6.0);
-                hint(
-                    ui,
-                    "Diagnostics — not needed for normal use. The live probe \
+                                if self.tab == Tab::Debug {
+                                    ui.add_space(6.0);
+                                    hint(
+                                        ui,
+                                        "Diagnostics — not needed for normal use. The live probe \
                      and poll-engine stats below help tune bandwidth and \
                      debug scripts.",
-                );
-                section(ui, "Live memory probe");
-                ui.label(
+                                    );
+                                    section(ui, "Live memory probe");
+                                    ui.label(
                     egui::RichText::new("FxPakPro address (hex). SM Samus X = F50AF6, Y = F50AFA.")
                         .small()
                         .weak(),
                 );
-                ui.horizontal(|ui| {
-                    ui.label("0x");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.probe_addr_hex).desired_width(90.0),
-                    );
-                    ui.label("size");
-                    ui.add(egui::DragValue::new(&mut self.probe_size).range(1..=64));
-                });
-                let region = self.parsed_probe_region();
-                if ui
-                    .add_enabled(
-                        region.is_some() && matches!(conn, ConnState::Connected),
-                        egui::Button::new("Read once"),
-                    )
-                    .clicked()
-                {
-                    if let Some(r) = region {
-                        self.sni.send(Cmd::Probe { region: r });
-                    }
-                }
+                                    ui.horizontal(|ui| {
+                                        ui.label("0x");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.probe_addr_hex)
+                                                .desired_width(90.0),
+                                        );
+                                        ui.label("size");
+                                        ui.add(
+                                            egui::DragValue::new(&mut self.probe_size)
+                                                .range(1..=64),
+                                        );
+                                    });
+                                    let region = self.parsed_probe_region();
+                                    if ui
+                                        .add_enabled(
+                                            region.is_some()
+                                                && matches!(conn, ConnState::Connected),
+                                            egui::Button::new("Read once"),
+                                        )
+                                        .clicked()
+                                    {
+                                        if let Some(r) = region {
+                                            self.sni.send(Cmd::Probe { region: r });
+                                        }
+                                    }
 
-                if let Some(r) = last_probe.region {
-                    ui.add_space(6.0);
-                    ui.label(format!("addr 0x{:06X}  size {}", r.address, r.size));
-                    if let Some(err) = &last_probe.error {
-                        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
-                    } else {
-                        let hex: String = last_probe
-                            .bytes
-                            .iter()
-                            .map(|b| format!("{b:02X} "))
-                            .collect();
-                        ui.monospace(hex.trim_end());
-                        // Little-endian interpretations (SNES is LE).
-                        if last_probe.bytes.len() >= 2 {
-                            let v = u16::from_le_bytes([last_probe.bytes[0], last_probe.bytes[1]]);
-                            ui.label(format!("u16 LE = {v}  (0x{v:04X})"));
-                        }
-                        ui.colored_label(
-                            egui::Color32::from_rgb(255, 170, 0),
-                            format!("round-trip: {} ms", last_probe.rtt_ms),
-                        );
-                        ui.label(
+                                    if let Some(r) = last_probe.region {
+                                        ui.add_space(6.0);
+                                        ui.label(format!(
+                                            "addr 0x{:06X}  size {}",
+                                            r.address, r.size
+                                        ));
+                                        if let Some(err) = &last_probe.error {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(220, 60, 60),
+                                                err,
+                                            );
+                                        } else {
+                                            let hex: String = last_probe
+                                                .bytes
+                                                .iter()
+                                                .map(|b| format!("{b:02X} "))
+                                                .collect();
+                                            ui.monospace(hex.trim_end());
+                                            // Little-endian interpretations (SNES is LE).
+                                            if last_probe.bytes.len() >= 2 {
+                                                let v = u16::from_le_bytes([
+                                                    last_probe.bytes[0],
+                                                    last_probe.bytes[1],
+                                                ]);
+                                                ui.label(format!("u16 LE = {v}  (0x{v:04X})"));
+                                            }
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(255, 170, 0),
+                                                format!("round-trip: {} ms", last_probe.rtt_ms),
+                                            );
+                                            ui.label(
                             egui::RichText::new(
                                 "↑ raw one-shot latency. The poll engine below hides it.",
                             )
                             .small()
                             .weak(),
                         );
-                    }
-                }
+                                        }
+                                    }
 
-                // --- Poll engine live telemetry ---
-                section(ui, "Poll engine");
-                let stats = self.engine.stats();
-                egui::Grid::new("poll_stats")
-                    .num_columns(2)
-                    .spacing([8.0, 2.0])
-                    .show(ui, |ui| {
-                        ui.label("cycle");
-                        ui.monospace(stats.cycle.to_string());
-                        ui.end_row();
-                        ui.label("watches");
-                        ui.monospace(format!(
-                            "{} active / {} total",
-                            stats.watches, stats.watches_total
-                        ));
-                        ui.end_row();
-                        ui.label("reads/cycle");
-                        ui.monospace(format!(
-                            "{} ({} B)",
-                            stats.reads_last_cycle, stats.bytes_last_cycle
-                        ));
-                        ui.end_row();
-                        ui.label("RTT (ewma)");
-                        ui.monospace(format!(
-                            "{:.1} ms (last {} ms)",
-                            stats.rtt_ms_ewma, stats.last_rtt_ms
-                        ));
-                        ui.end_row();
-                        ui.label("realtime");
-                        ui.monospace(format!(
-                            "{} w · {} ms sub-poll",
-                            stats.realtime_watches, stats.realtime_rtt_ms
-                        ));
-                        ui.end_row();
-                        ui.label("budget");
-                        ui.monospace(format!(
-                            "{} B (auto) · {:.0} B/ms",
-                            stats.byte_budget, stats.throughput_bpms
-                        ));
-                        ui.end_row();
-                        ui.label("deferred");
-                        ui.monospace(format!(
-                            "{} w · {} B",
-                            stats.deferred_watches, stats.deferred_bytes
-                        ));
-                        ui.end_row();
-                        ui.label("staleness");
-                        ui.monospace(format!(
-                            "oldest {} cyc · avg {:.1} cyc",
-                            stats.deferred_oldest_cycles, stats.deferred_avg_cycles
-                        ));
-                        ui.end_row();
-                        ui.label("drain");
-                        ui.monospace(format!(
-                            "{} B last · {:.1} KB/s",
-                            stats.deferred_bytes_processed_last_cycle,
-                            stats.deferred_drain_bpms_ewma * 1000.0 / 1024.0
-                        ));
-                        ui.end_row();
-                        ui.label("frame time");
-                        ui.monospace(format!(
-                            "{} / {} ms",
-                            stats.cycle_elapsed_ms, stats.frame_budget_ms
-                        ));
-                        ui.end_row();
-                        ui.label("overruns");
-                        ui.monospace(format!(
-                            "{:.1}% recent · {} total · +{} ms last",
-                            stats.frame_budget_overrun_rate * 100.0,
-                            stats.frame_budget_overruns,
-                            stats.frame_budget_overrun_ms
-                        ));
-                        ui.end_row();
-                    });
-                if let Some(e) = stats.last_error {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 60, 60),
-                        format!("last cycle error: {e}"),
-                    );
-                }
+                                    // --- Poll engine live telemetry ---
+                                    section(ui, "Poll engine");
+                                    let stats = self.engine.stats();
+                                    egui::Grid::new("poll_stats")
+                                        .num_columns(2)
+                                        .spacing([8.0, 2.0])
+                                        .show(ui, |ui| {
+                                            ui.label("cycle");
+                                            ui.monospace(stats.cycle.to_string());
+                                            ui.end_row();
+                                            ui.label("watches");
+                                            ui.monospace(format!(
+                                                "{} active / {} total",
+                                                stats.watches, stats.watches_total
+                                            ));
+                                            ui.end_row();
+                                            ui.label("reads/cycle");
+                                            ui.monospace(format!(
+                                                "{} ({} B)",
+                                                stats.reads_last_cycle, stats.bytes_last_cycle
+                                            ));
+                                            ui.end_row();
+                                            ui.label("RTT (ewma)");
+                                            ui.monospace(format!(
+                                                "{:.1} ms (last {} ms)",
+                                                stats.rtt_ms_ewma, stats.last_rtt_ms
+                                            ));
+                                            ui.end_row();
+                                            ui.label("realtime");
+                                            ui.monospace(format!(
+                                                "{} w · {} ms sub-poll",
+                                                stats.realtime_watches, stats.realtime_rtt_ms
+                                            ));
+                                            ui.end_row();
+                                            ui.label("budget");
+                                            ui.monospace(format!(
+                                                "{} B (auto) · {:.0} B/ms",
+                                                stats.byte_budget, stats.throughput_bpms
+                                            ));
+                                            ui.end_row();
+                                            ui.label("deferred");
+                                            ui.monospace(format!(
+                                                "{} w · {} B",
+                                                stats.deferred_watches, stats.deferred_bytes
+                                            ));
+                                            ui.end_row();
+                                            ui.label("staleness");
+                                            ui.monospace(format!(
+                                                "oldest {} cyc · avg {:.1} cyc",
+                                                stats.deferred_oldest_cycles,
+                                                stats.deferred_avg_cycles
+                                            ));
+                                            ui.end_row();
+                                            ui.label("drain");
+                                            ui.monospace(format!(
+                                                "{} B last · {:.1} KB/s",
+                                                stats.deferred_bytes_processed_last_cycle,
+                                                stats.deferred_drain_bpms_ewma * 1000.0 / 1024.0
+                                            ));
+                                            ui.end_row();
+                                            ui.label("frame time");
+                                            ui.monospace(format!(
+                                                "{} / {} ms",
+                                                stats.cycle_elapsed_ms, stats.frame_budget_ms
+                                            ));
+                                            ui.end_row();
+                                            ui.label("overruns");
+                                            ui.monospace(format!(
+                                                "{:.1}% recent · {} total · +{} ms last",
+                                                stats.frame_budget_overrun_rate * 100.0,
+                                                stats.frame_budget_overruns,
+                                                stats.frame_budget_overrun_ms
+                                            ));
+                                            ui.end_row();
+                                        });
+                                    if let Some(e) = stats.last_error {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(220, 60, 60),
+                                            format!("last cycle error: {e}"),
+                                        );
+                                    }
 
-                ui.horizontal(|ui| {
-                    ui.label("Frame budget");
-                    if ui
-                        .add(
-                            egui::Slider::new(
-                                &mut self.config.frame_budget_ms,
-                                4..=66,
-                            )
-                            .suffix(" ms"),
-                        )
-                        .changed()
-                    {
-                        // Push live to the running engine; the adaptive
-                        // budget re-converges to the new target within a
-                        // few cycles.
-                        self.engine.set_config(self.poll_config());
-                        self.config.save();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Demand window");
-                    if ui
-                        .add(
-                            egui::Slider::new(
-                                &mut self.config.demand_window_ms,
-                                100..=5000,
-                            )
-                            .suffix(" ms"),
-                        )
-                        .changed()
-                    {
-                        self.engine.set_config(self.poll_config());
-                        self.config.save();
-                    }
-                });
-                ui.label(
-                    egui::RichText::new(
-                        "watches unread this long stop being polled \
+                                    ui.horizontal(|ui| {
+                                        ui.label("Frame budget");
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut self.config.frame_budget_ms,
+                                                    4..=66,
+                                                )
+                                                .suffix(" ms"),
+                                            )
+                                            .changed()
+                                        {
+                                            // Push live to the running engine; the adaptive
+                                            // budget re-converges to the new target within a
+                                            // few cycles.
+                                            self.engine.set_config(self.poll_config());
+                                            self.config.save();
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Demand window");
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut self.config.demand_window_ms,
+                                                    100..=5000,
+                                                )
+                                                .suffix(" ms"),
+                                            )
+                                            .changed()
+                                        {
+                                            self.engine.set_config(self.poll_config());
+                                            self.config.save();
+                                        }
+                                    });
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "watches unread this long stop being polled \
                          (stay cached); frees bandwidth for live data",
-                    )
-                    .small()
-                    .weak(),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "engine reads as much as it can while keeping bulk \
+                                        )
+                                        .small()
+                                        .weak(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "engine reads as much as it can while keeping bulk \
                          round-trips under this; backs off hard on overshoot",
-                    )
-                    .small()
-                    .weak(),
-                );
-                } // end Tab::Debug
-                }); // inset Frame
-                }); // ScrollArea
+                                        )
+                                        .small()
+                                        .weak(),
+                                    );
+                                } // end Tab::Debug
+                            }); // inset Frame
+                    }); // ScrollArea
             }); // SidePanel
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -1621,7 +1741,6 @@ impl eframe::App for App {
         // Resolve everything that needs &mut self / ctx before the egui
         // closure (which borrows self immutably).
         let capture_mode = self.capture_mode();
-        let transparent = capture_mode == sni_capture::CaptureMode::TransparentOverlay;
         let cap_tex = if capture_mode == sni_capture::CaptureMode::Composited {
             self.capture_texture(ctx).map(|t| (t.id(), t.size()))
         } else {
@@ -1630,41 +1749,48 @@ impl eframe::App for App {
         let sizing = self.text_sizing();
         let loaded = self.host.is_loaded();
 
-        let mut central = egui::CentralPanel::default();
-        if transparent {
-            // No backdrop in transparent mode — the desktop/your capture
-            // software shows through the window instead.
-            central = central.frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT));
-        }
-        central.show(ctx, |ui| {
-            if capture_mode == sni_capture::CaptureMode::StreamingOverlay
-                && !self.config.stream_show_in_app_canvas
-            {
-                ui.with_layout(
-                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                    |ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "In-app preview hidden. The detached stream output window is still live.",
-                            )
-                            .weak(),
-                        );
-                    },
-                );
-            } else {
-                self.paint_overlay_canvas(
-                    ui,
-                    ctx,
-                    active_canvas,
-                    capture_mode,
-                    cap_tex,
-                    sizing,
-                    loaded,
-                );
-            }
-        });
+        // The detached "stream output" window only exists in streaming mode
+        // and only when the user wants it (otherwise the in-app view is the
+        // keyed output).
+        let detached_stream = capture_mode == sni_capture::CaptureMode::StreamingOverlay
+            && self.config.stream_detached_window;
+        // The in-app canvas is hidden only when a detached window owns the
+        // output and the user opted out of the in-app preview.
+        let preview_hidden = detached_stream && !self.config.stream_show_in_app_canvas;
 
-        if capture_mode == sni_capture::CaptureMode::StreamingOverlay {
+        let painted_vp = egui::CentralPanel::default()
+            .show(ctx, |ui| {
+                if preview_hidden {
+                    ui.with_layout(
+                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                        |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "In-app preview hidden. The detached stream output window is still live.",
+                                )
+                                .weak(),
+                            );
+                        },
+                    );
+                    None
+                } else {
+                    Some(self.paint_overlay_canvas(
+                        ui,
+                        active_canvas,
+                        capture_mode,
+                        cap_tex,
+                        sizing,
+                        loaded,
+                    ))
+                }
+            })
+            .inner;
+        // Remember the canvas viewport so next frame's mouse input maps into
+        // canvas coordinates. Kept only when the in-app canvas is the user's
+        // interaction surface (not when the preview is hidden).
+        self.last_viewport = painted_vp;
+
+        if detached_stream {
             self.show_stream_viewport(ctx, active_canvas, sizing, loaded);
         } else {
             self.stream_viewport_initialized = false;
@@ -1677,5 +1803,16 @@ impl eframe::App for App {
         // store.save) BEFORE the last flush so that write actually lands.
         self.host.unload();
         self.host.store().flush_if_dirty();
+
+        // Everything important is now persisted. Exit immediately rather
+        // than unwind through the blocking Drops that follow: dropping the
+        // multi-thread Tokio runtime drains its tasks, and dropping the
+        // CaptureSource joins the device thread — which can be parked inside
+        // a blocking `camera.frame()` call (a hiccupping / unplugged capture
+        // card). That join hung shutdown long enough that winit force-killed
+        // the process with STATUS_STACK_BUFFER_OVERRUN (0xC0000409). The OS
+        // reclaims threads, sockets and memory instantly and reliably; there
+        // is nothing left worth a graceful teardown.
+        std::process::exit(0);
     }
 }

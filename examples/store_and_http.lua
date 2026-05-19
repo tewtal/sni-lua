@@ -1,6 +1,6 @@
--- store + http demo
+-- Persistence (store.*) and async HTTP (http.*).
 --
--- Shows the two side-effecting APIs that never block the frame:
+-- The two side-effecting APIs that never block the frame:
 --
 --   store.*  persistent per-script state. store.get/set is a key-value
 --            cache; store.load/save read/replace the whole document. The

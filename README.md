@@ -44,13 +44,19 @@ sni-lua is built around that constraint:
   panel (`ui.*`). See [`docs/SCRIPTING.md`](docs/SCRIPTING.md).
 - **Overlay renderer** — crisp pixel-art text (5×7 + 8×8 fonts),
   script-controlled or app-forced canvas resolution.
-- **Capture modes** — composited (in-app capture device), transparent
-  always-on-top overlay (Windows click-through), and detached chroma-key
-  output for OBS.
+- **Output modes** — composited (capture device drawn in-app with the
+  overlay on top) or an integer-scaled chroma-key view for OBS, in a
+  detached window or the main window.
 - **Tabbed desktop UI** — native file dialog, live memory probe, poll-engine
   telemetry, and the per-script settings panel.
 
-## Build & run
+## Install
+
+Pre-built, ready-to-run archives for Windows, macOS, and Linux are attached
+to each [GitHub Release](../../releases): unzip/untar and run the `sni-lua`
+binary — the `examples/` and `docs/` it ships with sit next to it.
+
+## Build from source
 
 Use the wrapper scripts — they set the one environment bit the vendored
 LuaJIT build needs on Windows (see `build.cmd` header for why):
@@ -60,20 +66,29 @@ LuaJIT build needs on Windows (see `build.cmd` header for why):
 .\build.cmd run --release      # cmd
 ```
 
-Requires the MSVC toolchain (the `cc` crate finds it via the registry; no
-vcvars shell needed). First build is slow (gRPC + eframe + LuaJIT);
-subsequent builds are incremental.
+On macOS/Linux just use `cargo` directly (see build-time system deps in
+[`docs/PACKAGING.md`](docs/PACKAGING.md)). Requires the MSVC toolchain on
+Windows (the `cc` crate finds it via the registry; no vcvars shell needed).
+First build is slow (gRPC + eframe + LuaJIT); subsequent builds are
+incremental.
+
+To produce a distributable archive yourself, run `scripts/package.ps1`
+(Windows) or `scripts/package.sh` (macOS/Linux); see
+[`docs/PACKAGING.md`](docs/PACKAGING.md) for the release process and
+platform caveats.
 
 ### Using the app
 
 The left panel is tabbed so the everyday view stays uncluttered:
 
 * **Setup** — pick a script (**Browse…** opens a native file dialog), Load /
-  Reload, choose the SNI device, and the common Overlay knobs (text size,
-  canvas). This is all most users ever need.
+  Reload, choose the SNI device, the common Overlay knobs (text size,
+  canvas), and the **Output** mode (composited vs. streaming window). This
+  is all most users ever need.
 * **Script** — appears only when the loaded script declared a settings panel
   via `ui.*` (see below); auto-selected on load.
-* **Capture** — the capture mode/device/crop/streaming controls.
+* **Output** — tuning for the chosen output mode: capture device / input /
+  crop (composited), or key colour and window scale (streaming).
 * **Debug** — the live memory probe and the full poll-engine telemetry. Hidden
   by default; nothing here is required for normal use.
 
@@ -140,34 +155,33 @@ end
 The runnable demos in `examples/` each focus on one area — see the table at
 the bottom of [`docs/SCRIPTING.md`](docs/SCRIPTING.md#example-scripts).
 
-### Capture background
+### Output modes
 
-**Capture → Mode** selects how the game video gets behind the overlay:
+**Setup → Output → Mode** selects how the overlay reaches the screen; the
+**Output** tab tunes the active mode.
 
 * **Composited** — the app opens a capture device (HDMI/USB capture card;
   these enumerate as webcam-class devices) and draws the overlay on top
-  in-window. Pick the device under **Capture → Device**; *Rescan* re-enumerates.
+  in-window. Pick the device under **Output → Device**; *Rescan* re-enumerates.
   The **Input** controls request a width, height, and FPS from the capture
   card (`0` means auto), and **Crop** trims source pixels before the video is
   scaled into the active canvas.
   Capture runs on a background thread holding only the newest frame
   (latest-wins, stale dropped) so a slow device read never stalls the
   overlay — the same non-blocking philosophy as the SNI pipeline.
-* **Transparent overlay** — the app becomes a borderless, transparent,
-  always-on-top window. Place it over your own capture software (OBS, etc.);
-  no device is opened. Click-through mouse input is optional and can be turned
-  off with `Ctrl+Shift+F10` if the window needs to become interactive again.
-* **Streaming output** — the app keeps its normal controls window, and also
-  opens a detached `sni-lua stream output` window containing only the overlay
-  over a solid user-selectable key color (default `#FF00FF`). Capture that
-  window directly in OBS (or similar) and chroma-key the background out. You
-  can also hide the in-app preview while leaving the detached output live. No
-  capture device is opened in this mode.
+* **Streaming window** — the overlay is rendered over a solid
+  user-selectable key colour (default `#FF00FF`) for chroma-keying in OBS.
+  By default this goes to a detached `sni-lua stream output` window sized to
+  an **integer multiple of the script's canvas** (pixel-perfect for the
+  keyer); under **Output → Stream window** you can fix the scale manually
+  (still integer — a fractional scale would blur the pixel-art overlay) and
+  optionally hide the in-app preview. Or untick **Detached window** to skip
+  the extra window entirely and capture the keyed output straight from the
+  main app window.
 
-Caveats: the explicit click-through fallback uses Win32
-`WS_EX_TRANSPARENT|WS_EX_LAYERED` and is **Windows-only**. Some capture cards
-expose only certain resolutions/FPS; when a requested input format is not
-available, the closest compatible decoded format is selected.
+Some capture cards expose only certain resolutions/FPS; when a requested
+input format is not available, the closest compatible decoded format is
+selected.
 
 ### The ported Super Hitbox script
 

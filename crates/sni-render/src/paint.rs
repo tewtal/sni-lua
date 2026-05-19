@@ -83,6 +83,21 @@ impl Viewport {
         self.canvas
     }
 
+    /// Inverse of [`Self::pt`]: map a screen point back into canvas
+    /// coordinates. Returns `None` when the point is outside the canvas
+    /// rect (so a script can tell "mouse is over the game" from "not").
+    pub fn screen_to_canvas(&self, p: Pos2) -> Option<(f32, f32)> {
+        if self.scale <= 0.0 {
+            return None;
+        }
+        let x = (p.x - self.origin.x) / self.scale;
+        let y = (p.y - self.origin.y) / self.scale;
+        if x < 0.0 || y < 0.0 || x > self.canvas.w || y > self.canvas.h {
+            return None;
+        }
+        Some((x, y))
+    }
+
     #[inline]
     fn pt(&self, x: f32, y: f32) -> Pos2 {
         Pos2::new(

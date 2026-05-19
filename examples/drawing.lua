@@ -1,12 +1,12 @@
--- Drawing + animation tour: text bg/outline, gfx.poly, gfx.arc,
--- gfx.color_lerp, and the anim.* helpers. Self-contained (no SNES).
+-- Drawing & animation reference. Self-contained (no SNES needed).
 --
--- These remove the patterns every older example hand-rolled:
---   * shadowed/boxed text  -> gfx.text(..., { bg=, outline= })
---   * many gfx.line calls   -> gfx.poly
---   * partial rings/timers  -> gfx.arc
---   * stepped color tiers    -> gfx.color_lerp
---   * math.sin(time.now()*k) -> anim.pulse / anim.ease / anim.saw
+-- Demonstrates:
+--   * text with a background box / outline:  gfx.text(.., { bg=, outline= })
+--   * polylines and polygons:                gfx.poly
+--   * arcs and pie wedges (radial timers):   gfx.arc
+--   * smooth colour interpolation:           gfx.color_lerp
+--   * easing & oscillators:                  anim.pulse / anim.ease / anim.saw
+--   * a local coordinate origin:             gfx.push_origin / pop_origin
 
 local WHITE  = 0xFFFFFFFF
 local BLACK  = 0xFF000000
@@ -14,7 +14,7 @@ local PANEL  = 0xB0101018
 
 function on_init()
   ui.slider("hp", "Demo HP", 0, 100, 100)   -- drag to see the bar fade
-  log.info("draw_anim_demo loaded")
+  log.info("drawing example loaded")
 end
 
 function on_frame()

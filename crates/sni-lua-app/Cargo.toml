@@ -26,16 +26,7 @@ serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true
 arc-swap.workspace = true
-raw-window-handle = "0.6"
-# Native file-open dialog for picking a script. xdg-portal off: this is a
-# Windows-first desktop app and the Win32 backend has no extra system deps.
+# Native file-open dialog for picking a script. xdg-portal off keeps the
+# Windows build dependency-free; the dialog is only used on an explicit
+# click, off the render loop.
 rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }
-
-[target.'cfg(windows)'.dependencies]
-# Applying WS_EX_TRANSPARENT|WS_EX_LAYERED to the HWND for true click-through
-# in transparent-overlay mode (eframe handles transparent/topmost/no-decor,
-# but not click-through).
-windows = { version = "0.58", features = [
-    "Win32_Foundation",
-    "Win32_UI_WindowsAndMessaging",
-] }

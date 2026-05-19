@@ -385,6 +385,41 @@ if time.frame() % 30 == 0 then blink() end
 
 ---
 
+## `mouse` — pointer over the canvas
+
+The pointer, in the script's **canvas coordinate space** (so it lines up
+with what `gfx.*` draws regardless of window size or scale). Position is
+`nil` when the pointer is outside the canvas or there is no pointer — so a
+script can tell "hovering the overlay" from "elsewhere". Mapped through the
+previous frame's viewport: one frame of latency, imperceptible in use.
+
+| Call | Returns |
+|---|---|
+| `mouse.pos()` | `x, y` (canvas coords), or `nil, nil` when off-canvas. |
+| `mouse.x()` / `mouse.y()` | the coordinate, or `nil` when off-canvas. |
+| `mouse.over()` | `true` while the pointer is on the canvas. |
+| `mouse.down(btn?)` | `true` while the button is held. |
+| `mouse.pressed(btn?)` | `true` for exactly one frame on press. |
+| `mouse.released(btn?)` | `true` for exactly one frame on release. |
+| `mouse.wheel()` | scroll delta this frame (0 if none; +up). |
+
+`btn` is `"left"` (default), `"right"`, or `"middle"`.
+
+```lua
+function on_frame()
+  local mx, my = mouse.pos()
+  if mx and mouse.pressed("left") then
+    log.info(("clicked %d, %d"):format(mx, my))
+  end
+end
+```
+
+The pointer is only reported when the in-app canvas is the interaction
+surface (composited mode, or streaming with the in-app preview shown); it
+is not read from the detached stream window.
+
+---
+
 ## `log` / `print` — console
 
 Output to the in-app console (collapsible bottom panel). Multiple args are
@@ -441,12 +476,11 @@ if anim.blink(0.5) then gfx.text(8, 8, "!", 0xFFFF4040) end
 
 | File | Shows |
 |---|---|
-| `examples/sm_hud.lua` | watches, cached reads, basic HUD + hitbox |
-| `examples/hires_grid.lua` | `gfx.scale` higher-res canvas |
-| `examples/controls_demo.lua` | full `ui.*` settings panel |
-| `examples/store_http_demo.lua` | `store` + async `http` |
-| `examples/new_api_demo.lua` | `time`, `log`, `snes.buttons`, signed reads, origin, `on_unload` |
-| `examples/draw_anim_demo.lua` | text bg/outline, `poly`, `arc`, `color_lerp`, `anim.*` |
-| `examples/animated_input_viewer.lua` | animated SNES controller/input viewer with glow, ripples, history, and settings |
-| `examples/sm_stream_overlay.lua` | viewer-facing stream telemetry: room splits, boss timers, RNG proxy |
+| `examples/sm_hud.lua` | watches, cached reads, a basic Super Metroid HUD + Samus hitbox |
+| `examples/hires_canvas.lua` | `gfx.scale` for a higher-resolution canvas |
+| `examples/settings_panel.lua` | a full `ui.*` settings panel (Script tab) |
+| `examples/store_and_http.lua` | persistence (`store.*`) + async `http.*` |
+| `examples/drawing.lua` | text bg/outline, `poly`, `arc`, `color_lerp`, `push_origin`, `anim.*` |
+| `examples/toast.lua` | a reusable toast-notification system (`anim.*` + `mouse.*`) |
+| `examples/animated_input_viewer.lua` | a polished controller/input viewer (glow, ripples, history, settings) |
 | `examples/super_hitbox_sni.lua` | a real 4500-line ported Super Metroid script |

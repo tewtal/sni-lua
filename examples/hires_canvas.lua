@@ -1,4 +1,4 @@
--- Higher-resolution overlay demo.
+-- Higher-resolution canvas.
 --
 -- Requests a 2x canvas (512x448) so the overlay can draw sub-SNES-pixel
 -- detail: a fine grid and crisp text that would be impossible at native
@@ -13,8 +13,7 @@
 
 function on_init()
   gfx.scale(2)                       -- request 512x448 (app may override)
-  print("hires_grid.lua: canvas " ..
-        gfx.width() .. "x" .. gfx.height())
+  print("hires_canvas: " .. gfx.width() .. "x" .. gfx.height())
 end
 
 local WHITE = 0xFFFFFFFF
