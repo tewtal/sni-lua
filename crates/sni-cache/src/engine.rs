@@ -310,12 +310,17 @@ pub fn spawn(
                 if elapsed_ms >= frame_ms && !force_progress {
                     break;
                 }
-                let iter_budget =
-                    match budget_for_remaining_time(budget, throughput, elapsed_ms, frame_ms) {
-                        Some(iter_budget) => iter_budget,
-                        None if force_progress => budget,
-                        None => break,
-                    };
+                let iter_budget = match budget_for_remaining_time(
+                    budget,
+                    throughput,
+                    latency_floor_ms,
+                    elapsed_ms,
+                    frame_ms,
+                ) {
+                    Some(iter_budget) => iter_budget,
+                    None if force_progress => budget,
+                    None => break,
+                };
 
                 // Eligible = budget-sized coalesced reads with at least one
                 // member whose latest request marker is still unfulfilled
@@ -339,7 +344,13 @@ pub fn spawn(
                 let regions: Vec<_> = sel.reads.iter().map(|r| r.region).collect();
                 let bytes: u32 = regions.iter().map(|r| r.size).sum();
                 if !force_progress
-                    && !batch_fits_remaining_time(bytes, throughput, elapsed_ms, frame_ms)
+                    && !batch_fits_remaining_time(
+                        bytes,
+                        throughput,
+                        latency_floor_ms,
+                        elapsed_ms,
+                        frame_ms,
+                    )
                 {
                     break;
                 }
@@ -365,7 +376,7 @@ pub fn spawn(
                             Some(tp) => cfg.rtt_alpha * inst_bpms + (1.0 - cfg.rtt_alpha) * tp,
                             None => inst_bpms,
                         });
-                        budget = next_budget(budget, budget_ms, throughput, &cfg);
+                        budget = next_budget(budget, budget_ms, throughput, latency_floor_ms, &cfg);
 
                         // Don't start another batch that would clearly spend
                         // past the shared frame window, estimating the next
@@ -578,15 +589,24 @@ fn budgeted_transfer_ms(rtt_ms: u32, latency_floor_ms: Option<f32>) -> u32 {
 ///   jumping straight back to a spike.
 ///
 /// Pure so it can be unit-tested for convergence and backoff.
-fn next_budget(budget: u32, transfer_ms: u32, throughput: Option<f32>, cfg: &PollConfig) -> u32 {
-    let frame_ms = cfg.frame_budget_ms.max(1) as f32;
+fn next_budget(
+    budget: u32,
+    transfer_ms: u32,
+    throughput: Option<f32>,
+    latency_floor_ms: Option<f32>,
+    cfg: &PollConfig,
+) -> u32 {
+    let fixed_ms = latency_floor_ms.unwrap_or(0.0).floor() as u32;
+    let target_transfer_ms = cfg.frame_budget_ms.saturating_sub(fixed_ms).max(1);
+    let target_transfer_ms_f32 = target_transfer_ms as f32;
+    let ceil_frame_ms = cfg.frame_budget_ms.max(1) as f32;
     let b = budget as f32;
-    let next = if transfer_ms > cfg.frame_budget_ms {
-        let overshoot = (transfer_ms.max(1) as f32 / frame_ms).min(4.0);
+    let next = if transfer_ms > target_transfer_ms {
+        let overshoot = (transfer_ms.max(1) as f32 / target_transfer_ms_f32).min(4.0);
         (b * (0.5 / overshoot).max(0.2)).max(0.0)
     } else {
         let ceil = throughput
-            .map(|t| t * frame_ms * THROUGHPUT_HEADROOM)
+            .map(|t| t * ceil_frame_ms * THROUGHPUT_HEADROOM)
             .unwrap_or(b);
         let step = (cfg.max_byte_budget as f32 * 0.05).max(256.0);
         // Grow additively toward the throughput ceiling; never shrink here.
@@ -600,18 +620,25 @@ fn next_budget(budget: u32, transfer_ms: u32, throughput: Option<f32>, cfg: &Pol
 fn budget_for_remaining_time(
     budget: u32,
     throughput: Option<f32>,
+    latency_floor_ms: Option<f32>,
     elapsed_ms: u128,
     frame_ms: u128,
 ) -> Option<u32> {
     if elapsed_ms >= frame_ms {
         return None;
     }
+    let fixed_ms = latency_floor_ms.unwrap_or(0.0).floor() as u128;
+    let remaining_ms = frame_ms - elapsed_ms;
+    if remaining_ms <= fixed_ms {
+        return None;
+    }
+    let transfer_remaining_ms = (remaining_ms - fixed_ms) as f32;
+
     let Some(tp) = throughput.filter(|tp| tp.is_finite() && *tp > 0.0) else {
         return Some(budget);
     };
 
-    let remaining_ms = (frame_ms - elapsed_ms) as f32;
-    let capped = (tp * remaining_ms * THROUGHPUT_HEADROOM).floor() as u32;
+    let capped = (tp * transfer_remaining_ms * THROUGHPUT_HEADROOM).floor() as u32;
     if capped == 0 {
         None
     } else {
@@ -627,11 +654,13 @@ fn predicted_transfer_ms(bytes: u32, throughput: Option<f32>) -> Option<u128> {
 fn batch_fits_remaining_time(
     bytes: u32,
     throughput: Option<f32>,
+    latency_floor_ms: Option<f32>,
     elapsed_ms: u128,
     frame_ms: u128,
 ) -> bool {
+    let fixed_ms = latency_floor_ms.unwrap_or(0.0).floor() as u128;
     predicted_transfer_ms(bytes, throughput)
-        .map(|predicted| elapsed_ms.saturating_add(predicted) <= frame_ms)
+        .map(|predicted| elapsed_ms.saturating_add(fixed_ms).saturating_add(predicted) <= frame_ms)
         .unwrap_or(true)
 }
 
@@ -1105,7 +1134,7 @@ mod tests {
         let c = cfg();
         // 40ms of byte-transfer time on a 16ms frame: ~2.5x overshoot
         // -> sharp cut.
-        let next = next_budget(16_000, 40, Some(400.0), &c);
+        let next = next_budget(16_000, 40, Some(400.0), None, &c);
         assert!(next < 16_000 / 2, "spike must drop budget hard: {next}");
         assert!(next >= c.min_byte_budget);
     }
@@ -1113,8 +1142,8 @@ mod tests {
     #[test]
     fn bigger_overshoot_cuts_harder() {
         let c = cfg();
-        let mild = next_budget(16_000, 20, Some(800.0), &c);
-        let severe = next_budget(16_000, 64, Some(250.0), &c);
+        let mild = next_budget(16_000, 20, Some(800.0), None, &c);
+        let severe = next_budget(16_000, 64, Some(250.0), None, &c);
         assert!(
             severe < mild,
             "worse overshoot should cut more: {severe} vs {mild}"
@@ -1126,7 +1155,7 @@ mod tests {
         let c = cfg();
         // Comfortably under frame; throughput ~500 B/ms -> ceil =
         // 500 * 16 * 0.8 = 6400 bytes. From 4000 it grows toward that.
-        let next = next_budget(4000, 8, Some(500.0), &c);
+        let next = next_budget(4000, 8, Some(500.0), None, &c);
         assert!(next > 4000, "should grow when we have headroom");
         assert!(next <= 6400, "must not exceed throughput ceiling: {next}");
     }
@@ -1144,7 +1173,7 @@ mod tests {
         let transfer_ms = budgeted_transfer_ms(16, floor);
         assert_eq!(transfer_ms, 1);
 
-        let budget = next_budget(2048, transfer_ms, Some(2048.0), &c);
+        let budget = next_budget(2048, transfer_ms, Some(2048.0), floor, &c);
         assert!(
             budget > 2048,
             "fixed frame latency should still let the byte budget grow: {budget}"
@@ -1154,21 +1183,21 @@ mod tests {
     #[test]
     fn remaining_time_caps_iteration_budget_by_throughput() {
         // 8ms left at ~500 B/ms with 20% headroom -> 3200 bytes.
-        let capped = budget_for_remaining_time(6400, Some(500.0), 8, 16);
+        let capped = budget_for_remaining_time(6400, Some(500.0), None, 8, 16);
         assert_eq!(capped, Some(3200));
     }
 
     #[test]
     fn unknown_throughput_keeps_full_iteration_budget() {
-        assert_eq!(budget_for_remaining_time(4096, None, 12, 16), Some(4096));
+        assert_eq!(budget_for_remaining_time(4096, None, None, 12, 16), Some(4096));
     }
 
     #[test]
     fn predicted_overrun_defers_late_batch() {
         // 4000 bytes at ~500 B/ms predicts ~8ms of variable transfer, which
         // does not fit in the last 4ms of a 16ms frame.
-        assert!(!batch_fits_remaining_time(4000, Some(500.0), 12, 16));
-        assert!(batch_fits_remaining_time(1600, Some(500.0), 12, 16));
+        assert!(!batch_fits_remaining_time(4000, Some(500.0), None, 12, 16));
+        assert!(batch_fits_remaining_time(1600, Some(500.0), None, 12, 16));
     }
 
     #[test]
@@ -1181,7 +1210,7 @@ mod tests {
         let mut budget = 2048u32;
         for _ in 0..200 {
             let transfer_ms = (budget as f32 / tput).ceil() as u32;
-            budget = next_budget(budget, transfer_ms, Some(tput), &c);
+            budget = next_budget(budget, transfer_ms, Some(tput), None, &c);
         }
         // At ~6400 bytes, transfer time is ~13ms (< 16) so it stays; allow
         // some band.
@@ -1195,10 +1224,22 @@ mod tests {
     fn budget_respects_floor_and_ceiling() {
         let c = cfg();
         // Catastrophic RTT from min: clamps at floor, never 0.
-        let lo = next_budget(c.min_byte_budget, 500, Some(1.0), &c);
+        let lo = next_budget(c.min_byte_budget, 500, Some(1.0), None, &c);
         assert_eq!(lo, c.min_byte_budget);
         // Huge throughput can't push past the ceiling.
-        let hi = next_budget(c.max_byte_budget, 1, Some(1_000_000.0), &c);
+        let hi = next_budget(c.max_byte_budget, 1, Some(1_000_000.0), None, &c);
         assert_eq!(hi, c.max_byte_budget);
+    }
+
+    #[test]
+    fn low_latency_real_hardware_overruns_target_transfer() {
+        let mut c = cfg();
+        c.frame_budget_ms = 4;
+        let floor = Some(2.0); // 2ms physical latency floor
+        // target_transfer_ms = 4 - 2 = 2ms.
+        // A transfer taking 3ms (total RTT = 5ms > 4ms target) is an overrun!
+        // So the budget must be cut!
+        let next = next_budget(4096, 3, Some(1000.0), floor, &c);
+        assert!(next < 4096, "low budget with real hardware latency floor must detect overrun and cut: {next}");
     }
 }

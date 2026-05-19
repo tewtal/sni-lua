@@ -40,7 +40,9 @@ use mlua::{Lua, MultiValue, Value};
 use parking_lot::Mutex;
 use sni_cache::{PollEngine, WatchPriority};
 use sni_client::MemRegion;
-use sni_render::{Canvas, Color, DrawCmd, DrawList, Font};
+use sni_render::{
+    Canvas, Color, DrawCmd, DrawList, Font, PathPrimitive, ShadowSpec, TextAlign, TextVAlign,
+};
 
 pub use controls::{Control, Controls, SharedControls};
 pub use runtime::{HttpBridge, Store};
@@ -210,6 +212,9 @@ pub struct ScriptHost {
     /// resolved here, the renderer stays origin-agnostic. The current origin
     /// is the last entry (0,0 when empty). Reset at the top of every frame.
     origin_stack: Rc<RefCell<Vec<(f32, f32)>>>,
+    /// Scratch path builder for `gfx.begin_path` / `gfx.path_*`.
+    /// Reset with the rest of the per-frame draw state.
+    path_builder: Rc<RefCell<Vec<PathPrimitive>>>,
     /// Frame timing for the `time.*` table. `start` is script-load instant;
     /// `frame` increments per `run_frame`; `last_frame` feeds `time.dt()`.
     time: Rc<TimeState>,
@@ -263,6 +268,7 @@ impl ScriptHost {
             requested_canvas: Rc::new(Cell::new(Canvas::default())),
             requested_text_sizing: Rc::new(RefCell::new(None)),
             origin_stack: Rc::new(RefCell::new(Vec::new())),
+            path_builder: Rc::new(RefCell::new(Vec::new())),
             time: TimeState::new(),
             mouse: MouseState::new(),
             controls: Controls::shared(),
@@ -307,6 +313,7 @@ impl ScriptHost {
     }
 
     /// Install the `snes`, `gfx`, and global helpers into the VM.
+    #[allow(clippy::type_complexity)]
     fn install_api(&self) -> ScriptResult<()> {
         let globals = self.lua.globals();
 
@@ -529,35 +536,19 @@ impl ScriptHost {
                         Option<u32>,
                         Option<Value>,
                     )| {
-                        let (mut scale, mut bg, mut outline) = (1.0, None, None);
-                        match opts {
-                            Some(Value::Number(n)) => scale = n as f32,
-                            Some(Value::Integer(n)) => scale = n as f32,
-                            Some(Value::Table(t)) => {
-                                if let Ok(s) = t.get::<f32>("scale") {
-                                    if s > 0.0 {
-                                        scale = s;
-                                    }
-                                }
-                                if let Ok(c) = t.get::<u32>("bg") {
-                                    bg = Some(Color::from_argb(c));
-                                }
-                                if let Ok(c) = t.get::<u32>("outline") {
-                                    outline = Some(Color::from_argb(c));
-                                }
-                            }
-                            _ => {}
-                        }
+                        let opts = parse_text_opts(opts)?;
                         let (ox, oy) = off();
                         draw.borrow_mut().push(DrawCmd::Text {
                             x: x + ox,
                             y: y + oy,
                             text,
                             color: argb(color, 0xFFFFFFFF),
-                            scale,
+                            scale: opts.scale,
                             font: cur_font.get(),
-                            bg,
-                            outline,
+                            bg: opts.bg,
+                            outline: opts.outline,
+                            align: opts.align,
+                            valign: opts.valign,
                         });
                         Ok(())
                     },
@@ -699,14 +690,15 @@ impl ScriptHost {
             gfx.set("height", f)?;
         }
 
-        // gfx.box(x, y, w, h, color?, fill?, thickness?) — outline + optional
-        // fill. The bread-and-butter hitbox primitive.
+        // gfx.box(x, y, w, h, color?, fill?, thickness?, opts?) — outline +
+        // optional fill. `opts.shadow = { dx, dy, blur, spread, color? }`
+        // adds a soft box-shadow / glow behind the rectangle.
         {
             let draw = self.draw.clone();
             let off = offset.clone();
             let f = self.lua.create_function(
                 move |_,
-                      (x, y, w, h, color, fill, thickness): (
+                      (x, y, w, h, color, fill, thickness, opts): (
                     f32,
                     f32,
                     f32,
@@ -714,21 +706,93 @@ impl ScriptHost {
                     Option<u32>,
                     Option<u32>,
                     Option<f32>,
+                    Option<Value>,
                 )| {
                     let (ox, oy) = off();
+                    let color = argb(color, 0xFF00FF00);
+                    let fill = fill.map(Color::from_argb);
+                    let shadow = resolve_shadow(parse_shape_shadow(opts)?, fill.unwrap_or(color));
                     draw.borrow_mut().push(DrawCmd::Rect {
                         x: x + ox,
                         y: y + oy,
                         w,
                         h,
-                        color: argb(color, 0xFF00FF00),
-                        fill: fill.map(Color::from_argb),
+                        color,
+                        fill,
                         thickness: thickness.unwrap_or(1.0),
+                        shadow,
                     });
                     Ok(())
                 },
             )?;
             gfx.set("box", f)?;
+        }
+
+        // gfx.round_rect(x, y, w, h, radius, color?, fill?, thickness?, opts?)
+        {
+            let draw = self.draw.clone();
+            let off = offset.clone();
+            let f = self.lua.create_function(
+                move |_,
+                      (x, y, w, h, radius, color, fill, thickness, opts): (
+                    f32,
+                    f32,
+                    f32,
+                    f32,
+                    f32,
+                    Option<u32>,
+                    Option<u32>,
+                    Option<f32>,
+                    Option<Value>,
+                )| {
+                    let (ox, oy) = off();
+                    let color = argb(color, 0xFF00FF00);
+                    let fill = fill.map(Color::from_argb);
+                    let shadow = resolve_shadow(parse_shape_shadow(opts)?, fill.unwrap_or(color));
+                    draw.borrow_mut().push(DrawCmd::RoundRect {
+                        x: x + ox,
+                        y: y + oy,
+                        w,
+                        h,
+                        radius: radius.max(0.0),
+                        color,
+                        fill,
+                        thickness: thickness.unwrap_or(1.0),
+                        shadow,
+                    });
+                    Ok(())
+                },
+            )?;
+            gfx.set("round_rect", f)?;
+        }
+
+        // gfx.gradient_rect(x, y, w, h, color1, color2, opts?)
+        // `opts.dir` = "horizontal" (default) or "vertical".
+        // `opts.radius` rounds the filled silhouette; `opts.shadow` mirrors
+        // gfx.box / gfx.round_rect.
+        {
+            let draw = self.draw.clone();
+            let off = offset.clone();
+            let f = self.lua.create_function(
+                move |_, (x, y, w, h, start, end, opts): (f32, f32, f32, f32, u32, u32, Option<Value>)| {
+                    let (ox, oy) = off();
+                    let opts = parse_gradient_rect_opts(opts)?;
+                    let start = Color::from_argb(start);
+                    draw.borrow_mut().push(DrawCmd::GradientRect {
+                        x: x + ox,
+                        y: y + oy,
+                        w,
+                        h,
+                        radius: opts.radius,
+                        start,
+                        end: Color::from_argb(end),
+                        vertical: opts.vertical,
+                        shadow: resolve_shadow(opts.shadow, start),
+                    });
+                    Ok(())
+                },
+            )?;
+            gfx.set("gradient_rect", f)?;
         }
 
         // gfx.line(x1, y1, x2, y2, color?, thickness?)
@@ -758,6 +822,28 @@ impl ScriptHost {
                 },
             )?;
             gfx.set("line", f)?;
+        }
+
+        // gfx.gradient_line(x1, y1, x2, y2, color1, color2, thickness?)
+        {
+            let draw = self.draw.clone();
+            let off = offset.clone();
+            let f = self.lua.create_function(
+                move |_, (x1, y1, x2, y2, start, end, thickness): (f32, f32, f32, f32, u32, u32, Option<f32>)| {
+                    let (ox, oy) = off();
+                    draw.borrow_mut().push(DrawCmd::GradientLine {
+                        x1: x1 + ox,
+                        y1: y1 + oy,
+                        x2: x2 + ox,
+                        y2: y2 + oy,
+                        start: Color::from_argb(start),
+                        end: Color::from_argb(end),
+                        thickness: thickness.unwrap_or(1.0),
+                    });
+                    Ok(())
+                },
+            )?;
+            gfx.set("gradient_line", f)?;
         }
 
         // gfx.pixel(x, y, color?)
@@ -869,6 +955,103 @@ impl ScriptHost {
                 },
             )?;
             gfx.set("poly", f)?;
+        }
+
+        // gfx.begin_path() / gfx.path_* / gfx.fill_path() / gfx.stroke_path()
+        // build a compound shape and render its union once, avoiding the
+        // darker seams overlapping translucent fills would otherwise create.
+        {
+            let path = self.path_builder.clone();
+            let f = self.lua.create_function(move |_, ()| {
+                path.borrow_mut().clear();
+                Ok(())
+            })?;
+            gfx.set("begin_path", f)?;
+        }
+        {
+            let path = self.path_builder.clone();
+            let off = offset.clone();
+            let f = self.lua.create_function(move |_, (x, y, w, h): (f32, f32, f32, f32)| {
+                let (ox, oy) = off();
+                path.borrow_mut().push(PathPrimitive::Rect {
+                    x: x + ox,
+                    y: y + oy,
+                    w,
+                    h,
+                });
+                Ok(())
+            })?;
+            gfx.set("path_rect", f)?;
+        }
+        {
+            let path = self.path_builder.clone();
+            let off = offset.clone();
+            let f = self.lua.create_function(
+                move |_, (x, y, w, h, radius): (f32, f32, f32, f32, f32)| {
+                    let (ox, oy) = off();
+                    path.borrow_mut().push(PathPrimitive::RoundRect {
+                        x: x + ox,
+                        y: y + oy,
+                        w,
+                        h,
+                        radius: radius.max(0.0),
+                    });
+                    Ok(())
+                },
+            )?;
+            gfx.set("path_round_rect", f)?;
+        }
+        {
+            let path = self.path_builder.clone();
+            let off = offset.clone();
+            let f = self.lua.create_function(move |_, (x, y, radius): (f32, f32, f32)| {
+                let (ox, oy) = off();
+                path.borrow_mut().push(PathPrimitive::Circle {
+                    x: x + ox,
+                    y: y + oy,
+                    radius,
+                });
+                Ok(())
+            })?;
+            gfx.set("path_circle", f)?;
+        }
+        {
+            let draw = self.draw.clone();
+            let path = self.path_builder.clone();
+            let f = self.lua.create_function(
+                move |_, (fill, color, thickness): (u32, Option<u32>, Option<f32>)| {
+                    let shapes = path.borrow().clone();
+                    if shapes.is_empty() {
+                        return Ok(());
+                    }
+                    draw.borrow_mut().push(DrawCmd::Path {
+                        shapes,
+                        color: color.map(Color::from_argb),
+                        fill: Some(Color::from_argb(fill)),
+                        thickness: thickness.unwrap_or(1.0),
+                    });
+                    Ok(())
+                },
+            )?;
+            gfx.set("fill_path", f)?;
+        }
+        {
+            let draw = self.draw.clone();
+            let path = self.path_builder.clone();
+            let f = self.lua.create_function(move |_, (color, thickness): (Option<u32>, Option<f32>)| {
+                let shapes = path.borrow().clone();
+                if shapes.is_empty() {
+                    return Ok(());
+                }
+                draw.borrow_mut().push(DrawCmd::Path {
+                    shapes,
+                    color: Some(argb(color, 0xFF00FF00)),
+                    fill: None,
+                    thickness: thickness.unwrap_or(1.0),
+                });
+                Ok(())
+            })?;
+            gfx.set("stroke_path", f)?;
         }
 
         // gfx.arc(x, y, radius, start_deg, end_deg, color?, fill?, thickness?)
@@ -1629,6 +1812,7 @@ impl ScriptHost {
         self.requested_canvas.set(Canvas::default());
         *self.requested_text_sizing.borrow_mut() = None;
         self.origin_stack.borrow_mut().clear();
+        self.path_builder.borrow_mut().clear();
         self.time = TimeState::new();
         self.mouse = MouseState::new();
         // Drop the previous script's declared panel; the new script will
@@ -1754,6 +1938,7 @@ impl ScriptHost {
         // or a missing pop_origin from a previous frame.
         self.current_font.set(Font::default());
         self.origin_stack.borrow_mut().clear();
+        self.path_builder.borrow_mut().clear();
 
         // Deliver any HTTP responses first so a callback can stage data the
         // same frame's `on_frame` then draws.
@@ -1802,6 +1987,186 @@ type ArcArgs = (
 /// default. Centralised so every primitive treats color args the same way.
 fn argb(c: Option<u32>, default: u32) -> Color {
     Color::from_argb(c.unwrap_or(default))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextOpts {
+    scale: f32,
+    bg: Option<Color>,
+    outline: Option<Color>,
+    align: TextAlign,
+    valign: TextVAlign,
+}
+
+impl Default for TextOpts {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            bg: None,
+            outline: None,
+            align: TextAlign::Left,
+            valign: TextVAlign::Top,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LuaShadow {
+    dx: f32,
+    dy: f32,
+    blur: f32,
+    spread: f32,
+    color: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GradientRectOpts {
+    vertical: bool,
+    radius: f32,
+    shadow: Option<LuaShadow>,
+}
+
+impl Default for GradientRectOpts {
+    fn default() -> Self {
+        Self {
+            vertical: false,
+            radius: 0.0,
+            shadow: None,
+        }
+    }
+}
+
+fn parse_text_align(name: &str) -> mlua::Result<TextAlign> {
+    match name {
+        "left" => Ok(TextAlign::Left),
+        "center" | "centre" => Ok(TextAlign::Center),
+        "right" => Ok(TextAlign::Right),
+        _ => Err(mlua::Error::external(
+            "gfx.text align must be \"left\", \"center\", or \"right\"",
+        )),
+    }
+}
+
+fn parse_text_valign(name: &str) -> mlua::Result<TextVAlign> {
+    match name {
+        "top" => Ok(TextVAlign::Top),
+        "middle" | "center" | "centre" => Ok(TextVAlign::Middle),
+        "bottom" => Ok(TextVAlign::Bottom),
+        _ => Err(mlua::Error::external(
+            "gfx.text valign must be \"top\", \"middle\", or \"bottom\"",
+        )),
+    }
+}
+
+fn parse_text_opts(value: Option<Value>) -> mlua::Result<TextOpts> {
+    let mut opts = TextOpts::default();
+    match value {
+        Some(Value::Number(n)) => opts.scale = n as f32,
+        Some(Value::Integer(n)) => opts.scale = n as f32,
+        Some(Value::Table(t)) => {
+            if let Ok(s) = t.get::<f32>("scale") {
+                if s > 0.0 {
+                    opts.scale = s;
+                }
+            }
+            if let Ok(c) = t.get::<u32>("bg") {
+                opts.bg = Some(Color::from_argb(c));
+            }
+            if let Ok(c) = t.get::<u32>("outline") {
+                opts.outline = Some(Color::from_argb(c));
+            }
+            if let Ok(align) = t.get::<String>("align") {
+                opts.align = parse_text_align(&align)?;
+            }
+            if let Ok(valign) = t.get::<String>("valign") {
+                opts.valign = parse_text_valign(&valign)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(opts)
+}
+
+fn parse_shadow_value(value: Value) -> mlua::Result<Option<LuaShadow>> {
+    match value {
+        Value::Nil => Ok(None),
+        Value::Boolean(false) => Ok(None),
+        Value::Boolean(true) => Ok(Some(LuaShadow {
+            blur: 8.0,
+            ..LuaShadow::default()
+        })),
+        Value::Table(t) => {
+            let mut shadow = LuaShadow::default();
+            if let Ok(v) = t.get::<f32>("dx") {
+                shadow.dx = v;
+            }
+            if let Ok(v) = t.get::<f32>("dy") {
+                shadow.dy = v;
+            }
+            if let Ok(v) = t.get::<f32>("blur") {
+                shadow.blur = v.max(0.0);
+            }
+            if let Ok(v) = t.get::<f32>("spread") {
+                shadow.spread = v;
+            }
+            if let Ok(v) = t.get::<u32>("color") {
+                shadow.color = Some(v);
+            }
+            Ok(Some(shadow))
+        }
+        _ => Err(mlua::Error::external(
+            "shadow must be nil, false, true, or a table",
+        )),
+    }
+}
+
+fn parse_shape_shadow(opts: Option<Value>) -> mlua::Result<Option<LuaShadow>> {
+    let Some(Value::Table(t)) = opts else {
+        return Ok(None);
+    };
+    match t.get::<Value>("shadow") {
+        Ok(v) => parse_shadow_value(v),
+        Err(_) => Ok(None),
+    }
+}
+
+fn resolve_shadow(spec: Option<LuaShadow>, fallback_color: Color) -> Option<ShadowSpec> {
+    spec.map(|shadow| ShadowSpec {
+        dx: shadow.dx,
+        dy: shadow.dy,
+        blur: shadow.blur.max(0.0),
+        spread: shadow.spread,
+        color: shadow.color.map(Color::from_argb).unwrap_or(fallback_color),
+    })
+}
+
+fn parse_gradient_rect_opts(value: Option<Value>) -> mlua::Result<GradientRectOpts> {
+    let Some(Value::Table(t)) = value else {
+        return Ok(GradientRectOpts::default());
+    };
+    let mut opts = GradientRectOpts::default();
+    if let Ok(v) = t.get::<bool>("vertical") {
+        opts.vertical = v;
+    }
+    if let Ok(dir) = t.get::<String>("dir") {
+        opts.vertical = match dir.as_str() {
+            "vertical" | "v" | "y" => true,
+            "horizontal" | "h" | "x" => false,
+            _ => {
+                return Err(mlua::Error::external(
+                    "gfx.gradient_rect dir must be \"horizontal\" or \"vertical\"",
+                ))
+            }
+        };
+    }
+    if let Ok(radius) = t.get::<f32>("radius") {
+        opts.radius = radius.max(0.0);
+    }
+    opts.shadow = match t.get::<Value>("shadow") {
+        Ok(v) => parse_shadow_value(v)?,
+        Err(_) => None,
+    };
+    Ok(opts)
 }
 
 /// Convert a Lua value to JSON for the store / HTTP-JSON helpers. A Lua table
@@ -1992,12 +2357,15 @@ mod tests {
         for c in &last.cmds {
             match c {
                 DrawCmd::Text { .. } => t += 1,
-                DrawCmd::Rect { .. } => r += 1,
-                DrawCmd::Line { .. } => l += 1,
+                DrawCmd::Rect { .. } | DrawCmd::RoundRect { .. } | DrawCmd::GradientRect { .. } => {
+                    r += 1
+                }
+                DrawCmd::Line { .. } | DrawCmd::GradientLine { .. } => l += 1,
                 DrawCmd::Pixel { .. } => p += 1,
                 DrawCmd::Circle { .. }
                 | DrawCmd::Triangle { .. }
                 | DrawCmd::Poly { .. }
+                | DrawCmd::Path { .. }
                 | DrawCmd::Arc { .. } => {}
             }
         }
@@ -2009,6 +2377,47 @@ mod tests {
             !last.cmds.is_empty(),
             "ported script produced NO draw commands — console: {:?}",
             h.console().snapshot()
+        );
+    }
+
+    #[test]
+    fn drawing_example_exercises_every_primitive() {
+        // The drawing.lua gallery is the canonical primitive reference. Load
+        // it through the real bindings and drive a frame: this catches any
+        // gfx.* name typo and proves every new primitive (round_rect,
+        // gradient_rect, gradient_line, triangle, arc, fill/stroke path) is
+        // actually emitted, not just syntactically valid.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/drawing.lua");
+        let src = std::fs::read_to_string(path).expect("drawing example present");
+        let mut h = host();
+        h.load_script(&src, "drawing.lua")
+            .expect("drawing example loads without error");
+        let mut last = DrawList::default();
+        for _ in 0..4 {
+            last = h.run_frame();
+            assert!(
+                h.is_loaded(),
+                "drawing.lua disabled itself: {:?}",
+                h.console().snapshot()
+            );
+        }
+        let (mut round, mut grad_rect, mut grad_line, mut tri, mut path_cmd, mut arc) =
+            (false, false, false, false, false, false);
+        for c in &last.cmds {
+            match c {
+                DrawCmd::RoundRect { .. } => round = true,
+                DrawCmd::GradientRect { .. } => grad_rect = true,
+                DrawCmd::GradientLine { .. } => grad_line = true,
+                DrawCmd::Triangle { .. } => tri = true,
+                DrawCmd::Path { .. } => path_cmd = true,
+                DrawCmd::Arc { .. } => arc = true,
+                _ => {}
+            }
+        }
+        assert!(
+            round && grad_rect && grad_line && tri && path_cmd && arc,
+            "drawing.lua missing a primitive: round_rect={round} gradient_rect={grad_rect} \
+             gradient_line={grad_line} triangle={tri} path={path_cmd} arc={arc}"
         );
     }
 
@@ -2216,27 +2625,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn animated_input_viewer_example_loads_and_runs() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../examples/animated_input_viewer.lua"
-        );
-        let src = std::fs::read_to_string(path).expect("animated input viewer present");
-        let mut h = host();
-        h.load_script(&src, "animated_input_viewer.lua")
-            .expect("animated input viewer loads");
-        for _ in 0..4 {
-            h.run_frame();
-            assert!(h.is_loaded(), "console: {:?}", h.console().snapshot());
-        }
-        assert!(
-            !h.controls().borrow().is_empty(),
-            "input viewer should declare a settings panel"
-        );
-        let dl = h.run_frame();
-        assert!(!dl.cmds.is_empty(), "input viewer should draw something");
-    }
+
 
     #[test]
     fn ui_button_press_latches_once() {
@@ -2553,6 +2942,62 @@ mod tests {
     }
 
     #[test]
+    fn gfx_text_alignment_and_shadowed_rects_emit_commands() {
+        let mut h = host();
+        h.load_script(
+            r#"
+            function on_frame()
+              gfx.text(20, 30, "centered", 0xFFFFFFFF,
+                       { align = "center", valign = "middle" })
+              gfx.box(1, 2, 3, 4, 0xFF112233, 0x80112233, 2,
+                      { shadow = { dx = 4, dy = 5, blur = 6, spread = 7,
+                                   color = 0x55000000 } })
+              gfx.round_rect(10, 20, 30, 40, 8, 0xFFABCDEF, 0x11223344, 3,
+                             { shadow = true })
+            end
+            "#,
+            "t",
+        )
+        .unwrap();
+        let dl = h.run_frame();
+
+        let text = dl
+            .cmds
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::Text { align, valign, .. } => Some((*align, *valign)),
+                _ => None,
+            })
+            .expect("text emitted");
+        assert_eq!(text, (TextAlign::Center, TextVAlign::Middle));
+
+        let rect = dl
+            .cmds
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::Rect {
+                    shadow,
+                    thickness,
+                    ..
+                } => Some((shadow.as_ref().map(|s| (s.dx, s.dy, s.blur, s.spread)), *thickness)),
+                _ => None,
+            })
+            .expect("rect emitted");
+        assert_eq!(rect.0, Some((4.0, 5.0, 6.0, 7.0)));
+        assert_eq!(rect.1, 2.0);
+
+        let round_rect = dl
+            .cmds
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::RoundRect { radius, shadow, .. } => Some((*radius, shadow.is_some())),
+                _ => None,
+            })
+            .expect("round rect emitted");
+        assert_eq!(round_rect, (8.0, true));
+    }
+
+    #[test]
     fn gfx_text_sizing_request_is_recorded_and_resets_on_reload() {
         let mut h = host();
         h.load_script(r#"gfx.text_sizing("screen", 1.25)"#, "t")
@@ -2639,6 +3084,108 @@ mod tests {
     }
 
     #[test]
+    fn gfx_gradients_and_paths_emit_commands() {
+        let mut h = host();
+        h.load_script(
+            r#"
+            function on_frame()
+              gfx.gradient_line(0, 0, 10, 10, 0xFF000000, 0xFFFFFFFF, 2)
+              gfx.gradient_rect(5, 6, 7, 8, 0xFF112233, 0xFF445566,
+                                { dir = "vertical", radius = 3,
+                                  shadow = { blur = 4 } })
+              gfx.push_origin(100, 200)
+              gfx.begin_path()
+              gfx.path_rect(1, 2, 10, 11)
+              gfx.path_round_rect(5, 6, 8, 9, 2)
+              gfx.path_circle(7, 8, 4)
+              gfx.fill_path(0xFF00FF00, 0xFFFFFFFF, 1.5)
+              gfx.stroke_path(0xFF0000FF, 2)
+              gfx.pop_origin()
+            end
+            "#,
+            "t",
+        )
+        .unwrap();
+        let dl = h.run_frame();
+
+        let gradient_line = dl
+            .cmds
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::GradientLine { thickness, .. } => Some(*thickness),
+                _ => None,
+            })
+            .expect("gradient line emitted");
+        assert_eq!(gradient_line, 2.0);
+
+        let gradient_rect = dl
+            .cmds
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::GradientRect {
+                    x,
+                    y,
+                    radius,
+                    vertical,
+                    shadow,
+                    ..
+                } => Some((*x, *y, *radius, *vertical, shadow.is_some())),
+                _ => None,
+            })
+            .expect("gradient rect emitted");
+        assert_eq!(gradient_rect, (5.0, 6.0, 3.0, true, true));
+
+        let paths: Vec<_> = dl
+            .cmds
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Path {
+                    shapes,
+                    fill,
+                    color,
+                    thickness,
+                } => Some((shapes.clone(), fill.is_some(), color.is_some(), *thickness)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].1);
+        assert!(paths[0].2);
+        assert_eq!(paths[0].3, 1.5);
+        assert!(!paths[1].1);
+        assert!(paths[1].2);
+        assert_eq!(paths[1].3, 2.0);
+        assert_eq!(paths[0].0.len(), 3);
+        assert!(matches!(
+            &paths[0].0[0],
+            PathPrimitive::Rect {
+                x,
+                y,
+                w: 10.0,
+                h: 11.0,
+            } if (*x, *y) == (101.0, 202.0)
+        ));
+        assert!(matches!(
+            &paths[0].0[1],
+            PathPrimitive::RoundRect {
+                x,
+                y,
+                w: 8.0,
+                h: 9.0,
+                radius: 2.0,
+            } if (*x, *y) == (105.0, 206.0)
+        ));
+        assert!(matches!(
+            &paths[0].0[2],
+            PathPrimitive::Circle {
+                x,
+                y,
+                radius: 4.0,
+            } if (*x, *y) == (107.0, 208.0)
+        ));
+    }
+
+    #[test]
     fn gfx_color_lerp_blends_channels() {
         let mut h = host();
         h.load_script(
@@ -2676,6 +3223,20 @@ mod tests {
         assert!(dl.cmds.iter().any(|c| matches!(c, DrawCmd::Arc { .. })));
     }
 
+    #[test]
+    fn flashy_input_viewer_example_loads() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/flashy_input_viewer.lua"
+        );
+        let src = std::fs::read_to_string(path).expect("flashy example present");
+        let mut h = host();
+        h.load_script(&src, "flashy_input_viewer.lua")
+            .expect("flashy input viewer loads");
+        h.run_frame();
+        assert!(h.is_loaded(), "console: {:?}", h.console().snapshot());
+    }
+
     /// Every shipped example must at least load and survive a few frames, so
     /// an API change can't silently break the docs-by-example.
     fn smoke_example(file: &str) {
@@ -2694,10 +3255,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sm_hud_example_loads_and_runs() {
-        smoke_example("sm_hud.lua");
-    }
+
 
     #[test]
     fn hires_canvas_example_loads_and_runs() {

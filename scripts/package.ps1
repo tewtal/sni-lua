@@ -55,12 +55,7 @@ Copy-Item -Recurse "examples" -Destination "$staging/examples"
 New-Item -ItemType Directory -Force -Path "$staging/docs" | Out-Null
 Copy-Item "docs/SCRIPTING.md" -Destination "$staging/docs/"
 
-# Ship only runnable scripts. The 220KB verbatim upstream source and the
-# compat/ re-sync tooling are maintenance artifacts; users run the assembled
-# super_hitbox_sni.lua.
-Remove-Item -Force "$staging/examples/Super_Hitbox_Mesen2_AnyG_route_assist_polished.lua" `
-    -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force "$staging/examples/compat" -ErrorAction SilentlyContinue
+
 
 $zip = "dist/$name.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }

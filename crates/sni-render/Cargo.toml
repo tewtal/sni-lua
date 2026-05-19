@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 egui.workspace = true
+geo.workspace = true
 parking_lot.workspace = true

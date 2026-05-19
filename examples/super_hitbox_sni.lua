@@ -96,7 +96,7 @@ local function is_realtime(off)
         or (off >= 0x0998 and off <= 0x0999)   -- game mode (pause/unpause)
         or (off >= 0x0911 and off <= 0x0916)   -- layer 1 camera X/Y
         or (off >= 0x0AF6 and off <= 0x0AFB)   -- Samus X/Y (centered view)
-        or (off >= 0x05B8 and off <= 0x05BB)   -- NMI frame counter (emu.framecount)
+        or (off >= 0x05B8 and off <= 0x05B9)   -- NMI frame counter (emu.framecount)
 end
 
 local function is_high_volatility(off)
@@ -189,6 +189,26 @@ local function cached_u16(kind, addr)
     return cached_byte(kind, addr) + cached_byte(kind, addr + 1) * 256
 end
 
+local function cached_age(kind, addr, size)
+    local key = keyof(kind, addr)
+    local w = _watch[size][key] or register(kind, addr, size)
+    return snes.age(w)
+end
+
+local function read_age(cpu_addr, size)
+    size = size or 1
+    local kind, addr = classify(cpu_addr)
+    if kind == nil then return nil end
+    return cached_age(kind, addr, size)
+end
+
+local function read_valid(cpu_addr, size, max_age)
+    local age = read_age(cpu_addr, size or 1)
+    if age == nil then return false, nil end
+    if max_age ~= nil and age > max_age then return false, age end
+    return true, age
+end
+
 local function invalidate_words(kind, addr, size)
     for a = addr - 1, addr + size - 1 do
         if a >= 0 then _word[keyof(kind, a)] = nil end
@@ -233,6 +253,8 @@ xemu.read_u8     = function(p) return read_n(p, 1, false) end
 xemu.read_u16_le = function(p) return read_n(p, 2, false) end
 xemu.read_s8     = function(p) return read_n(p, 1, true)  end
 xemu.read_s16_le = function(p) return read_n(p, 2, true)  end
+xemu.read_age    = function(p, size) return read_age(p, size or 1) end
+xemu.read_valid  = function(p, size, max_age) return read_valid(p, size or 1, max_age) end
 
 -- The body's bank-wrapped readers (makeBankWrappedReader, kept verbatim) call
 -- these two as free globals. Upstream defined them in its glue zone delegating
@@ -285,6 +307,7 @@ local function tier_cpu(cpu_addr, class, size)
     if prev ~= nil then snes.tier(prev, class) end
 end
 xemu.tier = function(cpu_addr, class) tier_cpu(cpu_addr, class, 1) end
+xemu.tier_size = function(cpu_addr, class, size) tier_cpu(cpu_addr, class, size or 1) end
 
 -- ---- minimal real `emu` / `event` the verbatim body calls directly ----------
 --
@@ -311,19 +334,30 @@ function emu.clearScreen() end
 -- emu.framecount(): the CONSOLE's NMI frame clock, NOT our render loop. Over
 -- SNI we are a latency-bound observer and cannot see every console frame; a
 -- self-incremented render tick would drift vs the console and break the
--- body's frame-delta math (its hotkey edge-detector keys off this). SM bumps
--- a 32-bit NMI counter at $7E:05B8 (lo) / $05BA (hi) every NMI regardless of
--- pause/door/menu -- monotonic and console-paced. on_init pins it realtime so
--- it tracks as tightly as the link allows. The 32-bit form won't wrap for
--- ~828 days, so long sessions never see the 16-bit (~18 min) rollover corrupt
--- a delta.
+-- body's frame-delta math. SM exposes a 16-bit NMI counter at $7E:05B8; the
+-- following words are lag counters, not a high word. Extend $05B8 locally and
+-- keep it monotonic across both rollovers and soft resets.
 local FRAMECOUNT_FALLBACK = 0
+local FRAMECOUNT_LAST_RAW = nil
+local FRAMECOUNT_BASE = 0
+local FRAMECOUNT_LAST = 0
 function emu.framecount()
-    local lo = read_n(0x7E05B8, 2, false)
-    local hi = read_n(0x7E05BA, 2, false)
-    local v = hi * 0x10000 + lo
-    if v == 0 then return FRAMECOUNT_FALLBACK end  -- cache cold / pre-connect
-    return v
+    if not read_valid(0x7E05B8, 2) then
+        return FRAMECOUNT_FALLBACK
+    end
+
+    local raw = read_n(0x7E05B8, 2, false)
+    if FRAMECOUNT_LAST_RAW ~= nil and raw < FRAMECOUNT_LAST_RAW then
+        if FRAMECOUNT_LAST_RAW - raw > 0x8000 then
+            FRAMECOUNT_BASE = FRAMECOUNT_BASE + 0x10000
+        else
+            FRAMECOUNT_BASE = FRAMECOUNT_LAST - raw + 1
+        end
+    end
+
+    FRAMECOUNT_LAST_RAW = raw
+    FRAMECOUNT_LAST = FRAMECOUNT_BASE + raw
+    return FRAMECOUNT_LAST
 end
 
 -- The body's tail dispatch calls emu.addEventCallback(on_paint, nmi) on the
@@ -354,7 +388,6 @@ function on_init()
     -- SM NMI frame counter -> realtime so emu.framecount() tracks the
     -- console clock as tightly as the link allows.
     tier_cpu(0x7E05B8, "realtime", 2)
-    tier_cpu(0x7E05BA, "realtime", 2)
 
     -- Block/hitbox grid origin = Samus position (centered/follow) or layer-1
     -- camera (normal). Keep both paths realtime so it scrolls smoothly.
@@ -399,7 +432,7 @@ local CONFIG = {
     -- Samus-centered high-resolution block viewer.
     -- Uses scriptHud so scale 2/3/4 draws a larger world-space area around Samus.
     samusCenteredBlockView = {
-        enabled = true,
+        enabled = false,
         visibleByDefault = true, -- Select+B+L+R toggles only the block/world viewer layer.
         scale = 3, -- 1..4. 4 shows the most blocks around Samus.
         drawScrolls = true,
@@ -646,6 +679,35 @@ local CONFIG = {
             alertOn0C5FLost = true,
             alertOn0026Bad = true,
             alertOnBombAfter0C5FGood = true,
+        },
+
+        -- SNI snapshots can jitter by a few poll cycles on real hardware.
+        -- These are validity windows in poll cycles, not console frames.
+        -- A poll cycle targets ~16ms but runs longer when SNI/hardware RTT
+        -- dominates, so treat these as "a handful of cycles" not exact ms.
+        --
+        -- Route/PLM/block values are effectively static once set: a
+        -- single late cycle should NOT visibly flip them. We keep the
+        -- windows generous AND apply freshness hysteresis (see
+        -- freshnessHysteresis below) so the dashboard stops flickering
+        -- between OK and ?? on routine poll jitter. Timing watches stay
+        -- tight because door-skip needs genuinely live input/state.
+        freshness = {
+            routeMaxAge = 24,   -- ~static route values; was 6 (too twitchy)
+            timingMaxAge = 4,   -- live input/game-state; was 2
+            plmMaxAge = 30,     -- PLM table; was 10
+            blockMaxAge = 90,   -- world/block reads; was 60
+        },
+
+        -- Freshness hysteresis: how many CONSECUTIVE stale cycles a value
+        -- that was previously fresh must accumulate before the UI is
+        -- allowed to show it as stale. This is the main anti-flicker
+        -- mechanism: brief jitter past the window is absorbed and the
+        -- displayed mark/colour/age only changes once data is genuinely
+        -- gone for a sustained run. Set to 0 to disable (hard cutoff).
+        freshnessHysteresis = {
+            staleCycles = 8,   -- must be stale this long before flipping to stale
+            freshCycles = 1,   -- recover to fresh after this many good cycles
         },
 
         -- Assist hotkeys. Hold Select+B, then tap the configured button.
@@ -2920,6 +2982,12 @@ local anygState = {
     trainingChecklistVisible = nil,
     trainingGuidePage = 1,
     prevGameState = nil,
+    prevGameStateFresh = false,
+    prevValueFresh = {},
+    routeWatchesPinned = false,
+    lastWarningFrameByKey = {},
+    prevFreezeFrame = nil,
+    prevDoorskipFrame = nil,
     doorskipTimingVisible = nil,
     doorskip = {
         attemptId = 0,
@@ -2954,6 +3022,7 @@ local anygState = {
         lastResultText = nil,
         lastResultColour = "white",
         flashFrames = 0,
+        timingUncertain = false,
         history = {},
     },
 }
@@ -2967,6 +3036,156 @@ local function anygRead(address, size)
         return xemu.read_u16_le(address)
     end
     return xemu.read_u8(address)
+end
+
+local ANYG_ROUTE_MAX_AGE = 6
+local ANYG_TIMING_MAX_AGE = 2
+local ANYG_PLM_MAX_AGE = 10
+local ANYG_BLOCK_MAX_AGE = 60
+
+local function anygMaxAge(key, fallback)
+    local cfg = ANYG.freshness or {}
+    local value = cfg[key]
+    if type(value) == "number" and value >= 0 then
+        return value
+    end
+    return fallback
+end
+
+local function anygRouteMaxAge()
+    return anygMaxAge("routeMaxAge", ANYG_ROUTE_MAX_AGE)
+end
+
+local function anygTimingMaxAge()
+    return anygMaxAge("timingMaxAge", ANYG_TIMING_MAX_AGE)
+end
+
+local function anygPlmMaxAge()
+    return anygMaxAge("plmMaxAge", ANYG_PLM_MAX_AGE)
+end
+
+local function anygBlockMaxAge()
+    return anygMaxAge("blockMaxAge", ANYG_BLOCK_MAX_AGE)
+end
+
+-- Freshness hysteresis state, keyed per watch (address|size). Each entry
+-- tracks the last UI-visible verdict plus how many consecutive cycles the
+-- raw read has disagreed with it, so a single late poll cycle does not
+-- flip the dashboard. Cold values (never observed, age == nil) bypass this
+-- entirely -- "no data yet" must surface immediately and honestly.
+local anygFreshSticky = {}
+
+local function anygFreshHysteresisCfg()
+    local cfg = (ANYG and ANYG.freshnessHysteresis) or {}
+    local staleN = cfg.staleCycles
+    local freshN = cfg.freshCycles
+    if type(staleN) ~= "number" or staleN < 0 then staleN = 8 end
+    if type(freshN) ~= "number" or freshN < 0 then freshN = 1 end
+    return staleN, freshN
+end
+
+local function anygReadValidRaw(address, size, maxAge)
+    if xemu.read_valid then
+        return xemu.read_valid(address, size or 1, maxAge)
+    end
+    return true, 0
+end
+
+-- Sticky wrapper around the raw validity check. Returns the *displayed*
+-- verdict (with hysteresis applied) plus the true age so callers that
+-- show "stale+N" still report the real staleness once it commits.
+local function anygReadValid(address, size, maxAge)
+    local rawValid, age = anygReadValidRaw(address, size or 1, maxAge)
+    local staleN, freshN = anygFreshHysteresisCfg()
+
+    -- Hysteresis disabled, or genuinely cold (never seen): pass through.
+    if staleN == 0 or age == nil then
+        return rawValid, age
+    end
+
+    local key = (address or 0) * 8 + (size or 1)
+    local s = anygFreshSticky[key]
+    if s == nil then
+        s = { shown = rawValid, run = 0, frame = nil }
+        anygFreshSticky[key] = s
+    end
+
+    -- Advance the hysteresis run AT MOST ONCE PER SCRIPT FRAME. The same
+    -- address is read from several render paths each frame; without this
+    -- guard the staleCycles threshold would be consumed by duplicate
+    -- intra-frame reads and depend on which panels happen to be visible.
+    local frame = anygState.frame
+    if frame ~= s.frame then
+        s.frame = frame
+        if rawValid == s.shown then
+            s.run = 0
+        else
+            s.run = s.run + 1
+            local needed = rawValid and freshN or staleN
+            if s.run >= needed then
+                s.shown = rawValid
+                s.run = 0
+            end
+        end
+    end
+
+    return s.shown, age
+end
+
+local function anygReadFresh(address, size, maxAge)
+    local value = anygRead(address, size or 1)
+    local valid, age = anygReadValid(address, size or 1, maxAge or anygRouteMaxAge())
+    return value, valid, age
+end
+
+local function anygFreshText(valid, age)
+    if valid then return "" end
+    if age == nil then return "cold" end
+    return string.format("stale+%d", age)
+end
+
+local function anygPin(address, class, size)
+    if xemu.tier_size then
+        xemu.tier_size(address, class, size or 1)
+    elseif xemu.tier then
+        xemu.tier(address, class)
+    end
+end
+
+local function anygPinRouteWatches()
+    if anygState.routeWatchesPinned then return end
+    anygState.routeWatchesPinned = true
+
+    anygPin(0x7E008B, "realtime", 2) -- held input
+    anygPin(0x7E008F, "realtime", 2) -- newly-pressed input
+    anygPin(0x7E0998, "realtime", 2) -- game state
+    anygPin(0x7E0A94, "realtime", 2) -- Samus animation timer
+    anygPin(0x7E0A96, "realtime", 2) -- Samus animation frame
+    anygPin(0x7E0380, "realtime", 2) -- Gold Block dispatch pointer
+
+    anygPin(0x7E0026, "high", 2)
+    anygPin(0x7E090F, "high", 2)
+    anygPin(0x7E0C5F, "high", 1)
+    anygPin(0x7E1843, "high", 1)
+    anygPin(0x7E03D7, "high", 1)
+    anygPin(0x7E09DA, "high", 2)
+    anygPin(0x7E09DC, "high", 2)
+    anygPin(0x7E09DE, "high", 2)
+    anygPin(0x7E09E0, "high", 2)
+
+    for _, target in ipairs(ANYG.routeTargets or {}) do
+        anygPin(target.btAddress, "high", 1)
+        anygPin(target.btsAddress, "high", 1)
+    end
+    for _, watch in ipairs(ANYG.extraWatches or {}) do
+        anygPin(watch.address, "high", watch.size or 1)
+    end
+    for i = 0,((ANYG.plm or {}).slots or 40) - 1 do
+        anygPin(0x7E1C37 + i * 2, "high", 2)
+    end
+    for i = 0,9 do
+        anygPin(0x7E0C7C + i * 2, "high", 2)
+    end
 end
 
 local function anygHex(value, digits)
@@ -3006,6 +3225,16 @@ local function anygAddWarning(message, colour)
     while #anygState.warnings > maxMessages do
         table.remove(anygState.warnings)
     end
+end
+
+local function anygAddWarningKey(key, message, colour, minGapFrames)
+    local frame = anygState.frame or 0
+    local last = anygState.lastWarningFrameByKey[key]
+    if last ~= nil and frame - last < (minGapFrames or 60) then
+        return
+    end
+    anygState.lastWarningFrameByKey[key] = frame
+    anygAddWarning(message, colour)
 end
 
 local function anygStatusColour(status)
@@ -3063,13 +3292,21 @@ local function anygCountPlms()
     local cfg = ANYG.plm or {}
     local slots = cfg.slots or 40
     local count = 0
+    local fresh = true
+    local worstAge = 0
     for i = 0,slots - 1 do
         local id = sm.getPlmId(i)
+        local valid, age = anygReadValid(0x7E1C37 + i * 2, 2, anygPlmMaxAge())
+        if not valid then
+            fresh = false
+        elseif age ~= nil and age > worstAge then
+            worstAge = age
+        end
         if id ~= 0 then
             count = count + 1
         end
     end
-    return count
+    return count, fresh, worstAge
 end
 
 local function anygClassifyFreeze(frames)
@@ -3090,19 +3327,44 @@ local function anygClassifyFreeze(frames)
 end
 
 local function anygGameTimeKey()
-    return ((sm.getGameTimeHours() or 0) * 60 * 60 * 60)
-         + ((sm.getGameTimeMinutes() or 0) * 60 * 60)
-         + ((sm.getGameTimeSeconds() or 0) * 60)
-         + (sm.getGameTimeFrames() or 0)
+    local fresh = true
+    local worstAge = 0
+    local function readTime(address)
+        local value, valid, age = anygReadFresh(address, 2, anygRouteMaxAge())
+        if not valid then
+            fresh = false
+        elseif age ~= nil and age > worstAge then
+            worstAge = age
+        end
+        return value
+    end
+    local frames = readTime(0x7E09DA)
+    local seconds = readTime(0x7E09DC)
+    local minutes = readTime(0x7E09DE)
+    local hours = readTime(0x7E09E0)
+    return ((hours or 0) * 60 * 60 * 60)
+         + ((minutes or 0) * 60 * 60)
+         + ((seconds or 0) * 60)
+         + (frames or 0),
+         fresh,
+         worstAge
 end
 
 local function anygAnyBombActive()
+    local fresh = true
+    local worstAge = 0
     for i = 0,9 do
+        local valid, age = anygReadValid(0x7E0C7C + i * 2, 2, anygPlmMaxAge())
+        if not valid then
+            fresh = false
+        elseif age ~= nil and age > worstAge then
+            worstAge = age
+        end
         if sm.getBombTimer(i) ~= 0 then
-            return true
+            return true, fresh, worstAge
         end
     end
-    return false
+    return false, fresh, worstAge
 end
 
 local function anygUpdateFreezeTimer()
@@ -3110,10 +3372,22 @@ local function anygUpdateFreezeTimer()
     if not cfg.enabled then return end
 
     local gameState = sm.getGameState()
-    local timeKey = anygGameTimeKey()
+    local gameStateFresh = anygReadValid(0x7E0998, 2, anygTimingMaxAge())
+    local timeKey, timeFresh = anygGameTimeKey()
+    local frame = emu.framecount()
+    local frameDelta = 1
+    if anygState.prevFreezeFrame ~= nil and frame > anygState.prevFreezeFrame then
+        frameDelta = frame - anygState.prevFreezeFrame
+    end
+
+    if not gameStateFresh or not timeFresh then
+        anygState.prevFreezeFrame = frame
+        return
+    end
+
     if anygState.prevGameTime ~= nil and gameState == 8 then
         if timeKey == anygState.prevGameTime then
-            anygState.freezeFrames = anygState.freezeFrames + 1
+            anygState.freezeFrames = anygState.freezeFrames + frameDelta
         else
             local f = anygState.freezeFrames
             if f >= (cfg.minFrames or 24) and f <= (cfg.maxFrames or 150) then
@@ -3127,6 +3401,7 @@ local function anygUpdateFreezeTimer()
         anygState.freezeFrames = 0
     end
     anygState.prevGameTime = timeKey
+    anygState.prevFreezeFrame = frame
 end
 
 local function anygCheckImportantChanges(snapshot)
@@ -3135,8 +3410,10 @@ local function anygCheckImportantChanges(snapshot)
 
     local function changedLost(key, desired, label)
         local prev = anygState.prevValues[key]
+        local prevFresh = anygState.prevValueFresh[key] ~= false
         local now = snapshot[key]
-        if prev == desired and now ~= desired then
+        local nowFresh = snapshot._fresh == nil or snapshot._fresh[key] ~= false
+        if prevFresh and nowFresh and prev == desired and now ~= desired then
             anygAddWarning(string.format("%s lost: %02X -> %02X", label, prev, now), "red")
         end
     end
@@ -3152,8 +3429,10 @@ local function anygCheckImportantChanges(snapshot)
 
     if cfg.alertOn090FReset then
         local prev = anygState.prevValues["090F"]
+        local prevFresh = anygState.prevValueFresh["090F"] ~= false
         local now = snapshot["090F"]
-        if prev ~= nil and now == 0 and prev ~= 0 then
+        local nowFresh = snapshot._fresh == nil or snapshot._fresh["090F"] ~= false
+        if prevFresh and nowFresh and prev ~= nil and now == 0 and prev ~= 0 then
             local hi = xemu.rshift(xemu.and_(prev, 0xF0), 4)
             if hi == 0xF or hi == 0x7 or prev >= 0xFC then
                 anygAddWarning(string.format("$090F reset: %02X -> 00", prev), "red")
@@ -3163,30 +3442,37 @@ local function anygCheckImportantChanges(snapshot)
 
     if cfg.alertOn0C5FLost then
         local prev = anygState.prevValues["0C5F"]
+        local prevFresh = anygState.prevValueFresh["0C5F"] ~= false
         local now = snapshot["0C5F"]
-        if prev ~= nil and (xemu.rshift(prev, 4) == 0xF or xemu.rshift(prev, 4) == 0x7) and not (xemu.rshift(now, 4) == 0xF or xemu.rshift(now, 4) == 0x7) then
+        local nowFresh = snapshot._fresh == nil or snapshot._fresh["0C5F"] ~= false
+        if prevFresh and nowFresh and prev ~= nil and (xemu.rshift(prev, 4) == 0xF or xemu.rshift(prev, 4) == 0x7) and not (xemu.rshift(now, 4) == 0xF or xemu.rshift(now, 4) == 0x7) then
             anygAddWarning(string.format("$0C5F lost: %02X -> %02X", prev, now), "red")
         end
     end
 
     if cfg.alertOn0026Bad then
         local prev = anygState.prevValues["0026"]
+        local prevFresh = anygState.prevValueFresh["0026"] ~= false
         local now = snapshot["0026"]
-        if now == 0 and prev ~= 0 then
+        local nowFresh = snapshot._fresh == nil or snapshot._fresh["0026"] ~= false
+        if prevFresh and nowFresh and now == 0 and prev ~= nil and prev ~= 0 then
             anygAddWarning("$0026 became 0000: likely no X-ray from item touch", "red")
-        elseif now == 0xFFFF and prev ~= 0xFFFF then
+        elseif prevFresh and nowFresh and now == 0xFFFF and prev ~= 0xFFFF then
             anygAddWarning("$0026 is FFFF: X-ray + major items source ready", "green")
         end
     end
 
     if cfg.alertOnBombAfter0C5FGood then
-        local bombActive = anygAnyBombActive()
+        local bombActive, bombFresh = anygAnyBombActive()
         local c5f = snapshot["0C5F"] or 0
+        local c5fFresh = snapshot._fresh == nil or snapshot._fresh["0C5F"] ~= false
         local c5fGood = xemu.rshift(c5f, 4) == 0xF or xemu.rshift(c5f, 4) == 0x7
-        if bombActive and not anygState.previousBombActive and c5fGood then
+        if bombFresh and c5fFresh and bombActive and not anygState.previousBombActive and c5fGood then
             anygAddWarning("Bomb active while $0C5F is good: avoid resetting 6F-skree setup", "yellow")
         end
-        anygState.previousBombActive = bombActive
+        if bombFresh then
+            anygState.previousBombActive = bombActive
+        end
     end
 end
 
@@ -3223,11 +3509,12 @@ end
 local function anygTimingColour(status)
     local cfg = anygDoorskipConfig()
     if status == "GOOD" then return cfg.okColour or "green" end
+    if status == "UNKNOWN" then return cfg.warnColour or "yellow" end
     if status == "EARLY" or status == "LATE" then return cfg.warnColour or "yellow" end
     return cfg.badColour or "red"
 end
 
--- When $0998 advances to $0D after the pause-start, SM has already latched a
+-- When $0998 advances to $0E after the pause-start, SM has already latched a
 -- stable animation timer/frame pair that tells us how early/late the D-pad
 -- direction press was. This avoids relying on live per-frame edge sampling.
 local ANYG_DOORSKIP_DIRECTION_SAMPLE_TO_DIFF = {
@@ -3306,6 +3593,7 @@ local function anygStartDoorskipAttempt(input)
     ds.lastResultText = "Doorskip timing: Start pressed"
     ds.lastResultColour = "white"
     ds.flashFrames = 0
+    ds.timingUncertain = false
 
     if xemu.and_(input, sm.button_A) == 0 then
         anygAddWarning("Doorskip: Start pressed without Jump held", "yellow")
@@ -3365,11 +3653,17 @@ local function anygBuildDoorskipResultText(ds)
         shoulderText = "L/R waiting"
     elseif ds.angleStatus == "MISSED" then
         shoulderText = "L/R MISSED"
+    elseif ds.angleStatus == "UNKNOWN" then
+        shoulderText = "L/R UNKNOWN"
     elseif ds.angleOffset ~= nil then
         shoulderText = string.format("L/R %+d %s", ds.angleOffset, ds.angleStatus or "?")
     end
 
-    return string.format("Doorskip: %s | %s | %s", dirText, downText, shoulderText)
+    local text = string.format("Doorskip: %s | %s | %s", dirText, downText, shoulderText)
+    if ds.timingUncertain then
+        text = text .. " | obs gap"
+    end
+    return text
 end
 
 local function anygFinalizeShoulderTiming(cfg, button, diff)
@@ -3379,6 +3673,9 @@ local function anygFinalizeShoulderTiming(cfg, button, diff)
     ds.angleButton = button or ds.firstShoulderButton
     ds.angleOffset = diff
     ds.angleStatus = anygTimingStatus(diff or 9999, cfg.shoulderGoodWindow or 0, cfg.shoulderNearWindow or 2)
+    if ds.timingUncertain and ds.angleStatus == "GOOD" then
+        ds.angleStatus = "UNKNOWN"
+    end
     ds.angleHeldOnResume = false
     ds.anglePressedOnResume = diff == 0
     ds.shoulderResolved = true
@@ -3386,7 +3683,7 @@ local function anygFinalizeShoulderTiming(cfg, button, diff)
 
     local dirOk = ds.directionStatus == "GOOD"
     local downOk = (cfg.requireDownBeforeResume == false) or ds.downStatus == "OK"
-    local shoulderOk = ds.angleStatus == "GOOD"
+    local shoulderOk = ds.angleStatus == "GOOD" and not ds.timingUncertain
     local overallGood = dirOk and downOk and shoulderOk
 
     local colour = overallGood and (cfg.okColour or "green") or (cfg.warnColour or "yellow")
@@ -3442,11 +3739,11 @@ local function anygMarkShoulderMissed(cfg)
     local ds = anygState.doorskip
     if ds.shoulderResolved then return end
     ds.angleOffset = nil
-    ds.angleStatus = "MISSED"
+    ds.angleStatus = ds.timingUncertain and "UNKNOWN" or "MISSED"
     ds.shoulderResolved = true
     ds.awaitingLateShoulder = false
 
-    local colour = cfg.badColour or "red"
+    local colour = ds.timingUncertain and (cfg.warnColour or "yellow") or (cfg.badColour or "red")
     ds.lastResultText = anygBuildDoorskipResultText(ds)
     ds.lastResultColour = colour
     anygPushDoorskipHistory(ds.lastResultText, colour)
@@ -3465,21 +3762,70 @@ local function anygUpdateDoorskipTiming()
     local prevGameState = anygState.prevGameState
     local ds = anygState.doorskip
 
-    local leftPressed = xemu.and_(changed, sm.button_left) ~= 0
-    local rightPressed = xemu.and_(changed, sm.button_right) ~= 0
-    local downPressed = xemu.and_(changed, sm.button_down) ~= 0
-    local shoulderLPressed = xemu.and_(changed, sm.button_L) ~= 0
-    local shoulderRPressed = xemu.and_(changed, sm.button_R) ~= 0
-    local shoulderHeld = xemu.and_(input, sm.button_L + sm.button_R) ~= 0
+    local timingMaxAge = anygTimingMaxAge()
+    -- Door-skip timing is frame-accurate: a genuinely stale frame must
+    -- abort with "timing unknown" rather than be smoothed over. Use the
+    -- RAW validity here, deliberately bypassing the render hysteresis.
+    local inputFresh = anygReadValidRaw(0x7E008B, 2, timingMaxAge)
+    local changedFresh = anygReadValidRaw(0x7E008F, 2, timingMaxAge)
+    local gameStateFresh = anygReadValidRaw(0x7E0998, 2, timingMaxAge)
+    if not gameStateFresh then
+        if ds.startFrame ~= nil and ANYG.showInputWarnings ~= false then
+            ds.timingUncertain = true
+            anygAddWarningKey("doorskip-gamestate-stale", "Doorskip: $0998 stale/cold; exact timing unknown", "yellow", 30)
+        end
+        return
+    end
+
+    local frameDelta = nil
+    if anygState.prevDoorskipFrame ~= nil then
+        frameDelta = anygState.frame - anygState.prevDoorskipFrame
+    end
+    local exactSample = inputFresh
+        and changedFresh
+        and anygState.prevGameStateFresh
+        and frameDelta == 1
+
+    local attemptActive = ds.startFrame ~= nil and anygState.frame - ds.startFrame <= (cfg.attemptTimeoutFrames or 240)
+    if attemptActive and not exactSample then
+        ds.timingUncertain = true
+        if ANYG.showInputWarnings ~= false then
+            anygAddWarningKey("doorskip-observation-gap", "Doorskip: missed/stale frame; exact timing unknown", "yellow", 30)
+        end
+    end
+
+    local leftPressed = exactSample and xemu.and_(changed, sm.button_left) ~= 0
+    local rightPressed = exactSample and xemu.and_(changed, sm.button_right) ~= 0
+    local downPressed = exactSample and xemu.and_(changed, sm.button_down) ~= 0
+    local shoulderLPressed = exactSample and xemu.and_(changed, sm.button_L) ~= 0
+    local shoulderRPressed = exactSample and xemu.and_(changed, sm.button_R) ~= 0
+    local shoulderHeld = inputFresh and xemu.and_(input, sm.button_L + sm.button_R) ~= 0
     local shoulderPressed = shoulderLPressed or shoulderRPressed
-    local enteredPauseStart = prevGameState ~= nil and prevGameState ~= gameState and gameState == 0x0C
-    local directionLatched = prevGameState ~= nil and prevGameState ~= gameState and gameState == 0x0D
+    local stateChanged = exactSample and prevGameState ~= nil and prevGameState ~= gameState
+    local enteredPauseStart = stateChanged and gameState == 0x0C
+    local directionLatched = prevGameState ~= nil and prevGameState ~= 0x0E and gameState == 0x0E
 
     if enteredPauseStart and xemu.and_(input, sm.button_A) ~= 0 then
         anygStartDoorskipAttempt(input)
+    elseif ds.startFrame == nil
+        and inputFresh
+        and gameState == 0x0C
+        and xemu.and_(input, sm.button_start) ~= 0
+        and xemu.and_(input, sm.button_A) ~= 0 then
+        anygStartDoorskipAttempt(input)
+        ds.timingUncertain = true
+        if ANYG.showInputWarnings ~= false then
+            anygAddWarningKey("doorskip-start-inferred", "Doorskip: Start inferred after observation gap", "yellow", 60)
+        end
+    elseif ds.startFrame == nil and directionLatched then
+        anygStartDoorskipAttempt(input)
+        ds.timingUncertain = true
+        if ANYG.showInputWarnings ~= false then
+            anygAddWarningKey("doorskip-latch-inferred", "Doorskip: attempt inferred at direction latch", "yellow", 60)
+        end
     end
 
-    local attemptActive = ds.startFrame ~= nil and anygState.frame - ds.startFrame <= (cfg.attemptTimeoutFrames or 240)
+    attemptActive = ds.startFrame ~= nil and anygState.frame - ds.startFrame <= (cfg.attemptTimeoutFrames or 240)
 
     if attemptActive and (leftPressed or rightPressed) then
         local button = leftPressed and sm.button_left or sm.button_right
@@ -3489,8 +3835,12 @@ local function anygUpdateDoorskipTiming()
 
     if attemptActive and directionLatched and ds.directionFrame == nil then
         local timer = sm.getSamusAnimationFrameTimer()
-        local frame = sm.getSamusAnimationFrame()
-        local diff = anygDecodeDoorskipDirectionDiff(timer, frame)
+        local animFrame = sm.getSamusAnimationFrame()
+        -- Raw validity: this is the frame-accurate D-pad timing capture.
+        local timerFresh = anygReadValidRaw(0x7E0A94, 2, timingMaxAge)
+        local animFrameFresh = anygReadValidRaw(0x7E0A96, 2, timingMaxAge)
+        local animFresh = timerFresh and animFrameFresh
+        local diff = animFresh and anygDecodeDoorskipDirectionDiff(timer, animFrame) or nil
         local button = ds.lastDirectionButton
         if button == nil then
             if xemu.and_(input, sm.button_left) ~= 0 then
@@ -3505,9 +3855,20 @@ local function anygUpdateDoorskipTiming()
         ds.directionFrame = anygState.frame
         ds.directionButton = button
         ds.directionTimerValue = timer
-        ds.directionAnimationFrameValue = frame
+        ds.directionAnimationFrameValue = animFrame
 
-        if diff ~= nil then
+        if not animFresh then
+            ds.directionOffset = nil
+            ds.directionDiff = nil
+            ds.directionStatus = "UNKNOWN"
+            ds.timingUncertain = true
+            ds.lastResultText = string.format(
+                "D-pad timing stale/cold $0A94/$0A96 = %s/%s at $0998=0E",
+                anygHex(timer, 2),
+                anygHex(animFrame, 2)
+            )
+            ds.lastResultColour = cfg.warnColour or "yellow"
+        elseif diff ~= nil then
             local status = anygTimingStatus(diff, cfg.directionGoodWindow or 0, cfg.directionNearWindow or 2)
             ds.directionOffset = diff
             ds.directionDiff = diff
@@ -3516,7 +3877,7 @@ local function anygUpdateDoorskipTiming()
                 "D-pad %s via $0A94/$0A96 %s/%s: %s (%+d)",
                 anygButtonNameFromMask(button),
                 anygHex(timer, 2),
-                anygHex(frame, 2),
+                anygHex(animFrame, 2),
                 status,
                 diff
             )
@@ -3526,9 +3887,9 @@ local function anygUpdateDoorskipTiming()
             ds.directionDiff = nil
             ds.directionStatus = "UNKNOWN"
             ds.lastResultText = string.format(
-                "D-pad timing raw $0A94/$0A96 = %s/%s at $0998=0D",
+                "D-pad timing raw $0A94/$0A96 = %s/%s at $0998=0E",
                 anygHex(timer, 2),
-                anygHex(frame, 2)
+                anygHex(animFrame, 2)
             )
             ds.lastResultColour = cfg.badColour or "red"
         end
@@ -3569,10 +3930,10 @@ local function anygUpdateDoorskipTiming()
     local targetFrom = cfg.targetResumeFromGameMode or 0x12
     local targetTo = cfg.targetResumeToGameMode or 0x08
     local earlyDoorTo = cfg.earlyDoorTransitionToGameMode or 0x0B
-    local resumedToGameplay = prevGameState == targetFrom and gameState == targetTo
-    local earlyDoorTransition = cfg.markEarlyDoorTransition ~= false and prevGameState == targetFrom and gameState == earlyDoorTo
+    local resumedToGameplay = stateChanged and prevGameState == targetFrom and gameState == targetTo
+    local earlyDoorTransition = cfg.markEarlyDoorTransition ~= false and stateChanged and prevGameState == targetFrom and gameState == earlyDoorTo
 
-    if prevGameState ~= nil and gameState ~= prevGameState and attemptActive then
+    if stateChanged and attemptActive then
         ds.lastResultText = string.format("Game mode %02X -> %02X", prevGameState, gameState)
         ds.lastResultColour = cfg.titleColour or "yellow"
         if resumedToGameplay or earlyDoorTransition then
@@ -3652,6 +4013,8 @@ local function anygUpdateDoorskipTiming()
     end
 
     anygState.prevGameState = gameState
+    anygState.prevGameStateFresh = gameStateFresh
+    anygState.prevDoorskipFrame = anygState.frame
 end
 
 local function anygHandleControls()
@@ -3669,8 +4032,13 @@ local function anygHandleControls()
     end
 
     if hotkeyPressed(input, changed, cfg, "resetPlmBaselineButton", "Y") then
-        anygState.plmBaseline = anygCountPlms()
-        anygAddWarning(string.format("PLM baseline reset to %d", anygState.plmBaseline), "green")
+        local count, fresh, age = anygCountPlms()
+        if fresh then
+            anygState.plmBaseline = count
+            anygAddWarning(string.format("PLM baseline reset to %d", anygState.plmBaseline), "green")
+        else
+            anygAddWarning(string.format("PLM baseline not reset: %s PLM table", anygFreshText(false, age)), "yellow")
+        end
     end
 
     if hotkeyPressed(input, changed, cfg, "toggleDashboardButton", "L") then
@@ -3717,6 +4085,7 @@ local function anygHandleControls()
 end
 local function anygUpdateState()
     if not anygEnabled() then return end
+    anygPinRouteWatches()
     local _, _, frame = getHotkeyFrameState()
     if lastAnygUpdateFrame == frame then
         return
@@ -3741,34 +4110,46 @@ local function anygUpdateState()
 
     anygUpdateFreezeTimer()
 
-    local snapshot = {
-        ["11FD"] = xemu.read_u8(0x7E11FD),
-        ["1201"] = xemu.read_u8(0x7E1201),
-        ["1D59"] = xemu.read_u8(0x7E1D59),
-        ["1D5B"] = xemu.read_u8(0x7E1D5B),
-        ["090F"] = xemu.read_u8(0x7E090F),
-        ["18E2"] = xemu.read_u8(0x7E18E2),
-        ["0C5F"] = xemu.read_u8(0x7E0C5F),
-        ["1A8A"] = xemu.read_u8(0x7E1A8A),
-        ["0026"] = xemu.read_u16_le(0x7E0026),
-        ["0380"] = xemu.read_u16_le(0x7E0380),
-        ["1843"] = xemu.read_u8(0x7E1843),
-        ["03D7"] = xemu.read_u8(0x7E03D7),
-    }
+    local snapshot = { _fresh = {}, _age = {} }
+    local function snap(key, address, size, maxAge)
+        local value, fresh, age = anygReadFresh(address, size, maxAge or anygRouteMaxAge())
+        snapshot[key] = value
+        snapshot._fresh[key] = fresh
+        snapshot._age[key] = age
+    end
+    snap("11FD", 0x7E11FD, 1)
+    snap("1201", 0x7E1201, 1)
+    snap("1D59", 0x7E1D59, 1)
+    snap("1D5B", 0x7E1D5B, 1)
+    snap("090F", 0x7E090F, 1)
+    snap("18E2", 0x7E18E2, 1)
+    snap("0C5F", 0x7E0C5F, 1)
+    snap("1A8A", 0x7E1A8A, 1)
+    snap("0026", 0x7E0026, 2)
+    snap("0380", 0x7E0380, 2)
+    snap("1843", 0x7E1843, 1)
+    snap("03D7", 0x7E03D7, 1)
 
     anygCheckImportantChanges(snapshot)
     anygState.prevValues = snapshot
+    anygState.prevValueFresh = snapshot._fresh
 
     if ANYG.plm and ANYG.plm.enabled then
-        local count = anygCountPlms()
-        if anygState.plmBaseline == nil then
+        local count, fresh, age = anygCountPlms()
+        if not fresh then
+            if ANYG.showInputWarnings ~= false then
+                anygAddWarningKey("plm-table-stale", string.format("PLM count waiting: %s table", anygFreshText(false, age)), "yellow", 60)
+            end
+        elseif anygState.plmBaseline == nil then
             anygState.plmBaseline = ANYG.plm.baseline or count
-        end
-        if anygState.lastPlmCount ~= nil and count ~= anygState.lastPlmCount then
+            anygState.lastPlmCount = count
+        elseif anygState.lastPlmCount ~= nil and count ~= anygState.lastPlmCount then
             local delta = count - anygState.lastPlmCount
             anygAddWarning(string.format("PLM count %d (%+d)", count, delta), delta > 0 and "green" or "yellow")
+            anygState.lastPlmCount = count
+        else
+            anygState.lastPlmCount = count
         end
-        anygState.lastPlmCount = count
     end
 end
 
@@ -3863,28 +4244,41 @@ local function anygDrawDashboard(viewWidth, viewHeight)
     end
 
     local function targetStatus(target)
-        local bt = anygRead(target.btAddress, 1)
-        local bts = anygRead(target.btsAddress, 1)
+        local bt, btFresh, btAge = anygReadFresh(target.btAddress, 1)
+        local bts, btsFresh, btsAge = anygReadFresh(target.btsAddress, 1)
+        local fresh = btFresh and btsFresh
+        local age = btFresh and btsAge or btAge
+        if not fresh then
+            return false, bt, bts, "WAIT", "WAIT", false, age
+        end
         local btStatus = anygCheckBtSource(bt, target)
         local btsStatus = anygCheckBtsSource(bts, target)
         local ok = btStatus == "OK" and btsStatus == "OK"
-        return ok, bt, bts, btStatus, btsStatus
+        return ok, bt, bts, btStatus, btsStatus, true, age
     end
 
     if d.compact ~= false then
         local summaryParts = {}
         local summaryStatus = "OK"
         for _, target in ipairs(ANYG.routeTargets or {}) do
-            local ok, bt, bts = targetStatus(target)
-            if not ok then summaryStatus = "BAD" end
+            local ok, bt, bts, _, _, fresh, age = targetStatus(target)
+            if not fresh then
+                if summaryStatus ~= "BAD" then summaryStatus = "WARN" end
+            elseif not ok then
+                summaryStatus = "BAD"
+            end
             local short = target.key or target.name or "?"
             short = short:gsub("%-", "")
-            table.insert(summaryParts, string.format("%s %s", short, ok and "OK" or string.format("%02X/%02X", bt, bts)))
+            local valueText = ok and "OK" or string.format("%02X/%02X", bt, bts)
+            if not fresh then
+                valueText = anygFreshText(false, age)
+            end
+            table.insert(summaryParts, string.format("%s %s", short, valueText))
         end
         drawLineText("AnyG: " .. table.concat(summaryParts, "  "), summaryStatus)
 
-        local v0026 = xemu.read_u16_le(0x7E0026)
-        local v0380 = xemu.read_u16_le(0x7E0380)
+        local v0026, fresh0026, age0026 = anygReadFresh(0x7E0026, 2)
+        local v0380, fresh0380, age0380 = anygReadFresh(0x7E0380, 2)
         local label0380 = ""
         local status0026 = v0026 >= 0x8000 and "OK" or (v0026 == 0 and "BAD" or "WARN")
         for _, watch in ipairs(ANYG.extraWatches or {}) do
@@ -3894,25 +4288,37 @@ local function anygDrawDashboard(viewWidth, viewHeight)
         end
         local status0380 = label0380 ~= "" and "OK" or "INFO"
         local statusLine = (status0026 == "BAD" or status0380 == "BAD") and "BAD" or (status0026 == "WARN" and "WARN" or "OK")
+        if not fresh0026 or not fresh0380 then
+            statusLine = "WARN"
+            label0380 = anygFreshText(false, fresh0026 and age0380 or age0026)
+        end
         drawLineText(string.format("$0026 %04X  $0380 %04X %s", v0026, v0380, label0380), statusLine)
 
         if d.showAddressDetails then
-            local v090F = xemu.read_u8(0x7E090F)
-            local v1843 = xemu.read_u8(0x7E1843)
-            local v03D7 = xemu.read_u8(0x7E03D7)
-            drawLineText(string.format("detail: $090F %02X  $1843 %02X  $03D7 %02X", v090F, v1843, v03D7), "INFO")
+            local v090F, f090F, a090F = anygReadFresh(0x7E090F, 1)
+            local v1843, f1843, a1843 = anygReadFresh(0x7E1843, 1)
+            local v03D7, f03D7, a03D7 = anygReadFresh(0x7E03D7, 1)
+            local detailStatus = (f090F and f1843 and f03D7) and "INFO" or "WARN"
+            local detailNote = detailStatus == "WARN" and (" " .. anygFreshText(false, (not f090F and a090F) or (not f1843 and a1843) or a03D7)) or ""
+            drawLineText(string.format("detail: $090F %02X  $1843 %02X  $03D7 %02X%s", v090F, v1843, v03D7, detailNote), detailStatus)
         end
 
         if d.showPlmAndFreeze ~= false then
             local parts = {}
             local status = "INFO"
             if ANYG.showPlmCount and ANYG.plm and ANYG.plm.enabled then
-                local count = anygState.lastPlmCount or anygCountPlms()
+                local count, fresh, age = anygCountPlms()
+                if anygState.lastPlmCount ~= nil and fresh then count = anygState.lastPlmCount end
                 local baseline = anygState.plmBaseline or count
                 local extra = count - baseline
                 local targetExtra = ANYG.plm.targetExtra or 8
-                table.insert(parts, string.format("PLM %02d (%+d/%d)", count, extra, targetExtra))
-                if extra >= targetExtra then status = "OK" elseif extra > 0 then status = "WARN" end
+                if fresh then
+                    table.insert(parts, string.format("PLM %02d (%+d/%d)", count, extra, targetExtra))
+                    if extra >= targetExtra then status = "OK" elseif extra > 0 then status = "WARN" end
+                else
+                    table.insert(parts, "PLM " .. anygFreshText(false, age))
+                    status = "WARN"
+                end
             end
             if ANYG.showFreezeTimer and (ANYG.freezeTimer or {}).enabled then
                 if anygState.freezeFrames and anygState.freezeFrames > 0 then
@@ -3934,19 +4340,24 @@ local function anygDrawDashboard(viewWidth, viewHeight)
     drawLineText("AnyG route assist", "INFO")
 
     for _, target in ipairs(ANYG.routeTargets or {}) do
-        local ok, bt, bts, btStatus, btsStatus = targetStatus(target)
-        local status = ok and "OK" or "BAD"
-        drawLineText(string.format("%-10s BT %02X %s  BTS %02X %s", target.key or target.name, bt, btStatus, bts, btsStatus), status)
+        local ok, bt, bts, btStatus, btsStatus, fresh, age = targetStatus(target)
+        local status = fresh and (ok and "OK" or "BAD") or "WARN"
+        local note = fresh and "" or (" " .. anygFreshText(false, age))
+        drawLineText(string.format("%-10s BT %02X %s  BTS %02X %s%s", target.key or target.name, bt, btStatus, bts, btsStatus, note), status)
     end
 
     for _, watch in ipairs(ANYG.extraWatches or {}) do
-        local value = anygRead(watch.address, watch.size or 1)
+        local value, fresh, age = anygReadFresh(watch.address, watch.size or 1)
         local status, note = anygCheckWatch(value, watch)
+        if not fresh then
+            status = "WARN"
+            note = anygFreshText(false, age)
+        end
         local digits = (watch.size == 2) and 4 or 2
-        if watch.exactLabels and watch.exactLabels[value] then
+        if fresh and watch.exactLabels and watch.exactLabels[value] then
             note = watch.exactLabels[value]
             status = "OK"
-        elseif watch.showNearest and watch.exactLabels then
+        elseif fresh and watch.showNearest and watch.exactLabels then
             local nearestValue, nearestLabel, nearestDist = nil, nil, 0x10000
             for k, label in pairs(watch.exactLabels) do
                 local dist = math.abs(value - k)
@@ -3962,12 +4373,15 @@ local function anygDrawDashboard(viewWidth, viewHeight)
     end
 
     if ANYG.showPlmCount and ANYG.plm and ANYG.plm.enabled then
-        local count = anygState.lastPlmCount or anygCountPlms()
+        local count, fresh, age = anygCountPlms()
+        if anygState.lastPlmCount ~= nil and fresh then count = anygState.lastPlmCount end
         local baseline = anygState.plmBaseline or count
         local extra = count - baseline
         local targetExtra = ANYG.plm.targetExtra or 8
-        local status = extra >= targetExtra and "OK" or (extra > 0 and "WARN" or "INFO")
-        drawLineText(string.format("PLMs %02d  base %02d  extra %+d/%d", count, baseline, extra, targetExtra), status)
+        local status = fresh and (extra >= targetExtra and "OK" or (extra > 0 and "WARN" or "INFO")) or "WARN"
+        local text = fresh and string.format("PLMs %02d  base %02d  extra %+d/%d", count, baseline, extra, targetExtra)
+            or ("PLMs " .. anygFreshText(false, age))
+        drawLineText(text, status)
     end
 
     if ANYG.showFreezeTimer and (ANYG.freezeTimer or {}).enabled then
@@ -3986,29 +4400,33 @@ end
 
 local function anygDraw0380Helper(viewWidth, viewHeight)
     if not anygEnabled() or not ANYG.show0380Helper then return end
-    local value = xemu.read_u16_le(0x7E0380)
+    local value, fresh, age = anygReadFresh(0x7E0380, 2, anygTimingMaxAge())
     local label = nil
-    for _, watch in ipairs(ANYG.extraWatches or {}) do
-        if watch.key == "gold-0380" and watch.exactLabels then
-            label = watch.exactLabels[value]
-            if label == nil and watch.showNearest then
-                local nearestValue, nearestLabel, nearestDist = nil, nil, 0x10000
-                for k, l in pairs(watch.exactLabels) do
-                    local dist = math.abs(value - k)
-                    if dist < nearestDist then
-                        nearestValue, nearestLabel, nearestDist = k, l, dist
+    if fresh then
+        for _, watch in ipairs(ANYG.extraWatches or {}) do
+            if watch.key == "gold-0380" and watch.exactLabels then
+                label = watch.exactLabels[value]
+                if label == nil and watch.showNearest then
+                    local nearestValue, nearestLabel, nearestDist = nil, nil, 0x10000
+                    for k, l in pairs(watch.exactLabels) do
+                        local dist = math.abs(value - k)
+                        if dist < nearestDist then
+                            nearestValue, nearestLabel, nearestDist = k, l, dist
+                        end
                     end
-                end
-                if nearestValue ~= nil and nearestDist <= 0x40 then
-                    label = string.format("near %04X %s", nearestValue, nearestLabel)
+                    if nearestValue ~= nil and nearestDist <= 0x40 then
+                        label = string.format("near %04X %s", nearestValue, nearestLabel)
+                    end
                 end
             end
         end
+    else
+        label = anygFreshText(false, age)
     end
     if label == nil then
         label = ""
     end
-    local colour = (label ~= "") and "yellow" or "white"
+    local colour = fresh and ((label ~= "") and "yellow" or "white") or "cyan"
     drawText(math.floor(viewWidth / 2) + 12, math.floor(viewHeight / 2) - 20, string.format("$0380 %04X %s", value, label), colour, "black")
 end
 
@@ -4104,27 +4522,43 @@ local function anygDrawDoorskipTiming(viewWidth, viewHeight)
     anygDrawPanelLine(x, y, "Doorskip timing", title, bg)
     y = y + lh
 
-    local gs = sm.getGameState()
+    local gs, gsFresh, gsAge = anygReadFresh(0x7E0998, 2, anygTimingMaxAge())
+    local gsText = gsFresh and anygHex(gs, 2) or anygFreshText(false, gsAge)
     if cfg.showLiveInputLine then
-        local input = sm.getInput()
+        local input, inputFresh, inputAge = anygReadFresh(0x7E008B, 2, anygTimingMaxAge())
         local jumpHeld = xemu.and_(input, sm.button_A) ~= 0
         local downHeld = xemu.and_(input, sm.button_down) ~= 0
-        anygDrawPanelLine(x, y, string.format("$0998=%02X  Jump:%s  Down:%s", gs, jumpHeld and "held" or "no", downHeld and "held" or "no"), textC, bg)
+        local liveFresh = gsFresh and inputFresh
+        local inputText = inputFresh and "" or ("  input " .. anygFreshText(false, inputAge))
+        anygDrawPanelLine(
+            x,
+            y,
+            string.format("$0998=%s  Jump:%s  Down:%s%s", gsText, jumpHeld and "held" or "no", downHeld and "held" or "no", inputText),
+            liveFresh and textC or warnC,
+            bg
+        )
         y = y + lh
     end
 
     local startText
     if ds.startFrame ~= nil then
-        startText = string.format("Start +%df    $0998=%02X", anygState.frame - ds.startFrame, gs)
+        startText = string.format("Start +%df    $0998=%s", anygState.frame - ds.startFrame, gsText)
     else
-        startText = string.format("Waiting for Start    $0998=%02X", gs)
+        startText = string.format("Waiting for Start    $0998=%s", gsText)
     end
     anygDrawPanelLine(x, y, startText, textC, bg)
     y = y + lh
 
     local dirColour = warnC
-    local dirText = "D-pad timing: wait for $0998=0D"
-    if ds.directionDiff ~= nil then
+    local dirText = "D-pad timing: wait for $0998=0E"
+    if ds.directionStatus == "UNKNOWN" then
+        dirColour = warnC
+        dirText = string.format(
+            "D-pad timing: UNKNOWN (%s/%s)",
+            anygHex(ds.directionTimerValue, 2),
+            anygHex(ds.directionAnimationFrameValue, 2)
+        )
+    elseif ds.directionDiff ~= nil then
         dirColour = anygTimingColour(ds.directionStatus)
         dirText = string.format(
             "D-pad %s: %+d  %s (%s/%s)",
@@ -4142,7 +4576,7 @@ local function anygDrawDoorskipTiming(viewWidth, viewHeight)
             anygHex(ds.directionAnimationFrameValue, 2)
         )
     elseif ds.startFrame ~= nil then
-        dirText = "D-pad timing: waiting for 0D latch"
+        dirText = "D-pad timing: waiting for 0E latch"
         dirColour = textC
     end
     anygDrawPanelLine(x, y, dirText, dirColour, bg)
@@ -4191,6 +4625,9 @@ local function anygDrawDoorskipTiming(viewWidth, viewHeight)
     elseif ds.angleStatus == "MISSED" then
         shoulderText = "Shoulder L/R: MISSED"
         shoulderColour = badC
+    elseif ds.angleStatus == "UNKNOWN" then
+        shoulderText = "Shoulder L/R: UNKNOWN"
+        shoulderColour = warnC
     elseif ds.angleOffset ~= nil then
         shoulderText = string.format("Shoulder L/R: %+df  %s", ds.angleOffset, ds.angleStatus or "?")
         shoulderColour = anygTimingColour(ds.angleStatus)
@@ -4249,25 +4686,26 @@ local function anygDrawTrainingChecklist(viewWidth, viewHeight)
     local showNotes = cfg.checklistShowNotes ~= false
     local showSections = cfg.checklistShowSections ~= false
 
-    local v11FD = xemu.read_u8(0x7E11FD)
-    local v1201 = xemu.read_u8(0x7E1201)
-    local v1D59 = xemu.read_u8(0x7E1D59)
-    local v1D5B = xemu.read_u8(0x7E1D5B)
-    local v090F = xemu.read_u8(0x7E090F)
-    local v0C5F = xemu.read_u8(0x7E0C5F)
-    local v18E2 = xemu.read_u8(0x7E18E2)
-    local v1A8A = xemu.read_u8(0x7E1A8A)
-    local v1843 = xemu.read_u8(0x7E1843)
-    local v0026 = xemu.read_u16_le(0x7E0026)
-    local v0380 = xemu.read_u16_le(0x7E0380)
-    local bombActive = anygAnyBombActive()
+    local v11FD, f11FD = anygReadFresh(0x7E11FD, 1)
+    local v1201, f1201 = anygReadFresh(0x7E1201, 1)
+    local v1D59, f1D59 = anygReadFresh(0x7E1D59, 1)
+    local v1D5B, f1D5B = anygReadFresh(0x7E1D5B, 1)
+    local v090F, f090F = anygReadFresh(0x7E090F, 1)
+    local v0C5F, f0C5F = anygReadFresh(0x7E0C5F, 1)
+    local v18E2, f18E2 = anygReadFresh(0x7E18E2, 1)
+    local v1A8A, f1A8A = anygReadFresh(0x7E1A8A, 1)
+    local v1843, f1843 = anygReadFresh(0x7E1843, 1)
+    local v0026, f0026 = anygReadFresh(0x7E0026, 2)
+    local v0380, f0380 = anygReadFresh(0x7E0380, 2)
+    local bombActive, bombFresh = anygAnyBombActive()
 
     local function hiGood(v)
         local hi = xemu.rshift(xemu.and_(v, 0xF0), 4)
         return hi == 0xF or hi == 0x7
     end
 
-    local function status(ok, warn)
+    local function status(ok, warn, fresh)
+        if fresh == false then return "??", warnC end
         if ok then return "OK", okC end
         if warn then return "!!", warnC end
         return "BAD", badC
@@ -4302,8 +4740,8 @@ local function anygDrawTrainingChecklist(viewWidth, viewHeight)
         end
     end
 
-    local function addCheck(rows, label, ok, warn, value, note)
-        local mark, colour = status(ok, warn)
+    local function addCheck(rows, label, ok, warn, value, note, fresh)
+        local mark, colour = status(ok, warn, fresh)
         table.insert(rows, {
             kind = "check",
             label = label,
@@ -4317,43 +4755,48 @@ local function anygDrawTrainingChecklist(viewWidth, viewHeight)
     local rows = {}
     addSection(rows, "PRE-SHUFFLER VALUES")
     addCheck(rows, "5D-left BTS", v1D59 == 0x5D, false,
-        string.format("$1D59=%02X", v1D59), "want 5D for 5D-left / X-ray block")
+        string.format("$1D59=%02X", v1D59), "want 5D for 5D-left / X-ray block", f1D59)
     addCheck(rows, "5D-right BTS", v1D5B == 0x5D, false,
-        string.format("$1D5B=%02X", v1D5B), "want 5D for 5D-right / +1 PLM")
+        string.format("$1D5B=%02X", v1D5B), "want 5D for 5D-right / +1 PLM", f1D5B)
     addCheck(rows, "Geemer BT pair", hiGood(v11FD) and hiGood(v1201), hiGood(v11FD) or hiGood(v1201),
-        string.format("$11FD/$1201=%02X/%02X", v11FD, v1201), "both should be F_ or 7_ before Shuffler")
+        string.format("$11FD/$1201=%02X/%02X", v11FD, v1201), "both should be F_ or 7_ before Shuffler", f11FD and f1201)
     addCheck(rows, "6F-layer pair", hiGood(v090F) and v18E2 == 0x6F, v18E2 == 0x6F and v090F ~= 0,
-        string.format("$090F/$18E2=%02X/%02X", v090F, v18E2), "$090F should be F_/7_; $18E2 should be 6F")
+        string.format("$090F/$18E2=%02X/%02X", v090F, v18E2), "$090F should be F_/7_; $18E2 should be 6F", f090F and f18E2)
     addCheck(rows, "6F-skree pair", hiGood(v0C5F) and v1A8A == 0x6F, v1A8A == 0x6F and v0C5F ~= 0,
-        string.format("$0C5F/$1A8A=%02X/%02X", v0C5F, v1A8A), "$0C5F should stay F_/7_; $1A8A should be 6F")
+        string.format("$0C5F/$1A8A=%02X/%02X", v0C5F, v1A8A), "$0C5F should stay F_/7_; $1A8A should be 6F", f0C5F and f1A8A)
 
     addSection(rows, "RULES / DANGER CHECKS")
     addCheck(rows, "No bomb active", not bombActive, false,
-        bombActive and "bomb active" or "clear", "do not bomb again before Shuffler")
+        bombActive and "bomb active" or "clear", "do not bomb again before Shuffler", bombFresh)
     addCheck(rows, "$0026 item source", v0026 >= 0x8000, v0026 ~= 0 and v0026 < 0x8000,
-        string.format("$0026=%04X", v0026), "FFFF/C000 good; 0000 means no X-ray/all-items")
+        string.format("$0026=%04X", v0026), "FFFF/C000 good; 0000 means no X-ray/all-items", f0026)
     addCheck(rows, "$1843 slope timer", v1843 >= 0x10 and v1843 <= 0x1F, v1843 >= 0x08 and v1843 <= 0x27,
-        string.format("$1843=%02X", v1843), "route movement prefers about 10..1F")
+        string.format("$1843=%02X", v1843), "route movement prefers about 10..1F", f1843)
 
     addSection(rows, "POST-SHUFFLER / TOUCH FEEDBACK")
-    local count = anygState.lastPlmCount or anygCountPlms()
+    local count, countFresh = anygCountPlms()
+    if anygState.lastPlmCount ~= nil and countFresh then count = anygState.lastPlmCount end
     local baseline = anygState.plmBaseline or count
     local extra = count - baseline
     local targetExtra = ((ANYG.plm or {}).targetExtra or 8)
     addCheck(rows, "Extra PLMs", extra >= targetExtra, extra > 0,
-        string.format("%+d/%d  total %02d", extra, targetExtra, count), "Select+B+Y resets the baseline")
+        string.format("%+d/%d  total %02d", extra, targetExtra, count), "Select+B+Y resets the baseline", countFresh)
     addCheck(rows, "$0380 Gold value", false, true,
-        string.format("$0380=%04X", v0380), gold0380Label(v0380))
+        string.format("$0380=%04X", v0380), f0380 and gold0380Label(v0380) or "waiting for fresh OAM", f0380)
     local ds = anygState.doorskip or {}
     local downOk = ds.downStatus == "OK"
-    local shoulderOk = ds.angleStatus == "GOOD"
-    local dirOk = ds.directionStatus == "GOOD"
+    local timingCertain = not ds.timingUncertain
+    local shoulderOk = timingCertain and ds.angleStatus == "GOOD"
+    local dirOk = timingCertain and ds.directionStatus == "GOOD"
     local dsWarn = ds.startFrame ~= nil or ds.lastResultText ~= nil
     local dsValue = "waiting"
     if ds.startFrame ~= nil then
         dsValue = string.format("Start +%df", anygState.frame - ds.startFrame)
     elseif ds.lastResultText ~= nil then
         dsValue = ds.lastResultText
+    end
+    if not timingCertain and dsValue ~= "waiting" then
+        dsValue = dsValue .. " | obs gap"
     end
     addCheck(rows, "Doorskip timing", dirOk and downOk and shoulderOk, dsWarn,
         dsValue, "details in Select+B+Down timing panel")
@@ -4451,6 +4894,14 @@ function displayBlocks(cameraX, cameraY, roomWidth, viewWidth, viewHeight)
             -- Blocks are 16x16 px², using a right shift to avoid dealing with floats
             local blockIndex = xemu.rshift(xemu.and_(cameraY + y * 0x10, 0xFFF), 4) * roomWidth
                              + xemu.rshift(xemu.and_(cameraX + x * 0x10, 0xFFFF), 4)
+            local blockFresh = true
+            if xemu.read_valid then
+                local levelAddr = cpuBankWrappedOffsetAddress(0x7F0002, blockIndex * 2)
+                local btsAddr = cpuBankWrappedOffsetAddress(0x7F6402, blockIndex)
+                local blockMaxAge = anygBlockMaxAge()
+                blockFresh = select(1, xemu.read_valid(levelAddr, 2, blockMaxAge))
+                          and select(1, xemu.read_valid(btsAddr, 1, blockMaxAge))
+            end
 
             -- Block type is the most significant 4 bits of level data
             local blockType = xemu.rshift(sm.getLevelDatum(blockIndex), 12)
@@ -4459,7 +4910,9 @@ function displayBlocks(cameraX, cameraY, roomWidth, viewWidth, viewHeight)
             local f = outline[blockType] or standardOutline(colour_errorBlock)
             f(blockX, blockY, blockIndex, stackLimit)
 
-            anygDrawRouteBlockMarker(blockX, blockY, blockType, bts, blockIndex, cameraX, cameraY, viewWidth, viewHeight)
+            if blockFresh then
+                anygDrawRouteBlockMarker(blockX, blockY, blockType, bts, blockIndex, cameraX, cameraY, viewWidth, viewHeight)
+            end
 
             -- Draw labels after outlines so labels remain readable.
             if debugFlag ~= 0 then

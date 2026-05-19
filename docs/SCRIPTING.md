@@ -155,7 +155,7 @@ white for text/lines, green for shapes.
 
 | Call | Description |
 |---|---|
-| `gfx.text(x, y, str, color?, opts?)` | Draw `str` at `(x, y)`. `\n` starts a new line at the original `x`. |
+| `gfx.text(x, y, str, color?, opts?)` | Draw `str` anchored at `(x, y)`. `\n` starts a new line at the original `x`. Default anchor is top-left; `opts.align` / `opts.valign` can make `(x, y)` the centre or right/bottom edge instead. |
 | `gfx.text_width(str)` | Pixel width of `str` in the current font (widest line). |
 | `gfx.text_height(str?)` | Pixel height (line count × line advance; `nil`/omitted = one line). |
 | `gfx.font(name)` | Typeface for subsequent `gfx.text` this frame: `"small"` (5×7, default) or `"normal"` (8×8). Resets to `"small"` each frame. |
@@ -173,12 +173,15 @@ works) **or a table**:
 | `scale` | size multiplier (on top of the global overlay size) |
 | `bg` | `0xAARRGGBB` — solid backing rect, auto-sized to the text + 1px pad |
 | `outline` | `0xAARRGGBB` — 1px halo around every glyph (replaces the manual shadow double-draw) |
+| `align` | `"left"` (default), `"center"`, or `"right"` |
+| `valign` | `"top"` (default), `"middle"`, or `"bottom"` |
 
 ```lua
 gfx.text(8, 8, "HP 99", 0xFFFFFFFF, { bg = 0xA0000000, outline = 0xFF000000 })
 gfx.text(8, 8, "big", 0xFFFFFFFF, 2)   -- numeric = scale (back-compat)
 gfx.text_sizing("game", 1.0)            -- script load default
-local x = gfx.width() - gfx.text_width("right") - 4   -- right-align
+gfx.text(128, 112, "CENTER", 0xFFFFFFFF,
+   { scale = 4, align = "center", valign = "middle", outline = 0xFF000000 })
 ```
 
 ### Shapes
@@ -186,20 +189,44 @@ local x = gfx.width() - gfx.text_width("right") - 4   -- right-align
 `fill?` is an optional `0xAARRGGBB`; absent = outline only. `thickness?`
 defaults to `1.0`.
 
+Rectangular primitives also accept `opts?`, currently used for soft shadows:
+
+| Field | Meaning |
+|---|---|
+| `shadow` | `true` for a default glow, or `{ dx, dy, blur, spread, color? }` for an explicit shadow/halo. Supported by `gfx.box`, `gfx.round_rect`, and `gfx.gradient_rect`. |
+
 | Call | Description |
 |---|---|
 | `gfx.pixel(x, y, color?)` | One canvas pixel (drawn as a scaled quad so it stays visible zoomed). |
 | `gfx.line(x1, y1, x2, y2, color?, thickness?)` | Line segment. |
-| `gfx.box(x, y, w, h, color?, fill?, thickness?)` | Rectangle (the hitbox primitive). |
+| `gfx.gradient_line(x1, y1, x2, y2, color1, color2, thickness?)` | Line segment with a color ramp from start → end. |
+| `gfx.box(x, y, w, h, color?, fill?, thickness?, opts?)` | Rectangle (the hitbox primitive). |
+| `gfx.round_rect(x, y, w, h, radius, color?, fill?, thickness?, opts?)` | Native rounded rectangle. |
+| `gfx.gradient_rect(x, y, w, h, color1, color2, opts?)` | Filled rectangle with a horizontal gradient by default. `opts.dir = "vertical"` flips the ramp; `opts.radius` rounds the silhouette. |
 | `gfx.circle(x, y, radius, color?, fill?, thickness?)` | `(x, y)` is the **centre**. |
 | `gfx.triangle(x1, y1, x2, y2, x3, y3, color?, fill?, thickness?)` | Three points. |
 | `gfx.poly(points, color?, fill?, thickness?, closed?)` | Polyline/polygon. `points` = `{ {x,y}, … }` or `{ {x=,y=}, … }`. `closed?` default `true` (joins last→first). `fill` requires `closed` and assumes **convex**. |
 | `gfx.arc(x, y, radius, start_deg, end_deg, color?, fill?, thickness?)` | Arc centred at `(x, y)`. **Clockwise, 0° = east.** Full sweep (0→360) is a ring; with `fill` it's a pie slice from the centre. Good for radial timers / range cones. |
+| `gfx.begin_path()` | Clear the current compound path builder. |
+| `gfx.path_rect(x, y, w, h)` | Append a rectangle primitive to the current path. |
+| `gfx.path_round_rect(x, y, w, h, radius)` | Append a rounded rectangle primitive to the current path. |
+| `gfx.path_circle(x, y, radius)` | Append a circle primitive to the current path. |
+| `gfx.fill_path(fill, color?, thickness?)` | Render the union of the appended path primitives, optionally with an outline. Useful for seamless concave fills such as a D-pad. |
+| `gfx.stroke_path(color?, thickness?)` | Stroke the union of the appended path primitives without a fill. |
 
 ```lua
-gfx.box(sx-8, sy-16, 16, 32, 0xFF00FF00, 0x2000FF00)   -- outlined + faint fill
+gfx.box(sx-8, sy-16, 16, 32, 0xFF00FF00, 0x2000FF00,
+  1, { shadow = { blur = 10, spread = 2, color = 0x4000FF00 } })
+gfx.round_rect(20, 20, 80, 24, 12, 0xFFFFFFFF, 0x4018D0FF, 2)
+gfx.gradient_rect(20, 56, 120, 16, 0xFF10E0FF, 0xFF0044FF,
+      { dir = "vertical", radius = 8 })
 gfx.poly({ {0,0}, {10,0}, {5,10} }, 0xFFFFFFFF, 0x40FFFFFF)
 gfx.arc(40, 40, 16, -90, -90 + 360*frac, 0xFF40FF40, nil, 2)  -- progress ring
+gfx.begin_path()
+gfx.path_rect(80, 80, 20, 20)
+gfx.path_round_rect(80, 52, 20, 36, 8)
+gfx.path_round_rect(52, 80, 36, 20, 8)
+gfx.fill_path(0x8000E5FF, 0xFF00E5FF, 2)
 ```
 
 ### Color
@@ -476,11 +503,9 @@ if anim.blink(0.5) then gfx.text(8, 8, "!", 0xFFFF4040) end
 
 | File | Shows |
 |---|---|
-| `examples/sm_hud.lua` | watches, cached reads, a basic Super Metroid HUD + Samus hitbox |
 | `examples/hires_canvas.lua` | `gfx.scale` for a higher-resolution canvas |
 | `examples/settings_panel.lua` | a full `ui.*` settings panel (Script tab) |
 | `examples/store_and_http.lua` | persistence (`store.*`) + async `http.*` |
-| `examples/drawing.lua` | text bg/outline, `poly`, `arc`, `color_lerp`, `push_origin`, `anim.*` |
+| `examples/drawing.lua` | labelled gallery of every `gfx` primitive — `round_rect`, `gradient_rect`/`gradient_line`, `shadow` opts, `triangle`, `arc`, compound `fill_path`/`stroke_path`, `color_lerp`, `push_origin`, `anim.*` |
 | `examples/toast.lua` | a reusable toast-notification system (`anim.*` + `mouse.*`) |
-| `examples/animated_input_viewer.lua` | a polished controller/input viewer (glow, ripples, history, settings) |
 | `examples/super_hitbox_sni.lua` | a real 4500-line ported Super Metroid script |

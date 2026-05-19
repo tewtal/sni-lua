@@ -59,10 +59,7 @@ cp README.md LICENSE    "$STAGING/"
 cp -R examples          "$STAGING/examples"
 cp docs/SCRIPTING.md    "$STAGING/docs/"
 
-# Ship only runnable scripts. The verbatim upstream source and compat/
-# re-sync tooling are maintenance artifacts; users run super_hitbox_sni.lua.
-rm -f  "$STAGING/examples/Super_Hitbox_Mesen2_AnyG_route_assist_polished.lua"
-rm -rf "$STAGING/examples/compat"
+
 
 chmod +x "$STAGING/sni-lua"
 

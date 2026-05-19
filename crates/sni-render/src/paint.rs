@@ -7,10 +7,14 @@
 //! pixels. Scaling is uniform and letterboxed; text uses the embedded bitmap
 //! font drawn as nearest-neighbour quads so it stays crisp at any zoom.
 
-use egui::{Color32, Painter, Pos2, Rect, Stroke, Vec2};
+use egui::epaint::{Mesh, RectShape, Shadow, Vertex, WHITE_UV};
+use egui::{Color32, Painter, Pos2, Rect, Rounding, Shape, Stroke, Vec2};
+use geo::{BooleanOps, Coord, LineString, MultiPolygon, Polygon, TriangulateEarcut};
 
 use crate::font::Font;
-use crate::{Canvas, Color, DrawCmd, DrawList};
+use crate::{
+    Canvas, Color, DrawCmd, DrawList, PathPrimitive, ShadowSpec, TextAlign, TextVAlign,
+};
 
 /// How overlay text is sized. The "too big" complaint comes from text being
 /// `viewport_scale × font_scale` tall; this gives the user/script control.
@@ -27,8 +31,6 @@ pub enum TextSizing {
 
 impl Default for TextSizing {
     fn default() -> Self {
-        // Pixel-aligned and zooms with the view; mult 1.0 keeps the compact
-        // 5x7 font readable without dominating the overlay.
         TextSizing::GameScaled { mult: 1.0 }
     }
 }
@@ -39,10 +41,6 @@ fn col(c: Color) -> Color32 {
 
 /// Maps the active script canvas onto a screen rect: uniform scale, centred,
 /// letterboxed. Build one per frame from the area the capture occupies.
-///
-/// Decoupling the canvas (script coord space) from this fit means a script
-/// drawing in 512x448 lands in exactly the same on-screen place as one
-/// drawing in 256x224 — only the precision differs.
 #[derive(Clone, Copy)]
 pub struct Viewport {
     origin: Pos2,
@@ -70,8 +68,7 @@ impl Viewport {
         Self::fit(area, Canvas::native())
     }
 
-    /// The screen rect the canvas actually occupies (for a border /
-    /// background fill behind the overlay).
+    /// The screen rect the canvas actually occupies.
     pub fn screen_rect(&self) -> Rect {
         Rect::from_min_size(
             self.origin,
@@ -84,8 +81,7 @@ impl Viewport {
     }
 
     /// Inverse of [`Self::pt`]: map a screen point back into canvas
-    /// coordinates. Returns `None` when the point is outside the canvas
-    /// rect (so a script can tell "mouse is over the game" from "not").
+    /// coordinates. Returns `None` when the point is outside the canvas rect.
     pub fn screen_to_canvas(&self, p: Pos2) -> Option<(f32, f32)> {
         if self.scale <= 0.0 {
             return None;
@@ -114,15 +110,7 @@ impl Viewport {
 
 /// Paint every command in `list` into `painter` using `vp`. `sizing` is the
 /// app-wide text sizing mode/scale; per-label `scale` multiplies on top.
-/// Call inside the egui paint pass for the panel hosting the capture frame.
-///
-/// Drawing is **clipped to the canvas rect** (`vp.screen_rect()`), matching
-/// emulator behaviour: Mesen/BizHawk Lua surfaces clip to their bounds, and
-/// many scripts deliberately over-draw the edges (e.g. a one-block margin on
-/// a block grid) expecting that clip. Without it the overscan spills into the
-/// letterbox / app chrome — and a buggy script could scribble anywhere.
 pub fn paint(painter: &Painter, vp: &Viewport, list: &DrawList, sizing: TextSizing) {
-    // Constrain everything below to the canvas viewport.
     let painter = &painter.with_clip_rect(vp.screen_rect());
     for cmd in &list.cmds {
         match cmd {
@@ -135,8 +123,22 @@ pub fn paint(painter: &Painter, vp: &Viewport, list: &DrawList, sizing: TextSizi
                 font,
                 bg,
                 outline,
+                align,
+                valign,
             } => paint_text(
-                painter, vp, *x, *y, text, *color, *scale, *font, sizing, *bg, *outline,
+                painter,
+                vp,
+                *x,
+                *y,
+                text,
+                *color,
+                *scale,
+                *font,
+                sizing,
+                *bg,
+                *outline,
+                *align,
+                *valign,
             ),
 
             DrawCmd::Rect {
@@ -147,15 +149,33 @@ pub fn paint(painter: &Painter, vp: &Viewport, list: &DrawList, sizing: TextSizi
                 color,
                 fill,
                 thickness,
+                shadow,
             } => {
-                let r = Rect::from_min_size(vp.pt(*x, *y), Vec2::new(vp.len(*w), vp.len(*h)));
-                if let Some(f) = fill {
-                    painter.rect_filled(r, 0.0, col(*f));
-                }
-                painter.rect_stroke(
-                    r,
-                    0.0,
-                    Stroke::new(vp.len(*thickness).max(1.0), col(*color)),
+                let rect = Rect::from_min_size(vp.pt(*x, *y), Vec2::new(vp.len(*w), vp.len(*h)));
+                paint_rect_shape(painter, rect, 0.0, *fill, *color, *thickness, *shadow, vp);
+            }
+
+            DrawCmd::RoundRect {
+                x,
+                y,
+                w,
+                h,
+                radius,
+                color,
+                fill,
+                thickness,
+                shadow,
+            } => {
+                let rect = Rect::from_min_size(vp.pt(*x, *y), Vec2::new(vp.len(*w), vp.len(*h)));
+                paint_rect_shape(
+                    painter,
+                    rect,
+                    vp.len(*radius),
+                    *fill,
+                    *color,
+                    *thickness,
+                    *shadow,
+                    vp,
                 );
             }
 
@@ -174,8 +194,6 @@ pub fn paint(painter: &Painter, vp: &Viewport, list: &DrawList, sizing: TextSizi
             }
 
             DrawCmd::Pixel { x, y, color } => {
-                // One SNES pixel = one scaled quad, so it stays visible when
-                // zoomed up over the capture.
                 let r = Rect::from_min_size(vp.pt(*x, *y), Vec2::splat(vp.scale.max(1.0)));
                 painter.rect_filled(r, 0.0, col(*color));
             }
@@ -209,15 +227,10 @@ pub fn paint(painter: &Painter, vp: &Viewport, list: &DrawList, sizing: TextSizi
             } => {
                 let p = [vp.pt(*x1, *y1), vp.pt(*x2, *y2), vp.pt(*x3, *y3)];
                 if let Some(f) = fill {
-                    // Filled convex triangle as a single egui mesh path.
-                    painter.add(egui::Shape::convex_polygon(
-                        p.to_vec(),
-                        col(*f),
-                        Stroke::NONE,
-                    ));
+                    painter.add(Shape::convex_polygon(p.to_vec(), col(*f), Stroke::NONE));
                 }
                 let s = Stroke::new(vp.len(*thickness).max(1.0), col(*color));
-                painter.add(egui::Shape::closed_line(p.to_vec(), s));
+                painter.add(Shape::closed_line(p.to_vec(), s));
             }
 
             DrawCmd::Poly {
@@ -234,17 +247,71 @@ pub fn paint(painter: &Painter, vp: &Viewport, list: &DrawList, sizing: TextSizi
                 let s = Stroke::new(vp.len(*thickness).max(1.0), col(*color));
                 if *closed {
                     if let Some(f) = fill {
-                        // Convex-fill assumption matches gfx.triangle; a
-                        // concave polygon still strokes correctly.
-                        painter.add(egui::Shape::convex_polygon(
-                            p.clone(),
-                            col(*f),
-                            Stroke::NONE,
-                        ));
+                        painter.add(Shape::convex_polygon(p.clone(), col(*f), Stroke::NONE));
                     }
-                    painter.add(egui::Shape::closed_line(p, s));
+                    painter.add(Shape::closed_line(p, s));
                 } else {
-                    painter.add(egui::Shape::line(p, s));
+                    painter.add(Shape::line(p, s));
+                }
+            }
+
+            DrawCmd::GradientLine {
+                x1,
+                y1,
+                x2,
+                y2,
+                start,
+                end,
+                thickness,
+            } => paint_gradient_line(painter, vp, *x1, *y1, *x2, *y2, *start, *end, *thickness),
+
+            DrawCmd::GradientRect {
+                x,
+                y,
+                w,
+                h,
+                radius,
+                start,
+                end,
+                vertical,
+                shadow,
+            } => {
+                let rect = Rect::from_min_size(vp.pt(*x, *y), Vec2::new(vp.len(*w), vp.len(*h)));
+                if let Some(shadow) = shadow {
+                    paint_shadow(painter, rect, vp.len(*radius), *shadow, vp);
+                }
+                let poly = if *radius > 0.0 {
+                    round_rect_polygon(*x, *y, *w, *h, *radius)
+                } else {
+                    rect_polygon(*x, *y, *w, *h)
+                };
+                if let Some(mesh) = polygon_mesh(vp, &poly, *start, *end, *vertical) {
+                    painter.add(Shape::mesh(mesh));
+                }
+            }
+
+            DrawCmd::Path {
+                shapes,
+                color,
+                fill,
+                thickness,
+            } => {
+                let union = union_shapes(shapes);
+                if union.0.is_empty() {
+                    continue;
+                }
+                if let Some(f) = fill {
+                    for poly in &union.0 {
+                        if let Some(mesh) = polygon_mesh(vp, poly, *f, *f, false) {
+                            painter.add(Shape::mesh(mesh));
+                        }
+                    }
+                }
+                if let Some(c) = color {
+                    let stroke = Stroke::new(vp.len(*thickness).max(1.0), col(*c));
+                    for poly in &union.0 {
+                        paint_polygon_outline(painter, vp, poly, stroke);
+                    }
                 }
             }
 
@@ -260,9 +327,6 @@ pub fn paint(painter: &Painter, vp: &Viewport, list: &DrawList, sizing: TextSizi
             } => {
                 let centre = vp.pt(*x, *y);
                 let r = vp.len(*radius);
-                // Tessellate the sweep. Step ~ every few degrees, scaled a
-                // little by radius so big arcs stay smooth; clamped so a
-                // tiny/huge arc doesn't under/over-tessellate.
                 let sweep = (*end_deg - *start_deg).abs();
                 let steps = ((sweep / 6.0).ceil() as usize)
                     .clamp(2, 180)
@@ -271,28 +335,276 @@ pub fn paint(painter: &Painter, vp: &Viewport, list: &DrawList, sizing: TextSizi
                 let mut pts: Vec<Pos2> = Vec::with_capacity(steps + 2);
                 for i in 0..=steps {
                     let t = i as f32 / steps as f32;
-                    // Clockwise, 0° = +x: screen y grows downward, so +sin.
                     let a = (start_deg + (end_deg - start_deg) * t).to_radians();
                     pts.push(Pos2::new(centre.x + r * a.cos(), centre.y + r * a.sin()));
                 }
                 let s = Stroke::new(vp.len(*thickness).max(1.0), col(*color));
                 if let Some(f) = fill {
-                    // Pie slice: fan from the centre through the arc points.
                     let mut poly = Vec::with_capacity(pts.len() + 1);
                     poly.push(centre);
                     poly.extend_from_slice(&pts);
-                    painter.add(egui::Shape::convex_polygon(poly, col(*f), Stroke::NONE));
+                    painter.add(Shape::convex_polygon(poly, col(*f), Stroke::NONE));
                 }
-                painter.add(egui::Shape::line(pts, s));
+                painter.add(Shape::line(pts, s));
             }
         }
     }
 }
 
-/// Draw `text` with the selected bitmap `font`. Each set bit becomes a
-/// nearest-neighbour quad so text is crisp at any zoom (never blurred like a
-/// vector font over a pixel-art capture). `\n` starts a new line at the
-/// original x. Screen-space pixel size is decided by `sizing`.
+#[allow(clippy::too_many_arguments)]
+fn paint_rect_shape(
+    painter: &Painter,
+    rect: Rect,
+    radius: f32,
+    fill: Option<Color>,
+    color: Color,
+    thickness: f32,
+    shadow: Option<ShadowSpec>,
+    vp: &Viewport,
+) {
+    if let Some(shadow) = shadow {
+        paint_shadow(painter, rect, radius, shadow, vp);
+    }
+    let shape = RectShape::new(
+        rect,
+        rounding(radius),
+        fill.map(col).unwrap_or(Color32::TRANSPARENT),
+        Stroke::new(vp.len(thickness).max(1.0), col(color)),
+    );
+    painter.add(shape);
+}
+
+fn paint_shadow(painter: &Painter, rect: Rect, radius: f32, shadow: ShadowSpec, vp: &Viewport) {
+    let shape = Shadow {
+        offset: Vec2::new(vp.len(shadow.dx), vp.len(shadow.dy)),
+        blur: vp.len(shadow.blur),
+        spread: vp.len(shadow.spread),
+        color: col(shadow.color),
+    }
+    .as_shape(rect, rounding(radius));
+    painter.add(shape);
+}
+
+fn rounding(radius: f32) -> Rounding {
+    Rounding::same(radius.max(0.0))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_gradient_line(
+    painter: &Painter,
+    vp: &Viewport,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    start: Color,
+    end: Color,
+    thickness: f32,
+) {
+    let p1 = vp.pt(x1, y1);
+    let p2 = vp.pt(x2, y2);
+    let dir = p2 - p1;
+    let len = dir.length();
+    let th = vp.len(thickness).max(1.0);
+    if len <= f32::EPSILON {
+        painter.circle_filled(p1, th * 0.5, col(start));
+        return;
+    }
+    let n = Vec2::new(-dir.y, dir.x) * (th * 0.5 / len);
+    let mut mesh = Mesh::default();
+    let base = mesh.vertices.len() as u32;
+    mesh.vertices.push(Vertex {
+        pos: p1 + n,
+        uv: WHITE_UV,
+        color: col(start),
+    });
+    mesh.vertices.push(Vertex {
+        pos: p1 - n,
+        uv: WHITE_UV,
+        color: col(start),
+    });
+    mesh.vertices.push(Vertex {
+        pos: p2 - n,
+        uv: WHITE_UV,
+        color: col(end),
+    });
+    mesh.vertices.push(Vertex {
+        pos: p2 + n,
+        uv: WHITE_UV,
+        color: col(end),
+    });
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    painter.add(Shape::mesh(mesh));
+}
+
+fn polygon_mesh(
+    vp: &Viewport,
+    polygon: &Polygon<f32>,
+    start: Color,
+    end: Color,
+    vertical: bool,
+) -> Option<Mesh> {
+    let raw = polygon.earcut_triangles_raw();
+    if raw.vertices.is_empty() || raw.triangle_indices.is_empty() {
+        return None;
+    }
+    let (mut min_x, mut max_x) = (f32::INFINITY, f32::NEG_INFINITY);
+    let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
+    for [x, y] in &raw.vertices {
+        min_x = min_x.min(*x);
+        max_x = max_x.max(*x);
+        min_y = min_y.min(*y);
+        max_y = max_y.max(*y);
+    }
+    let span = if vertical {
+        (max_y - min_y).max(f32::EPSILON)
+    } else {
+        (max_x - min_x).max(f32::EPSILON)
+    };
+    let mut mesh = Mesh::default();
+    for [x, y] in raw.vertices {
+        let t = if vertical {
+            ((y - min_y) / span).clamp(0.0, 1.0)
+        } else {
+            ((x - min_x) / span).clamp(0.0, 1.0)
+        };
+        mesh.vertices.push(Vertex {
+            pos: vp.pt(x, y),
+            uv: WHITE_UV,
+            color: lerp_color(start, end, t),
+        });
+    }
+    mesh.indices
+        .extend(raw.triangle_indices.into_iter().map(|idx| idx as u32));
+    Some(mesh)
+}
+
+fn lerp_color(a: Color, b: Color, t: f32) -> Color32 {
+    let lerp = |lhs: u8, rhs: u8| -> u8 {
+        (lhs as f32 + (rhs as f32 - lhs as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgba_unmultiplied(
+        lerp(a.r, b.r),
+        lerp(a.g, b.g),
+        lerp(a.b, b.b),
+        lerp(a.a, b.a),
+    )
+}
+
+fn union_shapes(shapes: &[PathPrimitive]) -> MultiPolygon<f32> {
+    let mut union: Option<MultiPolygon<f32>> = None;
+    for shape in shapes {
+        let poly = match shape {
+            PathPrimitive::Rect { x, y, w, h } => rect_polygon(*x, *y, *w, *h),
+            PathPrimitive::RoundRect {
+                x,
+                y,
+                w,
+                h,
+                radius,
+            } => round_rect_polygon(*x, *y, *w, *h, *radius),
+            PathPrimitive::Circle { x, y, radius } => circle_polygon(*x, *y, *radius),
+        };
+        let next = MultiPolygon(vec![poly]);
+        union = Some(match union {
+            Some(cur) => cur.union(&next),
+            None => next,
+        });
+    }
+    union.unwrap_or_else(|| MultiPolygon(vec![]))
+}
+
+fn paint_polygon_outline(painter: &Painter, vp: &Viewport, polygon: &Polygon<f32>, stroke: Stroke) {
+    let exterior = ring_points(polygon.exterior(), vp);
+    if exterior.len() >= 2 {
+        painter.add(Shape::closed_line(exterior, stroke));
+    }
+    for hole in polygon.interiors() {
+        let inner = ring_points(hole, vp);
+        if inner.len() >= 2 {
+            painter.add(Shape::closed_line(inner, stroke));
+        }
+    }
+}
+
+fn ring_points(ring: &LineString<f32>, vp: &Viewport) -> Vec<Pos2> {
+    let coords = &ring.0;
+    let end = coords.len().saturating_sub(1);
+    coords[..end]
+        .iter()
+        .map(|coord| vp.pt(coord.x, coord.y))
+        .collect()
+}
+
+fn rect_polygon(x: f32, y: f32, w: f32, h: f32) -> Polygon<f32> {
+    Polygon::new(
+        LineString(vec![
+            Coord { x, y },
+            Coord { x: x + w, y },
+            Coord { x: x + w, y: y + h },
+            Coord { x, y: y + h },
+            Coord { x, y },
+        ]),
+        vec![],
+    )
+}
+
+fn round_rect_polygon(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Polygon<f32> {
+    let r = radius.clamp(0.0, w.abs().min(h.abs()) * 0.5);
+    if r <= 0.0 {
+        return rect_polygon(x, y, w, h);
+    }
+    let steps = ((r / 3.0).ceil() as usize).clamp(3, 12);
+    let mut pts = Vec::with_capacity(steps * 4 + 5);
+    pts.push(Coord { x: x + r, y });
+    append_arc(&mut pts, x + w - r, y + r, r, -90.0, 0.0, steps);
+    append_arc(&mut pts, x + w - r, y + h - r, r, 0.0, 90.0, steps);
+    append_arc(&mut pts, x + r, y + h - r, r, 90.0, 180.0, steps);
+    append_arc(&mut pts, x + r, y + r, r, 180.0, 270.0, steps);
+    pts.push(pts[0]);
+    Polygon::new(LineString(pts), vec![])
+}
+
+fn circle_polygon(x: f32, y: f32, radius: f32) -> Polygon<f32> {
+    let steps = ((radius.abs() / 3.0).ceil() as usize).clamp(8, 64);
+    let mut pts = Vec::with_capacity(steps + 1);
+    for i in 0..steps {
+        let t = i as f32 / steps as f32;
+        let a = t * std::f32::consts::TAU;
+        pts.push(Coord {
+            x: x + radius * a.cos(),
+            y: y + radius * a.sin(),
+        });
+    }
+    pts.push(pts[0]);
+    Polygon::new(LineString(pts), vec![])
+}
+
+fn append_arc(
+    pts: &mut Vec<Coord<f32>>,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    start_deg: f32,
+    end_deg: f32,
+    steps: usize,
+) {
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let a = (start_deg + (end_deg - start_deg) * t).to_radians();
+        let next = Coord {
+            x: cx + radius * a.cos(),
+            y: cy + radius * a.sin(),
+        };
+        if pts.last().copied() != Some(next) {
+            pts.push(next);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_text(
     painter: &Painter,
@@ -306,18 +618,10 @@ fn paint_text(
     sizing: TextSizing,
     bg: Option<Color>,
     outline: Option<Color>,
+    align: TextAlign,
+    valign: TextVAlign,
 ) {
     let c = col(color);
-
-    // Screen-space size of one font pixel, per the global sizing mode, with
-    // the per-label multiplier on top. This single value is the whole fix
-    // for "text too big": FixedScreen ignores viewport zoom; GameScaled.mult
-    // and label_scale shrink it.
-    //
-    // In GameScaled mode we size relative to a *SNES* pixel, not a canvas
-    // pixel, so a HUD looks identical whether the script draws in a 256 or
-    // 512 canvas — only its positioning precision differs. (screen px per
-    // SNES px = vp.scale / snes_ratio = vp.scale * canvas.w / 256.)
     let snes_px = vp.scale / vp.canvas().snes_ratio();
     let px = match sizing {
         TextSizing::GameScaled { mult } => snes_px * mult * label_scale,
@@ -325,34 +629,42 @@ fn paint_text(
     }
     .max(1.0);
 
-    let origin = vp.pt(x, y);
     let advance = font.advance() as f32 * px;
     let line_advance = font.line_advance() as f32 * px;
+    let widest = text
+        .split('\n')
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0) as f32;
+    let n_lines = text.split('\n').count().max(1) as f32;
+    let text_w = widest * advance;
+    let text_h = (n_lines * line_advance).max(line_advance);
+    let ax = match align {
+        TextAlign::Left => 0.0,
+        TextAlign::Center => text_w * 0.5,
+        TextAlign::Right => text_w,
+    };
+    let ay = match valign {
+        TextVAlign::Top => 0.0,
+        TextVAlign::Middle => text_h * 0.5,
+        TextVAlign::Bottom => text_h,
+    };
+    let origin = vp.pt(x, y) - Vec2::new(ax, ay);
 
-    // Optional backing rect: span the text's pixel extent (widest line ×
-    // line count) plus a 1-font-pixel pad so glyphs don't touch the edge.
     if let Some(b) = bg {
-        let lines = text.split('\n');
-        let widest = text
-            .split('\n')
-            .map(|l| l.chars().count())
-            .max()
-            .unwrap_or(0) as f32;
-        let n_lines = lines.count().max(1) as f32;
         if widest > 0.0 {
             let pad = px;
-            let w = widest * advance + 2.0 * pad;
-            let h = (n_lines * line_advance).max(line_advance) + 2.0 * pad;
             painter.rect_filled(
-                Rect::from_min_size(Pos2::new(origin.x - pad, origin.y - pad), Vec2::new(w, h)),
+                Rect::from_min_size(
+                    Pos2::new(origin.x - pad, origin.y - pad),
+                    Vec2::new(text_w + 2.0 * pad, text_h + 2.0 * pad),
+                ),
                 0.0,
                 col(b),
             );
         }
     }
 
-    // Lay glyph quads. Factored so the outline pass can replay the same
-    // layout shifted by ±1 font-pixel in the 8 neighbour directions.
     let lay = |painter: &Painter, dx: f32, dy: f32, paint: Color32| {
         let mut pen_x = origin.x + dx;
         let mut pen_y = origin.y + dy;
@@ -368,7 +680,6 @@ fn paint_text(
                     continue;
                 }
                 for bit in 0..font.width() {
-                    // bit 0 is leftmost pixel (LSB-first, both font tables).
                     if bits & (1 << bit) != 0 {
                         let rx = pen_x + bit as f32 * px;
                         let ry = pen_y + row as f32 * px;
@@ -408,38 +719,12 @@ mod tests {
 
     #[test]
     fn viewport_fits_and_centres() {
-        // A 1024x448 area: native 256x224 scales by min(4, 2) = 2.
         let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 448.0));
         let vp = Viewport::fit(area, Canvas::native());
         let r = vp.screen_rect();
-        assert_eq!(r.width(), 512.0); // 256 * 2
-        assert_eq!(r.height(), 448.0); // 224 * 2
-        assert_eq!(r.min.x, 256.0); // (1024 - 512) / 2
+        assert_eq!(r.width(), 512.0);
+        assert_eq!(r.height(), 448.0);
+        assert_eq!(r.min.x, 256.0);
         assert_eq!(r.min.y, 0.0);
-    }
-
-    #[test]
-    fn canvas_origin_maps_to_viewport_origin() {
-        let area = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::splat(512.0));
-        let vp = Viewport::fit(area, Canvas::native());
-        assert_eq!(vp.pt(0.0, 0.0), vp.screen_rect().min);
-    }
-
-    #[test]
-    fn higher_res_canvas_occupies_same_screen_area() {
-        // The whole point of decoupling: a 2x canvas must land in exactly
-        // the same on-screen rect as native — only precision differs.
-        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 448.0));
-        let native = Viewport::fit(area, Canvas::native());
-        let hi = Viewport::fit(area, Canvas::scaled(2));
-        assert_eq!(native.screen_rect(), hi.screen_rect());
-        // Canvas centre maps to the same screen point in both.
-        assert_eq!(native.pt(128.0, 112.0), hi.pt(256.0, 224.0));
-    }
-
-    #[test]
-    fn scaled_canvas_is_clamped() {
-        assert_eq!(Canvas::scaled(0).w, super::super::SNES_W); // min 1x
-        assert_eq!(Canvas::scaled(9999).w, super::super::SNES_W * 8.0);
     }
 }

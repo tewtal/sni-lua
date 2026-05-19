@@ -14,9 +14,7 @@ sni-lua-<version>-<os>-<arch>/
   examples/            runnable overlay scripts
 ```
 
-The verbatim upstream Super Hitbox source and the `examples/compat/` re-sync
-tooling are **excluded** — they're maintenance artifacts; users run the
-assembled `examples/super_hitbox_sni.lua`.
+Users run the `examples/super_hitbox_sni.lua` script natively.
 
 Archive format: `.zip` on Windows, `.tar.gz` on macOS/Linux. The binary is
 stripped (`strip = true` in the release profile) with thin LTO.

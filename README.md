@@ -183,41 +183,13 @@ Some capture cards expose only certain resolutions/FPS; when a requested
 input format is not available, the closest compatible decoded format is
 selected.
 
-### The ported Super Hitbox script
+### The Super Hitbox script
 
-`examples/super_hitbox_sni.lua` is a real 4500-line Super Metroid
-hitbox/route-assist script (originally a Mesen2 script) running natively over
-SNI. It is a **single hand-maintained file**: edit it (or the two adapter
-parts) directly.
+`examples/super_hitbox_sni.lua` is a fully featured, 4500-line Super Metroid hitbox and route-assist script running natively over SNI. 
 
-The script's body already abstracts every emulator touchpoint behind its own
-`xemu` table. A thin sni-lua-native **adapter** binds that table *directly* to
-sni-lua's async `snes`/`gfx` API — one honest SNES-CPU→memory-region address
-map and one colour conversion, no fake-`emu` indirection. The essential part
-is the *read-through cache*: the body reads synchronously thousands of times
-per frame, but sni-lua has no synchronous read (the FXPAK is latency-bound).
-The adapter turns each read into a cache lookup that, on a miss, lazily
-registers a watch — so within a few frames every address the script touches
-is batched by the poll engine automatically, and the synchronous-looking code
-"just works" on the async model.
-
-The adapter has two parts in `examples/compat/`
-(`super_hitbox_adapter.lua` = pre-CONFIG: address map, cache, reads/writes,
-tiers, minimal `emu`; `super_hitbox_adapter_part2.lua` = post-CONFIG: colour +
-draw + draw-surface). The body routes its bit ops through `xemu.*`, which the
-adapter points at LuaJIT's `bit.*`, so the body needs **no source patching**.
-`examples/compat/build_super_hitbox.lua` re-assembles the single file from
-`[adapter part 1] + [upstream CONFIG] + [adapter part 2] + [upstream body]`
-when you re-sync an upstream drop; it fails loudly if upstream moved a splice
-boundary.
-
-Part 2 also surfaces the most-used Any% Glitched toggles (RAM dashboard,
-route highlights, warnings, PLM/freeze, etc.) plus overlay opacity as `ui.*`
-controls, so they appear in the app's **Script** tab and can be flipped live
-without editing the file. Only settings the body reads fresh each frame are
-exposed; the block-viewer scale/layout (captured into body-locals once at
-load) stays file-edited. Defaults mirror the verbatim upstream `CONFIG`; the
-user's saved choices override on reload.
+It exposes a rich, async-optimized integration with Super Metroid:
+- **Read-Through Cache**: Operates cleanly within the script body by hitting a high-performance read-through cache backed by the `sni-cache` background poll engine, ensuring lag-free execution.
+- **Interactive Settings Panel**: Surfaces the most-used Any% Glitched toggles (RAM dashboard, route highlights, warnings, PLM/freeze, etc.) plus overlay opacity as `ui.*` controls, which appear dynamically in the app's **Script** tab and can be flipped live without editing the script file.
 
 ## Layout
 

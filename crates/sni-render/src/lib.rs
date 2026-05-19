@@ -18,6 +18,22 @@ pub use paint::{paint, TextSizing, Viewport};
 pub const SNES_W: f32 = 256.0;
 pub const SNES_H: f32 = 224.0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextVAlign {
+    #[default]
+    Top,
+    Middle,
+    Bottom,
+}
+
 /// The coordinate space scripts draw into. Independent of the on-screen size
 /// (the [`Viewport`] handles fitting this onto the capture area) and of
 /// render quality (supersampling). Default is native SNES; an integer scale
@@ -70,7 +86,7 @@ impl Canvas {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Color {
     pub r: u8,
     pub g: u8,
@@ -94,6 +110,37 @@ impl Color {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShadowSpec {
+    pub dx: f32,
+    pub dy: f32,
+    pub blur: f32,
+    pub spread: f32,
+    pub color: Color,
+}
+
+#[derive(Debug, Clone)]
+pub enum PathPrimitive {
+    Rect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
+    RoundRect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radius: f32,
+    },
+    Circle {
+        x: f32,
+        y: f32,
+        radius: f32,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub enum DrawCmd {
     Text {
@@ -112,6 +159,10 @@ pub enum DrawCmd {
         /// Optional 1px (font-pixel) outline around every glyph, drawn in
         /// the 8 neighbour offsets. Replaces the manual shadow trick.
         outline: Option<Color>,
+        /// Horizontal anchor for `(x, y)`.
+        align: TextAlign,
+        /// Vertical anchor for `(x, y)`.
+        valign: TextVAlign,
     },
     Rect {
         x: f32,
@@ -122,6 +173,18 @@ pub enum DrawCmd {
         /// `None` = outline only; `Some` = filled with this color.
         fill: Option<Color>,
         thickness: f32,
+        shadow: Option<ShadowSpec>,
+    },
+    RoundRect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radius: f32,
+        color: Color,
+        fill: Option<Color>,
+        thickness: f32,
+        shadow: Option<ShadowSpec>,
     },
     Line {
         x1: f32,
@@ -163,6 +226,33 @@ pub enum DrawCmd {
         points: Vec<(f32, f32)>,
         closed: bool,
         color: Color,
+        fill: Option<Color>,
+        thickness: f32,
+    },
+    GradientLine {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        start: Color,
+        end: Color,
+        thickness: f32,
+    },
+    GradientRect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radius: f32,
+        start: Color,
+        end: Color,
+        vertical: bool,
+        shadow: Option<ShadowSpec>,
+    },
+    /// Merge a set of closed primitives into one filled/stroked shape.
+    Path {
+        shapes: Vec<PathPrimitive>,
+        color: Option<Color>,
         fill: Option<Color>,
         thickness: f32,
     },

@@ -4,3 +4,4 @@
 *.pdb
 sni-lua.config.json
 .DS_Store
+.claude/

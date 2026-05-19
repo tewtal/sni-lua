@@ -18,7 +18,7 @@ pub type WatchId = u64;
 
 /// How often a watch is refreshed relative to others — the lever that spends
 /// the per-cycle bandwidth budget where it matters.
-/// Ordered most-urgent first so `max()` upgrades a watch correctly when a
+/// Ordered most-urgent first so `min()` upgrades a watch correctly when a
 /// script hints a higher tier for an address that's already registered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum WatchPriority {
