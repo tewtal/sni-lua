@@ -106,6 +106,12 @@ pub enum DrawCmd {
         scale: f32,
         /// Typeface for this label (script-selectable via `gfx.font`).
         font: Font,
+        /// Optional solid backing rect behind the text (1px font-pixel pad),
+        /// so a HUD reads over busy capture without a hand-rolled box.
+        bg: Option<Color>,
+        /// Optional 1px (font-pixel) outline around every glyph, drawn in
+        /// the 8 neighbour offsets. Replaces the manual shadow trick.
+        outline: Option<Color>,
     },
     Rect {
         x: f32,
@@ -129,6 +135,49 @@ pub enum DrawCmd {
         x: f32,
         y: f32,
         color: Color,
+    },
+    /// Circle centred at `(x, y)`. `fill` `None` = outline only.
+    Circle {
+        x: f32,
+        y: f32,
+        radius: f32,
+        color: Color,
+        fill: Option<Color>,
+        thickness: f32,
+    },
+    /// Triangle through three points. `fill` `None` = outline only.
+    Triangle {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        x3: f32,
+        y3: f32,
+        color: Color,
+        fill: Option<Color>,
+        thickness: f32,
+    },
+    /// Polyline / polygon through `points`. `closed` joins the last point
+    /// back to the first; `fill` (convex) requires `closed`.
+    Poly {
+        points: Vec<(f32, f32)>,
+        closed: bool,
+        color: Color,
+        fill: Option<Color>,
+        thickness: f32,
+    },
+    /// Circular arc centred at `(x, y)` from `start_deg` to `end_deg`
+    /// (clockwise, 0° = +x / east). A full 360° sweep is a ring; with
+    /// `fill` it's a pie slice (from the centre). Stroked along the arc.
+    Arc {
+        x: f32,
+        y: f32,
+        radius: f32,
+        start_deg: f32,
+        end_deg: f32,
+        color: Color,
+        fill: Option<Color>,
+        thickness: f32,
     },
 }
 

@@ -33,7 +33,6 @@ impl WriteSink for ActorWriteSink {
     }
 }
 
-
 fn capture_settings(config: &Config) -> sni_capture::CaptureSettings {
     sni_capture::CaptureSettings {
         width: config.capture_width,
@@ -108,11 +107,7 @@ fn section(ui: &mut egui::Ui, title: &str) {
 /// A settings row whose label occupies a fixed leading column so the widgets
 /// in a section line up vertically regardless of label length. The widget(s)
 /// are added by `add` to the right of the label.
-fn row<R>(
-    ui: &mut egui::Ui,
-    label: &str,
-    add: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
+fn row<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     ui.horizontal(|ui| {
         // Width tuned to the longest label in the panels ("Crop mode").
         let (rect, _) = ui.allocate_exact_size(
@@ -187,7 +182,7 @@ impl App {
             PollConfig {
                 frame_budget_ms: config.frame_budget_ms.max(1),
                 demand_window: std::time::Duration::from_millis(
-                    config.demand_window_ms.max(50) as u64,
+                    config.demand_window_ms.max(50) as u64
                 ),
                 ..PollConfig::default()
             }, // (App::poll_config mirrors this; kept inline pre-construction)
@@ -266,12 +261,15 @@ impl App {
                 // Bind the persistent store to this script *before* loading,
                 // so `on_init` can already read saved state.
                 let script_path = std::path::PathBuf::from(&path);
-                self.host
-                    .bind_store(Config::store_path_for(&script_path));
+                self.host.bind_store(Config::store_path_for(&script_path));
                 match self.host.load_script(&src, &name) {
                     Ok(()) => {
                         self.status = format!("Loaded script: {name}");
                         self.config.last_script = Some(script_path);
+                        if let Some(req) = self.host.requested_text_sizing() {
+                            self.config.text_sizing_mode = req.mode;
+                            self.config.text_size = req.size.clamp(0.3, 4.0);
+                        }
                         self.config.save();
                         // Jump to the script's settings panel if it declared
                         // one, so its options are immediately visible. Don't
@@ -363,9 +361,7 @@ impl App {
                                 ui.end_row();
                             }
                             Control::Label { text } => {
-                                ui.label(
-                                    egui::RichText::new(text.as_str()).small().weak(),
-                                );
+                                ui.label(egui::RichText::new(text.as_str()).small().weak());
                                 ui.end_row();
                             }
                             Control::Checkbox { label, value, .. } => {
@@ -383,8 +379,7 @@ impl App {
                                 ui.label(label.as_str());
                                 // Whole-number bounds read as an integer
                                 // slider; otherwise show 2 decimals.
-                                let whole =
-                                    min.fract() == 0.0 && max.fract() == 0.0;
+                                let whole = min.fract() == 0.0 && max.fract() == 0.0;
                                 let mut s = egui::Slider::new(value, *min..=*max);
                                 s = if whole {
                                     s.integer()
@@ -397,10 +392,7 @@ impl App {
                             Control::Text { label, value, .. } => {
                                 ui.label(label.as_str());
                                 changed |= ui
-                                    .add(
-                                        egui::TextEdit::singleline(value)
-                                            .desired_width(160.0),
-                                    )
+                                    .add(egui::TextEdit::singleline(value).desired_width(160.0))
                                     .changed();
                                 ui.end_row();
                             }
@@ -412,12 +404,8 @@ impl App {
                                 let r = (*value >> 16) as u8;
                                 let g = (*value >> 8) as u8;
                                 let b = *value as u8;
-                                let mut col =
-                                    egui::Color32::from_rgba_unmultiplied(r, g, b, a);
-                                if ui
-                                    .color_edit_button_srgba(&mut col)
-                                    .changed()
-                                {
+                                let mut col = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+                                if ui.color_edit_button_srgba(&mut col).changed() {
                                     let [r, g, b, a] = col.to_array();
                                     *value = ((a as u32) << 24)
                                         | ((r as u32) << 16)
@@ -435,28 +423,20 @@ impl App {
                             } => {
                                 ui.label(label.as_str());
                                 let id = label.clone();
-                                let cur = options
-                                    .get(*value)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                egui::ComboBox::from_id_salt(id)
-                                    .selected_text(cur)
-                                    .show_ui(ui, |ui| {
+                                let cur = options.get(*value).cloned().unwrap_or_default();
+                                egui::ComboBox::from_id_salt(id).selected_text(cur).show_ui(
+                                    ui,
+                                    |ui| {
                                         for (i, opt) in options.iter().enumerate() {
                                             changed |= ui
-                                                .selectable_value(
-                                                    value,
-                                                    i,
-                                                    opt.as_str(),
-                                                )
+                                                .selectable_value(value, i, opt.as_str())
                                                 .changed();
                                         }
-                                    });
+                                    },
+                                );
                                 ui.end_row();
                             }
-                            Control::Button {
-                                label, pressed, ..
-                            } => {
+                            Control::Button { label, pressed, .. } => {
                                 if ui.button(label.as_str()).clicked() {
                                     *pressed = true;
                                 }
@@ -506,7 +486,7 @@ impl App {
         PollConfig {
             frame_budget_ms: self.config.frame_budget_ms.max(1),
             demand_window: std::time::Duration::from_millis(
-                self.config.demand_window_ms.max(50) as u64,
+                self.config.demand_window_ms.max(50) as u64
             ),
             ..PollConfig::default()
         }
@@ -1030,7 +1010,8 @@ impl eframe::App for App {
                 hint(
                     ui,
                     "Scripts default to the compact 5x7 font; \
-                     gfx.font(\"normal\") selects the larger 8x8.",
+                     gfx.font(\"normal\") selects the larger 8x8. \
+                     A loaded script may seed this setting with gfx.text_sizing.",
                 );
 
                 ui.add_space(6.0);
@@ -1608,21 +1589,14 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         ui.heading("Console");
                         let n = self.console.lines.lock().len();
-                        ui.label(
-                            egui::RichText::new(format!("{n} lines"))
-                                .small()
-                                .weak(),
-                        );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui.button("Clear").clicked() {
-                                    self.console.lines.lock().clear();
-                                }
-                                ui.checkbox(&mut self.show_console, "")
-                                    .on_hover_text("Hide console");
-                            },
-                        );
+                        ui.label(egui::RichText::new(format!("{n} lines")).small().weak());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Clear").clicked() {
+                                self.console.lines.lock().clear();
+                            }
+                            ui.checkbox(&mut self.show_console, "")
+                                .on_hover_text("Hide console");
+                        });
                     });
                     ui.separator();
                     let lines = self.console.snapshot();
@@ -1632,10 +1606,8 @@ impl eframe::App for App {
                         .show(ui, |ui| {
                             for l in &lines {
                                 ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(l).monospace().size(12.0),
-                                    )
-                                    .wrap(),
+                                    egui::Label::new(egui::RichText::new(l).monospace().size(12.0))
+                                        .wrap(),
                                 );
                             }
                         });
@@ -1697,6 +1669,9 @@ impl eframe::App for App {
 
     fn on_exit(&mut self) {
         self.config.save();
+        // Let the script clean up (its on_unload may stage a final
+        // store.save) BEFORE the last flush so that write actually lands.
+        self.host.unload();
         self.host.store().flush_if_dirty();
     }
 }

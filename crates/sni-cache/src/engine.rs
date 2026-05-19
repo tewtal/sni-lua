@@ -300,12 +300,9 @@ pub fn spawn(
                 if elapsed_ms >= frame_ms {
                     break;
                 }
-                let Some(iter_budget) = budget_for_remaining_time(
-                    budget,
-                    throughput,
-                    elapsed_ms,
-                    frame_ms,
-                ) else {
+                let Some(iter_budget) =
+                    budget_for_remaining_time(budget, throughput, elapsed_ms, frame_ms)
+                else {
                     break;
                 };
 

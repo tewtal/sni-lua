@@ -54,14 +54,10 @@ pub struct Viewport {
 impl Viewport {
     /// Fit `canvas` inside `area`, preserving aspect ratio.
     pub fn fit(area: Rect, canvas: Canvas) -> Self {
-        let scale =
-            (area.width() / canvas.w).min(area.height() / canvas.h);
+        let scale = (area.width() / canvas.w).min(area.height() / canvas.h);
         let w = canvas.w * scale;
         let h = canvas.h * scale;
-        let origin = Pos2::new(
-            area.center().x - w * 0.5,
-            area.center().y - h * 0.5,
-        );
+        let origin = Pos2::new(area.center().x - w * 0.5, area.center().y - h * 0.5);
         Self {
             origin,
             scale,
@@ -89,7 +85,10 @@ impl Viewport {
 
     #[inline]
     fn pt(&self, x: f32, y: f32) -> Pos2 {
-        Pos2::new(self.origin.x + x * self.scale, self.origin.y + y * self.scale)
+        Pos2::new(
+            self.origin.x + x * self.scale,
+            self.origin.y + y * self.scale,
+        )
     }
 
     #[inline]
@@ -107,12 +106,7 @@ impl Viewport {
 /// many scripts deliberately over-draw the edges (e.g. a one-block margin on
 /// a block grid) expecting that clip. Without it the overscan spills into the
 /// letterbox / app chrome — and a buggy script could scribble anywhere.
-pub fn paint(
-    painter: &Painter,
-    vp: &Viewport,
-    list: &DrawList,
-    sizing: TextSizing,
-) {
+pub fn paint(painter: &Painter, vp: &Viewport, list: &DrawList, sizing: TextSizing) {
     // Constrain everything below to the canvas viewport.
     let painter = &painter.with_clip_rect(vp.screen_rect());
     for cmd in &list.cmds {
@@ -124,8 +118,10 @@ pub fn paint(
                 color,
                 scale,
                 font,
+                bg,
+                outline,
             } => paint_text(
-                painter, vp, *x, *y, text, *color, *scale, *font, sizing,
+                painter, vp, *x, *y, text, *color, *scale, *font, sizing, *bg, *outline,
             ),
 
             DrawCmd::Rect {
@@ -137,10 +133,7 @@ pub fn paint(
                 fill,
                 thickness,
             } => {
-                let r = Rect::from_min_size(
-                    vp.pt(*x, *y),
-                    Vec2::new(vp.len(*w), vp.len(*h)),
-                );
+                let r = Rect::from_min_size(vp.pt(*x, *y), Vec2::new(vp.len(*w), vp.len(*h)));
                 if let Some(f) = fill {
                     painter.rect_filled(r, 0.0, col(*f));
                 }
@@ -168,11 +161,114 @@ pub fn paint(
             DrawCmd::Pixel { x, y, color } => {
                 // One SNES pixel = one scaled quad, so it stays visible when
                 // zoomed up over the capture.
-                let r = Rect::from_min_size(
-                    vp.pt(*x, *y),
-                    Vec2::splat(vp.scale.max(1.0)),
-                );
+                let r = Rect::from_min_size(vp.pt(*x, *y), Vec2::splat(vp.scale.max(1.0)));
                 painter.rect_filled(r, 0.0, col(*color));
+            }
+
+            DrawCmd::Circle {
+                x,
+                y,
+                radius,
+                color,
+                fill,
+                thickness,
+            } => {
+                let c = vp.pt(*x, *y);
+                let r = vp.len(*radius);
+                if let Some(f) = fill {
+                    painter.circle_filled(c, r, col(*f));
+                }
+                painter.circle_stroke(c, r, Stroke::new(vp.len(*thickness).max(1.0), col(*color)));
+            }
+
+            DrawCmd::Triangle {
+                x1,
+                y1,
+                x2,
+                y2,
+                x3,
+                y3,
+                color,
+                fill,
+                thickness,
+            } => {
+                let p = [vp.pt(*x1, *y1), vp.pt(*x2, *y2), vp.pt(*x3, *y3)];
+                if let Some(f) = fill {
+                    // Filled convex triangle as a single egui mesh path.
+                    painter.add(egui::Shape::convex_polygon(
+                        p.to_vec(),
+                        col(*f),
+                        Stroke::NONE,
+                    ));
+                }
+                let s = Stroke::new(vp.len(*thickness).max(1.0), col(*color));
+                painter.add(egui::Shape::closed_line(p.to_vec(), s));
+            }
+
+            DrawCmd::Poly {
+                points,
+                closed,
+                color,
+                fill,
+                thickness,
+            } => {
+                if points.len() < 2 {
+                    continue;
+                }
+                let p: Vec<Pos2> = points.iter().map(|(x, y)| vp.pt(*x, *y)).collect();
+                let s = Stroke::new(vp.len(*thickness).max(1.0), col(*color));
+                if *closed {
+                    if let Some(f) = fill {
+                        // Convex-fill assumption matches gfx.triangle; a
+                        // concave polygon still strokes correctly.
+                        painter.add(egui::Shape::convex_polygon(
+                            p.clone(),
+                            col(*f),
+                            Stroke::NONE,
+                        ));
+                    }
+                    painter.add(egui::Shape::closed_line(p, s));
+                } else {
+                    painter.add(egui::Shape::line(p, s));
+                }
+            }
+
+            DrawCmd::Arc {
+                x,
+                y,
+                radius,
+                start_deg,
+                end_deg,
+                color,
+                fill,
+                thickness,
+            } => {
+                let centre = vp.pt(*x, *y);
+                let r = vp.len(*radius);
+                // Tessellate the sweep. Step ~ every few degrees, scaled a
+                // little by radius so big arcs stay smooth; clamped so a
+                // tiny/huge arc doesn't under/over-tessellate.
+                let sweep = (*end_deg - *start_deg).abs();
+                let steps = ((sweep / 6.0).ceil() as usize)
+                    .clamp(2, 180)
+                    .max((r / 8.0) as usize)
+                    .min(360);
+                let mut pts: Vec<Pos2> = Vec::with_capacity(steps + 2);
+                for i in 0..=steps {
+                    let t = i as f32 / steps as f32;
+                    // Clockwise, 0° = +x: screen y grows downward, so +sin.
+                    let a = (start_deg + (end_deg - start_deg) * t).to_radians();
+                    pts.push(Pos2::new(centre.x + r * a.cos(), centre.y + r * a.sin()));
+                }
+                let s = Stroke::new(vp.len(*thickness).max(1.0), col(*color));
+                if let Some(f) = fill {
+                    // Pie slice: fan from the centre through the arc points.
+                    let mut poly = Vec::with_capacity(pts.len() + 1);
+                    poly.push(centre);
+                    poly.extend_from_slice(&pts);
+                    painter.add(egui::Shape::convex_polygon(poly, col(*f), Stroke::NONE));
+                }
+                painter.add(egui::Shape::line(pts, s));
             }
         }
     }
@@ -193,6 +289,8 @@ fn paint_text(
     label_scale: f32,
     font: Font,
     sizing: TextSizing,
+    bg: Option<Color>,
+    outline: Option<Color>,
 ) {
     let c = col(color);
 
@@ -213,40 +311,80 @@ fn paint_text(
     .max(1.0);
 
     let origin = vp.pt(x, y);
-    let mut pen_x = origin.x;
-    let mut pen_y = origin.y;
     let advance = font.advance() as f32 * px;
     let line_advance = font.line_advance() as f32 * px;
 
-    for ch in text.chars() {
-        if ch == '\n' {
-            pen_x = origin.x;
-            pen_y += line_advance;
-            continue;
+    // Optional backing rect: span the text's pixel extent (widest line ×
+    // line count) plus a 1-font-pixel pad so glyphs don't touch the edge.
+    if let Some(b) = bg {
+        let lines = text.split('\n');
+        let widest = text
+            .split('\n')
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0) as f32;
+        let n_lines = lines.count().max(1) as f32;
+        if widest > 0.0 {
+            let pad = px;
+            let w = widest * advance + 2.0 * pad;
+            let h = (n_lines * line_advance).max(line_advance) + 2.0 * pad;
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(origin.x - pad, origin.y - pad), Vec2::new(w, h)),
+                0.0,
+                col(b),
+            );
         }
-        let g = font.glyph(ch);
-        for (row, bits) in g.iter().enumerate() {
-            if *bits == 0 {
+    }
+
+    // Lay glyph quads. Factored so the outline pass can replay the same
+    // layout shifted by ±1 font-pixel in the 8 neighbour directions.
+    let lay = |painter: &Painter, dx: f32, dy: f32, paint: Color32| {
+        let mut pen_x = origin.x + dx;
+        let mut pen_y = origin.y + dy;
+        for ch in text.chars() {
+            if ch == '\n' {
+                pen_x = origin.x + dx;
+                pen_y += line_advance;
                 continue;
             }
-            for bit in 0..font.width() {
-                // bit 0 is leftmost pixel (LSB-first, both font tables).
-                if bits & (1 << bit) != 0 {
-                    let rx = pen_x + bit as f32 * px;
-                    let ry = pen_y + row as f32 * px;
-                    painter.rect_filled(
-                        Rect::from_min_size(
-                            Pos2::new(rx, ry),
-                            Vec2::splat(px),
-                        ),
-                        0.0,
-                        c,
-                    );
+            let g = font.glyph(ch);
+            for (row, bits) in g.iter().enumerate() {
+                if *bits == 0 {
+                    continue;
+                }
+                for bit in 0..font.width() {
+                    // bit 0 is leftmost pixel (LSB-first, both font tables).
+                    if bits & (1 << bit) != 0 {
+                        let rx = pen_x + bit as f32 * px;
+                        let ry = pen_y + row as f32 * px;
+                        painter.rect_filled(
+                            Rect::from_min_size(Pos2::new(rx, ry), Vec2::splat(px)),
+                            0.0,
+                            paint,
+                        );
+                    }
                 }
             }
+            pen_x += advance;
         }
-        pen_x += advance;
+    };
+
+    if let Some(o) = outline {
+        let oc = col(o);
+        for (dx, dy) in [
+            (-px, -px),
+            (0.0, -px),
+            (px, -px),
+            (-px, 0.0),
+            (px, 0.0),
+            (-px, px),
+            (0.0, px),
+            (px, px),
+        ] {
+            lay(painter, dx, dy, oc);
+        }
     }
+    lay(painter, 0.0, 0.0, c);
 }
 
 #[cfg(test)]
@@ -267,8 +405,7 @@ mod tests {
 
     #[test]
     fn canvas_origin_maps_to_viewport_origin() {
-        let area =
-            Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::splat(512.0));
+        let area = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::splat(512.0));
         let vp = Viewport::fit(area, Canvas::native());
         assert_eq!(vp.pt(0.0, 0.0), vp.screen_rect().min);
     }

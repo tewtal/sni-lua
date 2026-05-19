@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -160,10 +161,18 @@ pub struct HttpBridge {
     req_tx: mpsc::UnboundedSender<HttpRequest>,
     pub resp_rx: Mutex<mpsc::UnboundedReceiver<HttpResponse>>,
     next_id: Mutex<u64>,
+    /// In-flight request count. Caps concurrency so a script looping
+    /// `http.get` can't spawn unbounded tasks / sockets. Incremented in
+    /// `submit`, decremented by the worker when the response is dispatched.
+    in_flight: AtomicUsize,
     /// Pending Lua callbacks keyed by request id. `mlua` values aren't `Send`,
     /// so callbacks live here on the UI thread, never crossing to Tokio.
     pub pending: Mutex<HashMap<u64, mlua::RegistryKey>>,
 }
+
+/// Max simultaneous in-flight HTTP requests. Generous for REST polling,
+/// low enough that a runaway script is bounded.
+pub const HTTP_MAX_IN_FLIGHT: usize = 16;
 
 impl HttpBridge {
     /// Spawn the HTTP worker on the *current* Tokio runtime. Must be called
@@ -172,6 +181,17 @@ impl HttpBridge {
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<HttpRequest>();
         let (resp_tx, resp_rx) = mpsc::unbounded_channel::<HttpResponse>();
 
+        let bridge = Arc::new(Self {
+            req_tx,
+            resp_rx: Mutex::new(resp_rx),
+            next_id: Mutex::new(1),
+            in_flight: AtomicUsize::new(0),
+            pending: Mutex::new(HashMap::new()),
+        });
+
+        // The worker decrements the in-flight count as each request finishes;
+        // give it a handle to do so.
+        let counter = bridge.clone();
         tokio::spawn(async move {
             let client = match reqwest::Client::builder()
                 .user_agent(concat!("sni-lua/", env!("CARGO_PKG_VERSION")))
@@ -186,6 +206,7 @@ impl HttpBridge {
             while let Some(req) = req_rx.recv().await {
                 let client = client.clone();
                 let resp_tx = resp_tx.clone();
+                let counter = counter.clone();
                 // One task per request so a slow endpoint can't head-of-line
                 // block other in-flight calls.
                 tokio::spawn(async move {
@@ -193,22 +214,27 @@ impl HttpBridge {
                         id: req.id,
                         result: execute(&client, req).await,
                     };
+                    counter.in_flight.fetch_sub(1, Ordering::Relaxed);
                     let _ = resp_tx.send(resp);
                 });
             }
         });
 
-        Arc::new(Self {
-            req_tx,
-            resp_rx: Mutex::new(resp_rx),
-            next_id: Mutex::new(1),
-            pending: Mutex::new(HashMap::new()),
-        })
+        bridge
     }
 
-    /// Allocate an id and enqueue a request. The id is returned so the host
-    /// can stash the Lua callback under it before any response can arrive.
-    pub fn submit(&self, mut req: HttpRequest) -> u64 {
+    /// Allocate an id and enqueue a request. Returns `None` (request dropped)
+    /// if the concurrency cap is already reached, so the host can warn the
+    /// script instead of growing tasks without bound. On success the id is
+    /// returned so the host can stash the Lua callback under it before any
+    /// response can arrive.
+    pub fn submit(&self, mut req: HttpRequest) -> Option<u64> {
+        // Reserve a slot atomically; back out if we'd exceed the cap.
+        let prev = self.in_flight.fetch_add(1, Ordering::Relaxed);
+        if prev >= HTTP_MAX_IN_FLIGHT {
+            self.in_flight.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
         let id = {
             let mut n = self.next_id.lock();
             let id = *n;
@@ -216,10 +242,12 @@ impl HttpBridge {
             id
         };
         req.id = id;
-        // Send failure only if the worker died; the response simply never
-        // arrives, the callback is dropped on script reload. Acceptable.
-        let _ = self.req_tx.send(req);
-        id
+        if self.req_tx.send(req).is_err() {
+            // Worker is gone; release the slot we reserved.
+            self.in_flight.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(id)
     }
 }
 

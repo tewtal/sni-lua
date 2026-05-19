@@ -74,9 +74,19 @@ impl Snapshot {
             .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    /// Signed 8-bit.
+    pub fn i8(&self, id: WatchId) -> Option<i8> {
+        self.u8(id).map(|v| v as i8)
+    }
+
     /// Signed 16-bit — SNES coordinates/velocities are frequently signed.
     pub fn i16(&self, id: WatchId) -> Option<i16> {
         self.u16(id).map(|v| v as i16)
+    }
+
+    /// Signed 32-bit.
+    pub fn i32(&self, id: WatchId) -> Option<i32> {
+        self.u32(id).map(|v| v as i32)
     }
 }
 

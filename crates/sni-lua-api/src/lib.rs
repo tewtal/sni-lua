@@ -80,6 +80,46 @@ impl WriteSink for NullWriteSink {
     fn queue_write(&self, _region: MemRegion, _data: Vec<u8>) {}
 }
 
+/// Script-requested app text sizing. The app applies this once after load as
+/// an initial default; users can still adjust the Overlay controls afterwards.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextSizingRequest {
+    pub mode: String,
+    pub size: f32,
+}
+
+/// Backs the `time.*` table. `Cell`s because access is single-threaded
+/// (UI thread). `frame_start` is updated each `run_frame`; the gap to the
+/// previous one is `dt`.
+struct TimeState {
+    start: std::time::Instant,
+    frame: Cell<u64>,
+    frame_start: Cell<std::time::Instant>,
+    dt: Cell<f64>,
+}
+
+impl TimeState {
+    fn new() -> Rc<Self> {
+        let now = std::time::Instant::now();
+        Rc::new(Self {
+            start: now,
+            frame: Cell::new(0),
+            frame_start: Cell::new(now),
+            dt: Cell::new(0.0),
+        })
+    }
+
+    /// Advance one frame: bump the counter and measure the gap since the
+    /// previous frame for `time.dt()`.
+    fn tick(&self) {
+        let now = std::time::Instant::now();
+        self.dt
+            .set(now.duration_since(self.frame_start.get()).as_secs_f64());
+        self.frame_start.set(now);
+        self.frame.set(self.frame.get() + 1);
+    }
+}
+
 /// Captured `print()` / error output for the in-app console.
 #[derive(Default)]
 pub struct Console {
@@ -120,6 +160,17 @@ pub struct ScriptHost {
     /// reads this each frame to build the viewport (and may override it with
     /// a user setting). Shared so `gfx.width()`/`height()` and the app agree.
     requested_canvas: Rc<Cell<Canvas>>,
+    /// Optional text sizing default requested by the script at load time.
+    /// The app reads this after `load_script` and seeds its Overlay controls.
+    requested_text_sizing: Rc<RefCell<Option<TextSizingRequest>>>,
+    /// `gfx.push_origin`/`pop_origin` translate stack. Coords are absolute
+    /// SNES space, so a translate is just an offset added at emit time —
+    /// resolved here, the renderer stays origin-agnostic. The current origin
+    /// is the last entry (0,0 when empty). Reset at the top of every frame.
+    origin_stack: Rc<RefCell<Vec<(f32, f32)>>>,
+    /// Frame timing for the `time.*` table. `start` is script-load instant;
+    /// `frame` increments per `run_frame`; `last_frame` feeds `time.dt()`.
+    time: Rc<TimeState>,
     /// Controls the script declared via `ui.*`. The app renders these and
     /// writes user edits back into the same values the script reads with
     /// `ui.get`. `Rc<RefCell>` — single-threaded, captured into Lua closures.
@@ -165,6 +216,9 @@ impl ScriptHost {
             draw: Rc::new(RefCell::new(DrawList::default())),
             current_font: Rc::new(Cell::new(Font::default())),
             requested_canvas: Rc::new(Cell::new(Canvas::default())),
+            requested_text_sizing: Rc::new(RefCell::new(None)),
+            origin_stack: Rc::new(RefCell::new(Vec::new())),
+            time: TimeState::new(),
             controls: Controls::shared(),
             store: Store::new(),
             http,
@@ -279,7 +333,47 @@ impl ScriptHost {
         reader!("u16", u16, i64);
         reader!("u24", u24, i64);
         reader!("u32", u32, i64);
+        reader!("i8", i8, i64);
         reader!("i16", i16, i64);
+        reader!("i32", i32, i64);
+
+        // snes.buttons(watch_id) -> decoded SNES controller table, or nil
+        // until the watch has data. The script registers a 2-byte watch on
+        // whatever address holds the joypad state for its game (e.g. the SM
+        // mirror $7E:008B) and tiers it "realtime"; this just decodes the
+        // standard 16-bit SNES pad layout into named fields:
+        //
+        //   bit 15..8 : B Y Select Start Up Down Left Right
+        //   bit  7..4 : A X L R
+        //
+        // Returns booleans plus `.raw` (the u16) so a script can also do
+        // edge detection itself (compare against last frame's `.raw`).
+        {
+            let engine = self.engine.clone();
+            let f = self.lua.create_function(move |lua, id: u64| {
+                engine.registry().touch(id);
+                let Some(v) = engine.snapshot().u16(id) else {
+                    return Ok(Value::Nil);
+                };
+                let t = lua.create_table()?;
+                let bit = |b: u32| (v & (1 << b)) != 0;
+                t.set("B", bit(15))?;
+                t.set("Y", bit(14))?;
+                t.set("Select", bit(13))?;
+                t.set("Start", bit(12))?;
+                t.set("Up", bit(11))?;
+                t.set("Down", bit(10))?;
+                t.set("Left", bit(9))?;
+                t.set("Right", bit(8))?;
+                t.set("A", bit(7))?;
+                t.set("X", bit(6))?;
+                t.set("L", bit(5))?;
+                t.set("R", bit(4))?;
+                t.set("raw", v)?;
+                Ok(Value::Table(t))
+            })?;
+            snes.set("buttons", f)?;
+        }
 
         // snes.bytes(id) -> { b0, b1, ... } or nil
         {
@@ -352,32 +446,123 @@ impl ScriptHost {
         // --- gfx table (pushes into the per-frame draw list) ---
         let gfx = self.lua.create_table()?;
 
-        // gfx.text(x, y, str, color?, scale?)
+        // Current translate from the push_origin stack (0,0 if empty). Every
+        // primitive offsets its coords by this, so a script can draw a whole
+        // group in local coords and place it once.
+        let origin = self.origin_stack.clone();
+        let offset =
+            move || -> (f32, f32) { origin.borrow().last().copied().unwrap_or((0.0, 0.0)) };
+
+        // gfx.text(x, y, str, color?, opts?)
+        //
+        // `opts` is either a number (the per-label scale — the original
+        // signature, kept working) or a table:
+        //   { scale = n, bg = 0xAARRGGBB, outline = 0xAARRGGBB }
+        // `bg` draws a solid backing rect (auto-sized, 1px pad); `outline`
+        // draws a 1px halo around every glyph (replaces the manual shadow
+        // double-draw scripts used to do).
         {
             let draw = self.draw.clone();
             let cur_font = self.current_font.clone();
+            let off = offset.clone();
             let f =
                 self.lua.create_function(
                     move |_,
-                          (x, y, text, color, scale): (
+                          (x, y, text, color, opts): (
                         f32,
                         f32,
                         String,
                         Option<u32>,
-                        Option<f32>,
+                        Option<Value>,
                     )| {
+                        let (mut scale, mut bg, mut outline) = (1.0, None, None);
+                        match opts {
+                            Some(Value::Number(n)) => scale = n as f32,
+                            Some(Value::Integer(n)) => scale = n as f32,
+                            Some(Value::Table(t)) => {
+                                if let Ok(s) = t.get::<f32>("scale") {
+                                    if s > 0.0 {
+                                        scale = s;
+                                    }
+                                }
+                                if let Ok(c) = t.get::<u32>("bg") {
+                                    bg = Some(Color::from_argb(c));
+                                }
+                                if let Ok(c) = t.get::<u32>("outline") {
+                                    outline = Some(Color::from_argb(c));
+                                }
+                            }
+                            _ => {}
+                        }
+                        let (ox, oy) = off();
                         draw.borrow_mut().push(DrawCmd::Text {
-                            x,
-                            y,
+                            x: x + ox,
+                            y: y + oy,
                             text,
                             color: argb(color, 0xFFFFFFFF),
-                            scale: scale.unwrap_or(1.0),
+                            scale,
                             font: cur_font.get(),
+                            bg,
+                            outline,
                         });
                         Ok(())
                     },
                 )?;
             gfx.set("text", f)?;
+        }
+
+        // gfx.text_width(str) / gfx.text_height() — pixel size of a string in
+        // the *current* font's coordinate space (before viewport scaling), so
+        // scripts can centre/right-align without hardcoding glyph widths.
+        // Multi-line aware: width = widest line, height = line count * advance.
+        {
+            let cur_font = self.current_font.clone();
+            let f = self.lua.create_function(move |_, s: String| {
+                let fnt = cur_font.get();
+                let adv = fnt.advance() as f32;
+                let widest = s
+                    .split('\n')
+                    .map(|line| line.chars().count())
+                    .max()
+                    .unwrap_or(0) as f32;
+                Ok(widest * adv)
+            })?;
+            gfx.set("text_width", f)?;
+        }
+        {
+            let cur_font = self.current_font.clone();
+            let f = self.lua.create_function(move |_, s: Option<String>| {
+                let fnt = cur_font.get();
+                let lines = s
+                    .as_deref()
+                    .map(|t| t.split('\n').count())
+                    .unwrap_or(1)
+                    .max(1) as f32;
+                Ok(lines * fnt.line_advance() as f32)
+            })?;
+            gfx.set("text_height", f)?;
+        }
+
+        // gfx.push_origin(x, y) / gfx.pop_origin() — translate stack. Nested
+        // pushes accumulate (child origin is parent + local). The stack is
+        // cleared at the top of every frame so a missing pop can't leak.
+        {
+            let origin = self.origin_stack.clone();
+            let f = self.lua.create_function(move |_, (x, y): (f32, f32)| {
+                let mut st = origin.borrow_mut();
+                let (px, py) = st.last().copied().unwrap_or((0.0, 0.0));
+                st.push((px + x, py + y));
+                Ok(())
+            })?;
+            gfx.set("push_origin", f)?;
+        }
+        {
+            let origin = self.origin_stack.clone();
+            let f = self.lua.create_function(move |_, ()| {
+                origin.borrow_mut().pop();
+                Ok(())
+            })?;
+            gfx.set("pop_origin", f)?;
         }
 
         // gfx.font("small"|"normal") — selects the typeface for subsequent
@@ -390,6 +575,38 @@ impl ScriptHost {
                 Ok(())
             })?;
             gfx.set("font", f)?;
+        }
+
+        // gfx.text_sizing("game"|"screen", size) — request the app's
+        // Overlay text defaults when this script loads. This is intentionally
+        // separate from per-label `scale`: scripts use this for a sane initial
+        // global fit, and users may still adjust the app controls afterwards.
+        {
+            let requested = self.requested_text_sizing.clone();
+            let f = self
+                .lua
+                .create_function(move |_, (mode, size): (String, f32)| {
+                    if !size.is_finite() || size <= 0.0 {
+                        return Err(mlua::Error::external(
+                            "gfx.text_sizing size must be a positive number",
+                        ));
+                    }
+                    let mode = match mode.as_str() {
+                        "game" | "game_scaled" | "game-scaled" | "scaled" => "game",
+                        "screen" | "fixed" | "fixed_screen" | "fixed-screen" => "screen",
+                        _ => {
+                            return Err(mlua::Error::external(
+                                "gfx.text_sizing mode must be \"game\" or \"screen\"",
+                            ))
+                        }
+                    };
+                    *requested.borrow_mut() = Some(TextSizingRequest {
+                        mode: mode.to_string(),
+                        size: size.clamp(0.1, 8.0),
+                    });
+                    Ok(())
+                })?;
+            gfx.set("text_sizing", f)?;
         }
 
         // gfx.canvas(w, h) — request a custom coordinate space. The app may
@@ -432,6 +649,7 @@ impl ScriptHost {
         // fill. The bread-and-butter hitbox primitive.
         {
             let draw = self.draw.clone();
+            let off = offset.clone();
             let f = self.lua.create_function(
                 move |_,
                       (x, y, w, h, color, fill, thickness): (
@@ -443,13 +661,14 @@ impl ScriptHost {
                     Option<u32>,
                     Option<f32>,
                 )| {
+                    let (ox, oy) = off();
                     draw.borrow_mut().push(DrawCmd::Rect {
-                        x,
-                        y,
+                        x: x + ox,
+                        y: y + oy,
                         w,
                         h,
                         color: argb(color, 0xFF00FF00),
-                        fill: fill.map(|c| Color::from_argb(c)),
+                        fill: fill.map(Color::from_argb),
                         thickness: thickness.unwrap_or(1.0),
                     });
                     Ok(())
@@ -461,6 +680,7 @@ impl ScriptHost {
         // gfx.line(x1, y1, x2, y2, color?, thickness?)
         {
             let draw = self.draw.clone();
+            let off = offset.clone();
             let f = self.lua.create_function(
                 move |_,
                       (x1, y1, x2, y2, color, thickness): (
@@ -471,11 +691,12 @@ impl ScriptHost {
                     Option<u32>,
                     Option<f32>,
                 )| {
+                    let (ox, oy) = off();
                     draw.borrow_mut().push(DrawCmd::Line {
-                        x1,
-                        y1,
-                        x2,
-                        y2,
+                        x1: x1 + ox,
+                        y1: y1 + oy,
+                        x2: x2 + ox,
+                        y2: y2 + oy,
                         color: argb(color, 0xFFFFFFFF),
                         thickness: thickness.unwrap_or(1.0),
                     });
@@ -488,17 +709,158 @@ impl ScriptHost {
         // gfx.pixel(x, y, color?)
         {
             let draw = self.draw.clone();
+            let off = offset.clone();
             let f =
                 self.lua
                     .create_function(move |_, (x, y, color): (f32, f32, Option<u32>)| {
+                        let (ox, oy) = off();
                         draw.borrow_mut().push(DrawCmd::Pixel {
-                            x,
-                            y,
+                            x: x + ox,
+                            y: y + oy,
                             color: argb(color, 0xFFFFFFFF),
                         });
                         Ok(())
                     })?;
             gfx.set("pixel", f)?;
+        }
+
+        // gfx.circle(x, y, radius, color?, fill?, thickness?) — (x,y) is the
+        // centre. Handy for radii / range indicators.
+        {
+            let draw = self.draw.clone();
+            let off = offset.clone();
+            let f = self.lua.create_function(
+                move |_,
+                      (x, y, radius, color, fill, thickness): (
+                    f32,
+                    f32,
+                    f32,
+                    Option<u32>,
+                    Option<u32>,
+                    Option<f32>,
+                )| {
+                    let (ox, oy) = off();
+                    draw.borrow_mut().push(DrawCmd::Circle {
+                        x: x + ox,
+                        y: y + oy,
+                        radius,
+                        color: argb(color, 0xFF00FF00),
+                        fill: fill.map(Color::from_argb),
+                        thickness: thickness.unwrap_or(1.0),
+                    });
+                    Ok(())
+                },
+            )?;
+            gfx.set("circle", f)?;
+        }
+
+        // gfx.triangle(x1,y1, x2,y2, x3,y3, color?, fill?, thickness?) —
+        // arrows / directional markers.
+        {
+            let draw = self.draw.clone();
+            let off = offset.clone();
+            let f = self.lua.create_function(
+                move |_, (x1, y1, x2, y2, x3, y3, color, fill, thickness): TriArgs| {
+                    let (ox, oy) = off();
+                    draw.borrow_mut().push(DrawCmd::Triangle {
+                        x1: x1 + ox,
+                        y1: y1 + oy,
+                        x2: x2 + ox,
+                        y2: y2 + oy,
+                        x3: x3 + ox,
+                        y3: y3 + oy,
+                        color: argb(color, 0xFF00FF00),
+                        fill: fill.map(Color::from_argb),
+                        thickness: thickness.unwrap_or(1.0),
+                    });
+                    Ok(())
+                },
+            )?;
+            gfx.set("triangle", f)?;
+        }
+
+        // gfx.poly(points, color?, fill?, thickness?, closed?)
+        //   points = { {x,y}, {x,y}, ... } (table of 2-tuples / {x,y} pairs)
+        // `closed` (default true) joins last->first; `fill` (convex) needs
+        // closed. Open polyline: closed=false, no fill.
+        {
+            let draw = self.draw.clone();
+            let off = offset.clone();
+            let f = self.lua.create_function(
+                move |_,
+                      (points, color, fill, thickness, closed): (
+                    mlua::Table,
+                    Option<u32>,
+                    Option<u32>,
+                    Option<f32>,
+                    Option<bool>,
+                )| {
+                    let (ox, oy) = off();
+                    let mut pts = Vec::new();
+                    for pair in points.sequence_values::<mlua::Table>() {
+                        let p = pair?;
+                        // Accept {x=,y=} or {[1]=x,[2]=y}.
+                        let px: f32 = p.get("x").or_else(|_| p.get(1))?;
+                        let py: f32 = p.get("y").or_else(|_| p.get(2))?;
+                        pts.push((px + ox, py + oy));
+                    }
+                    draw.borrow_mut().push(DrawCmd::Poly {
+                        points: pts,
+                        closed: closed.unwrap_or(true),
+                        color: argb(color, 0xFF00FF00),
+                        fill: fill.map(Color::from_argb),
+                        thickness: thickness.unwrap_or(1.0),
+                    });
+                    Ok(())
+                },
+            )?;
+            gfx.set("poly", f)?;
+        }
+
+        // gfx.arc(x, y, radius, start_deg, end_deg, color?, fill?, thickness?)
+        // Clockwise, 0° = east. Full sweep (start=0,end=360) is a ring;
+        // `fill` makes it a pie slice from the centre.
+        {
+            let draw = self.draw.clone();
+            let off = offset.clone();
+            let f = self.lua.create_function(
+                move |_, (x, y, radius, start_deg, end_deg, color, fill, thickness): ArcArgs| {
+                    let (ox, oy) = off();
+                    draw.borrow_mut().push(DrawCmd::Arc {
+                        x: x + ox,
+                        y: y + oy,
+                        radius,
+                        start_deg,
+                        end_deg,
+                        color: argb(color, 0xFF00FF00),
+                        fill: fill.map(Color::from_argb),
+                        thickness: thickness.unwrap_or(1.0),
+                    });
+                    Ok(())
+                },
+            )?;
+            gfx.set("arc", f)?;
+        }
+
+        // gfx.color_lerp(a, b, t) -> packed 0xAARRGGBB blended a..b by
+        // t (clamped 0..1), per channel including alpha. For health bars
+        // fading green->red, staleness dimming, etc. In Rust because the
+        // ARGB packing is the renderer's convention and LuaJIT's signed
+        // 32-bit bitops make this error-prone in script.
+        {
+            let f = self
+                .lua
+                .create_function(move |_, (a, b, t): (u32, u32, f32)| {
+                    let t = t.clamp(0.0, 1.0);
+                    let lerp = |shift: u32| -> u32 {
+                        let ca = ((a >> shift) & 0xFF) as f32;
+                        let cb = ((b >> shift) & 0xFF) as f32;
+                        let v = (ca + (cb - ca) * t).round().clamp(0.0, 255.0) as u32;
+                        v << shift
+                    };
+                    Ok(lerp(24) | lerp(16) | lerp(8) | lerp(0))
+                })?;
+            gfx.set("color_lerp", f)?;
         }
 
         // gfx.argb(a,r,g,b) -> packed color int helper.
@@ -513,18 +875,124 @@ impl ScriptHost {
 
         globals.set("gfx", gfx)?;
 
+        // --- time table (monotonic; no wall clock — sandbox stays tight) ---
+        let time_tbl = self.lua.create_table()?;
+        {
+            let time = self.time.clone();
+            // Seconds since the script loaded (float, monotonic).
+            let f = self
+                .lua
+                .create_function(move |_, ()| Ok(time.start.elapsed().as_secs_f64()))?;
+            time_tbl.set("now", f)?;
+        }
+        {
+            let time = self.time.clone();
+            // Overlay frames since load (increments once per on_frame).
+            let f = self
+                .lua
+                .create_function(move |_, ()| Ok(time.frame.get()))?;
+            time_tbl.set("frame", f)?;
+        }
+        {
+            let time = self.time.clone();
+            // Wall seconds between the last two frames — for velocity /
+            // frame-rate-independent animation.
+            let f = self.lua.create_function(move |_, ()| Ok(time.dt.get()))?;
+            time_tbl.set("dt", f)?;
+        }
+        globals.set("time", time_tbl)?;
+
+        // --- anim.* (pure Lua; tweening + time-driven oscillators) ---------
+        // Small stdlib-style helpers so scripts stop hand-rolling
+        // math.sin(time.now()*k). Pure Lua: trivial, safe, easy to extend.
+        // `t` is a 0..1 progress for lerp/ease; pulse/blink read time.now().
+        self.lua
+            .load(
+                r#"
+                anim = {}
+                local function clamp01(t)
+                  if t < 0 then return 0 elseif t > 1 then return 1 end
+                  return t
+                end
+                function anim.clamp(v, lo, hi)
+                  if v < lo then return lo elseif v > hi then return hi end
+                  return v
+                end
+                function anim.lerp(a, b, t) return a + (b - a) * clamp01(t) end
+                -- Common easings; name -> shaped t (0..1).
+                local E = {
+                  linear    = function(t) return t end,
+                  in_quad   = function(t) return t * t end,
+                  out_quad  = function(t) return 1 - (1 - t) * (1 - t) end,
+                  inout_quad= function(t)
+                                if t < 0.5 then return 2*t*t end
+                                return 1 - ((-2*t + 2)^2) / 2
+                              end,
+                  in_cubic  = function(t) return t * t * t end,
+                  out_cubic = function(t) return 1 - (1 - t)^3 end,
+                  smooth    = function(t) return t * t * (3 - 2 * t) end,
+                }
+                function anim.ease(t, name)
+                  return (E[name] or E.linear)(clamp01(t))
+                end
+                -- 0..1 sine, `hz` cycles/sec (default 1). phase optional.
+                function anim.pulse(hz, phase)
+                  hz = hz or 1
+                  return 0.5 + 0.5 * math.sin(
+                    (time.now() * hz + (phase or 0)) * 2 * math.pi)
+                end
+                -- Square wave: true for the first half of each `period` sec.
+                function anim.blink(period)
+                  period = period or 1
+                  return (time.now() % period) < (period / 2)
+                end
+                -- Sawtooth 0..1 over `period` sec (handy for sweeps).
+                function anim.saw(period)
+                  period = period or 1
+                  return (time.now() % period) / period
+                end
+                "#,
+            )
+            .set_name("=[anim prelude]")
+            .exec()?;
+
+        // --- log table (levelled console output; print() == log.info) ------
+        let log_tbl = self.lua.create_table()?;
+        {
+            let fmt = |args: &MultiValue| -> String {
+                args.iter()
+                    .map(|v| match v {
+                        Value::String(s) => s.to_string_lossy().to_string(),
+                        other => format!("{other:?}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            };
+            for (name, prefix) in [("info", ""), ("warn", "[warn] "), ("error", "[error] ")] {
+                let console = self.console.clone();
+                // `fmt` captures nothing, so it's Copy — the move closure
+                // takes its own copy; no per-iteration rebind needed.
+                let f = self.lua.create_function(move |_, args: MultiValue| {
+                    console.push(format!("{prefix}{}", fmt(&args)));
+                    Ok(())
+                })?;
+                log_tbl.set(name, f)?;
+            }
+        }
+        globals.set("log", log_tbl)?;
+
         // --- store table (persistent per-script JSON) ---
         let store_tbl = self.lua.create_table()?;
 
         // store.get(key) -> value | nil
         {
             let store = self.store.clone();
-            let f = self.lua.create_function(move |lua, key: String| {
-                match store.get(&key) {
+            let f = self
+                .lua
+                .create_function(move |lua, key: String| match store.get(&key) {
                     Some(j) => json_to_lua(lua, &j),
                     None => Ok(Value::Nil),
-                }
-            })?;
+                })?;
             store_tbl.set("get", f)?;
         }
         // store.set(key, value) — value must be JSON-able (nil/bool/number/
@@ -563,8 +1031,9 @@ impl ScriptHost {
         // store.save(table) — replace the whole document.
         {
             let store = self.store.clone();
-            let f = self.lua.create_function(move |_, t: Value| {
-                match lua_to_json(&t)? {
+            let f = self
+                .lua
+                .create_function(move |_, t: Value| match lua_to_json(&t)? {
                     serde_json::Value::Object(m) => {
                         store.replace(m);
                         Ok(())
@@ -572,8 +1041,7 @@ impl ScriptHost {
                     _ => Err(mlua::Error::RuntimeError(
                         "store.save expects a table".into(),
                     )),
-                }
-            })?;
+                })?;
             store_tbl.set("save", f)?;
         }
         globals.set("store", store_tbl)?;
@@ -600,10 +1068,7 @@ impl ScriptHost {
         {
             let controls = self.controls.clone();
             let f = self.lua.create_function(move |_, text: String| {
-                controls
-                    .borrow_mut()
-                    .items
-                    .push(Control::Header { text });
+                controls.borrow_mut().items.push(Control::Header { text });
                 Ok(())
             })?;
             ui_tbl.set("header", f)?;
@@ -626,11 +1091,10 @@ impl ScriptHost {
                     let value = seed(&id)
                         .and_then(|j| j.as_bool())
                         .unwrap_or(default.unwrap_or(false));
-                    controls.borrow_mut().items.push(Control::Checkbox {
-                        id,
-                        label,
-                        value,
-                    });
+                    controls
+                        .borrow_mut()
+                        .items
+                        .push(Control::Checkbox { id, label, value });
                     Ok(())
                 },
             )?;
@@ -641,22 +1105,30 @@ impl ScriptHost {
         {
             let controls = self.controls.clone();
             let seed = seed.clone();
-            let f = self.lua.create_function(
-                move |_, (id, label, min, max, default): (String, String, f64, f64, Option<f64>)| {
-                    let value = seed(&id)
-                        .and_then(|j| j.as_f64())
-                        .unwrap_or(default.unwrap_or(min))
-                        .clamp(min.min(max), min.max(max));
-                    controls.borrow_mut().items.push(Control::Slider {
-                        id,
-                        label,
-                        min,
-                        max,
-                        value,
-                    });
-                    Ok(())
-                },
-            )?;
+            let f =
+                self.lua.create_function(
+                    move |_,
+                          (id, label, min, max, default): (
+                        String,
+                        String,
+                        f64,
+                        f64,
+                        Option<f64>,
+                    )| {
+                        let value = seed(&id)
+                            .and_then(|j| j.as_f64())
+                            .unwrap_or(default.unwrap_or(min))
+                            .clamp(min.min(max), min.max(max));
+                        controls.borrow_mut().items.push(Control::Slider {
+                            id,
+                            label,
+                            min,
+                            max,
+                            value,
+                        });
+                        Ok(())
+                    },
+                )?;
             ui_tbl.set("slider", f)?;
         }
 
@@ -669,11 +1141,10 @@ impl ScriptHost {
                     let value = seed(&id)
                         .and_then(|j| j.as_str().map(str::to_owned))
                         .unwrap_or_else(|| default.unwrap_or_default());
-                    controls.borrow_mut().items.push(Control::Text {
-                        id,
-                        label,
-                        value,
-                    });
+                    controls
+                        .borrow_mut()
+                        .items
+                        .push(Control::Text { id, label, value });
                     Ok(())
                 },
             )?;
@@ -690,11 +1161,10 @@ impl ScriptHost {
                         .and_then(|j| j.as_u64())
                         .map(|v| v as u32)
                         .unwrap_or(default.unwrap_or(0xFFFFFFFF));
-                    controls.borrow_mut().items.push(Control::Color {
-                        id,
-                        label,
-                        value,
-                    });
+                    controls
+                        .borrow_mut()
+                        .items
+                        .push(Control::Color { id, label, value });
                     Ok(())
                 },
             )?;
@@ -707,7 +1177,13 @@ impl ScriptHost {
             let controls = self.controls.clone();
             let seed = seed.clone();
             let f = self.lua.create_function(
-                move |_, (id, label, options, default): (String, String, Vec<String>, Option<usize>)| {
+                move |_,
+                      (id, label, options, default): (
+                    String,
+                    String,
+                    Vec<String>,
+                    Option<usize>,
+                )| {
                     let n = options.len().max(1);
                     let value = seed(&id)
                         .and_then(|j| j.as_u64())
@@ -751,9 +1227,7 @@ impl ScriptHost {
                 Ok(match c.get(&id) {
                     Some(Control::Checkbox { value, .. }) => Value::Boolean(*value),
                     Some(Control::Slider { value, .. }) => Value::Number(*value),
-                    Some(Control::Text { value, .. }) => {
-                        Value::String(lua.create_string(value)?)
-                    }
+                    Some(Control::Text { value, .. }) => Value::String(lua.create_string(value)?),
                     Some(Control::Color { value, .. }) => Value::Integer(*value as i64),
                     Some(Control::Select { value, .. }) => Value::Integer(*value as i64 + 1),
                     _ => Value::Nil,
@@ -793,7 +1267,9 @@ impl ScriptHost {
                             Control::Checkbox { value: v, .. } => {
                                 *v = matches!(value, Value::Boolean(true))
                             }
-                            Control::Slider { value: v, min, max, .. } => {
+                            Control::Slider {
+                                value: v, min, max, ..
+                            } => {
                                 if let Some(n) = value.as_f64() {
                                     *v = n.clamp(min.min(*max), min.max(*max));
                                 }
@@ -808,9 +1284,13 @@ impl ScriptHost {
                                     *v = n as u32;
                                 }
                             }
-                            Control::Select { value: v, options, .. } => {
+                            Control::Select {
+                                value: v, options, ..
+                            } => {
                                 if let Some(n) = value.as_u64() {
-                                    *v = (n as usize).saturating_sub(1).min(options.len().saturating_sub(1));
+                                    *v = (n as usize)
+                                        .saturating_sub(1)
+                                        .min(options.len().saturating_sub(1));
                                 }
                             }
                             _ => {}
@@ -819,6 +1299,15 @@ impl ScriptHost {
                     Ok(())
                 })?;
             ui_tbl.set("set", f)?;
+        }
+
+        // ui.exists(id) -> true if a control with that id was declared.
+        {
+            let controls = self.controls.clone();
+            let f = self
+                .lua
+                .create_function(move |_, id: String| Ok(controls.borrow().get(&id).is_some()))?;
+            ui_tbl.set("exists", f)?;
         }
         globals.set("ui", ui_tbl)?;
 
@@ -859,14 +1348,22 @@ impl ScriptHost {
                         }
                         cb = o.get::<mlua::Function>("callback").ok();
                     }
-                    let id = bridge.submit(runtime::HttpRequest {
+                    let Some(id) = bridge.submit(runtime::HttpRequest {
                         method,
                         url,
                         headers,
                         body,
                         timeout_ms,
                         id: 0, // assigned by submit()
-                    });
+                    }) else {
+                        // Concurrency cap hit — drop the request and the
+                        // callback (never registered), warn the script.
+                        console.push(format!(
+                            "[http] too many in-flight requests (max {}) — dropped",
+                            runtime::HTTP_MAX_IN_FLIGHT
+                        ));
+                        return Ok(());
+                    };
                     // Stash the callback on the UI side keyed by id. mlua
                     // values never cross to the Tokio worker.
                     if let Some(cb) = cb {
@@ -992,11 +1489,17 @@ impl ScriptHost {
     /// previous script, runs the chunk once (top level), then calls
     /// `on_init()` if defined.
     pub fn load_script(&mut self, src: &str, name: &str) -> ScriptResult<()> {
+        // Give the outgoing script a chance to flush/clean up before its VM
+        // is dropped (reload counts as an unload).
+        self.fire_unload();
         self.loaded = false;
         self.engine.registry().clear();
         self.draw.borrow_mut().clear();
         self.current_font.set(Font::default());
         self.requested_canvas.set(Canvas::default());
+        *self.requested_text_sizing.borrow_mut() = None;
+        self.origin_stack.borrow_mut().clear();
+        self.time = TimeState::new();
         // Drop the previous script's declared panel; the new script will
         // re-declare its own (seeding values from the persisted store).
         self.controls.borrow_mut().items.clear();
@@ -1031,6 +1534,28 @@ impl ScriptHost {
         self.loaded
     }
 
+    /// Call the script's `on_unload()` (if defined and a script is loaded),
+    /// then mark unloaded. Used on reload and at app exit so a script can do
+    /// a final `store.save`, cancel timers, etc. Errors go to the console;
+    /// teardown never aborts the host. Idempotent — safe to call twice.
+    fn fire_unload(&mut self) {
+        if !self.loaded {
+            return;
+        }
+        if let Ok(cb) = self.lua.globals().get::<mlua::Function>("on_unload") {
+            if let Err(e) = cb.call::<()>(()) {
+                self.console.push(format!("[on_unload error] {e}"));
+            }
+        }
+        self.loaded = false;
+    }
+
+    /// Public teardown for the app to call on exit (after the last frame).
+    /// Fires `on_unload` so the script can persist before the process ends.
+    pub fn unload(&mut self) {
+        self.fire_unload();
+    }
+
     /// The script's declared settings panel, for the app to render. Empty
     /// (per [`Controls::is_empty`]) when the script declared no controls.
     pub fn controls(&self) -> SharedControls {
@@ -1052,15 +1577,15 @@ impl ScriptHost {
                 Control::Color { value, .. } => serde_json::json!(*value),
                 Control::Select { value, .. } => serde_json::json!(*value),
                 // Buttons are momentary — nothing to persist.
-                Control::Header { .. } | Control::Label { .. } | Control::Button { .. } => {
-                    continue
-                }
+                Control::Header { .. } | Control::Label { .. } | Control::Button { .. } => continue,
             };
             map.insert(id.to_string(), v);
         }
         if !map.is_empty() {
-            self.store
-                .set(controls::STORE_KEY.to_string(), serde_json::Value::Object(map));
+            self.store.set(
+                controls::STORE_KEY.to_string(),
+                serde_json::Value::Object(map),
+            );
         }
     }
 
@@ -1069,6 +1594,12 @@ impl ScriptHost {
     /// canvas (it may honor or override it).
     pub fn requested_canvas(&self) -> Canvas {
         self.requested_canvas.get()
+    }
+
+    /// Text sizing defaults the script requested via `gfx.text_sizing`, if
+    /// any. The app applies this after load; it is not a per-frame override.
+    pub fn requested_text_sizing(&self) -> Option<TextSizingRequest> {
+        self.requested_text_sizing.borrow().clone()
     }
 
     /// Force the active canvas (app override). Call before `run_frame` so the
@@ -1085,10 +1616,13 @@ impl ScriptHost {
         if !self.loaded {
             return DrawList::default();
         }
+        // Advance the frame clock (drives time.frame/now/dt).
+        self.time.tick();
         self.draw.borrow_mut().clear();
         // Reset per-frame draw state so a script can't leak font selection
-        // from a previous frame.
+        // or a missing pop_origin from a previous frame.
         self.current_font.set(Font::default());
+        self.origin_stack.borrow_mut().clear();
 
         // Deliver any HTTP responses first so a callback can stage data the
         // same frame's `on_frame` then draws.
@@ -1105,6 +1639,33 @@ impl ScriptHost {
         self.draw.borrow().clone()
     }
 }
+
+/// `gfx.triangle` args: three points plus optional color/fill/thickness.
+/// Named so the closure signature stays readable (and clippy-quiet).
+type TriArgs = (
+    f32,
+    f32,
+    f32,
+    f32,
+    f32,
+    f32,
+    Option<u32>,
+    Option<u32>,
+    Option<f32>,
+);
+
+/// `gfx.arc` args: centre, radius, start/end angle, optional
+/// color/fill/thickness.
+type ArcArgs = (
+    f32,
+    f32,
+    f32,
+    f32,
+    f32,
+    Option<u32>,
+    Option<u32>,
+    Option<f32>,
+);
 
 /// Resolve an optional packed ARGB int to a [`Color`], falling back to a
 /// default. Centralised so every primitive treats color args the same way.
@@ -1280,6 +1841,11 @@ mod tests {
         let mut h = host();
         h.load_script(&src, "super_hitbox_sni.lua")
             .expect("ported script loads without error");
+        // The adapter now surfaces the key AnyG toggles as ui.* controls.
+        assert!(
+            h.controls().borrow().get("anyg_dashboard").is_some(),
+            "hitbox adapter should declare the AnyG settings panel"
+        );
         let mut last = DrawList::default();
         for _ in 0..8 {
             last = h.run_frame();
@@ -1298,6 +1864,10 @@ mod tests {
                 DrawCmd::Rect { .. } => r += 1,
                 DrawCmd::Line { .. } => l += 1,
                 DrawCmd::Pixel { .. } => p += 1,
+                DrawCmd::Circle { .. }
+                | DrawCmd::Triangle { .. }
+                | DrawCmd::Poly { .. }
+                | DrawCmd::Arc { .. } => {}
             }
         }
         eprintln!(
@@ -1471,7 +2041,10 @@ mod tests {
         )
         .unwrap();
         h.run_frame();
-        assert!(h.is_loaded(), "script survived an http call with no runtime");
+        assert!(
+            h.is_loaded(),
+            "script survived an http call with no runtime"
+        );
         assert!(h
             .console()
             .snapshot()
@@ -1532,6 +2105,55 @@ mod tests {
             !h.controls().borrow().is_empty(),
             "demo should declare a settings panel"
         );
+    }
+
+    #[test]
+    fn new_api_demo_example_loads_and_runs() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/new_api_demo.lua"
+        );
+        let src = std::fs::read_to_string(path).expect("new_api_demo present");
+        let mut h = host();
+        h.load_script(&src, "new_api_demo.lua")
+            .expect("new_api_demo loads");
+        for _ in 0..4 {
+            h.run_frame();
+            assert!(h.is_loaded(), "console: {:?}", h.console().snapshot());
+        }
+        // It exercises time/gfx/snes.buttons/ui without a SNES and must
+        // still draw the HUD text + pulsing ring.
+        let dl = h.run_frame();
+        assert!(!dl.cmds.is_empty(), "demo should draw something");
+        // on_unload should fire cleanly on reload (no panic / error).
+        h.load_script("-- replace", "x").unwrap();
+        assert!(h
+            .console()
+            .snapshot()
+            .iter()
+            .any(|l| l.contains("unloading at frame")));
+    }
+
+    #[test]
+    fn animated_input_viewer_example_loads_and_runs() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/animated_input_viewer.lua"
+        );
+        let src = std::fs::read_to_string(path).expect("animated input viewer present");
+        let mut h = host();
+        h.load_script(&src, "animated_input_viewer.lua")
+            .expect("animated input viewer loads");
+        for _ in 0..4 {
+            h.run_frame();
+            assert!(h.is_loaded(), "console: {:?}", h.console().snapshot());
+        }
+        assert!(
+            !h.controls().borrow().is_empty(),
+            "input viewer should declare a settings panel"
+        );
+        let dl = h.run_frame();
+        assert!(!dl.cmds.is_empty(), "input viewer should draw something");
     }
 
     #[test]
@@ -1598,17 +2220,410 @@ mod tests {
         let mut h2 = host();
         h2.bind_store(Some(file.clone()));
         h2.load_script(script, "t").unwrap();
-        let v = match h2
-            .controls()
-            .borrow()
-            .get("vol")
-            .cloned()
-        {
+        let v = match h2.controls().borrow().get("vol").cloned() {
             Some(Control::Slider { value, .. }) => value,
             _ => panic!("slider missing"),
         };
         assert_eq!(v, 80.0);
 
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn time_table_advances_per_frame() {
+        let mut h = host();
+        h.load_script(
+            r#"
+            f0 = time.frame()
+            function on_frame()
+              fr = time.frame()
+              t  = time.now()
+              d  = time.dt()
+            end
+            "#,
+            "t",
+        )
+        .unwrap();
+        // Frame counter starts at 0 (no run_frame yet).
+        assert_eq!(h.lua.globals().get::<i64>("f0").unwrap(), 0);
+        h.run_frame();
+        assert_eq!(h.lua.globals().get::<i64>("fr").unwrap(), 1);
+        h.run_frame();
+        assert_eq!(h.lua.globals().get::<i64>("fr").unwrap(), 2);
+        assert!(h.lua.globals().get::<f64>("t").unwrap() >= 0.0);
+        assert!(h.lua.globals().get::<f64>("d").unwrap() >= 0.0);
+    }
+
+    #[test]
+    fn signed_readers_and_buttons_decode() {
+        let mut h = host();
+        // No SNI client -> snapshots empty, so reads are nil; we only assert
+        // the functions exist and tolerate the cold cache without erroring.
+        h.load_script(
+            r#"
+            local w = snes.watch(0x008B, 2, "realtime")
+            i8v   = snes.i8(w)        -- nil (cold)
+            i32v  = snes.i32(w)       -- nil (cold)
+            btns  = snes.buttons(w)   -- nil (cold)
+            has_fns = (snes.i8 ~= nil) and (snes.i32 ~= nil)
+                      and (snes.buttons ~= nil)
+            "#,
+            "t",
+        )
+        .unwrap();
+        let g = h.lua.globals();
+        assert!(g.get::<bool>("has_fns").unwrap());
+        assert!(g.get::<Value>("btns").unwrap().is_nil());
+    }
+
+    #[test]
+    fn gfx_origin_offsets_subsequent_draws() {
+        let mut h = host();
+        h.load_script(
+            r#"
+            function on_frame()
+              gfx.box(10, 10, 4, 4)              -- absolute
+              gfx.push_origin(100, 200)
+              gfx.box(1, 2, 4, 4)                -- -> (101, 202)
+              gfx.push_origin(10, 10)            -- nested -> +110,+210
+              gfx.pixel(0, 0)                    -- -> (110, 210)
+              gfx.pop_origin()
+              gfx.pop_origin()
+              gfx.box(5, 5, 4, 4)               -- back to absolute
+            end
+            "#,
+            "t",
+        )
+        .unwrap();
+        let dl = h.run_frame();
+        let rects: Vec<(f32, f32)> = dl
+            .cmds
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Rect { x, y, .. } => Some((*x, *y)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rects, vec![(10.0, 10.0), (101.0, 202.0), (5.0, 5.0)]);
+        let px: Vec<(f32, f32)> = dl
+            .cmds
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Pixel { x, y, .. } => Some((*x, *y)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(px, vec![(110.0, 210.0)]);
+    }
+
+    #[test]
+    fn gfx_circle_triangle_and_text_metrics() {
+        let mut h = host();
+        h.load_script(
+            r#"
+            function on_frame()
+              gfx.circle(50, 50, 8, 0xFFFF0000, 0x4000FF00, 2)
+              gfx.triangle(0,0, 10,0, 5,10, 0xFFFFFFFF)
+              tw = gfx.text_width("ABCD")     -- 4 glyphs * advance
+              th = gfx.text_height("a\nb\nc") -- 3 lines
+            end
+            "#,
+            "t",
+        )
+        .unwrap();
+        let dl = h.run_frame();
+        assert!(dl.cmds.iter().any(|c| matches!(c, DrawCmd::Circle { .. })));
+        assert!(dl
+            .cmds
+            .iter()
+            .any(|c| matches!(c, DrawCmd::Triangle { .. })));
+        let g = h.lua.globals();
+        assert!(g.get::<f32>("tw").unwrap() > 0.0);
+        // 3 lines must be taller than a single line.
+        assert!(g.get::<f32>("th").unwrap() > g.get::<f32>("tw").unwrap() / 4.0);
+    }
+
+    #[test]
+    fn log_levels_route_to_console_with_prefix() {
+        let mut h = host();
+        h.load_script(
+            r#"log.info("hi"); log.warn("careful"); log.error("boom")"#,
+            "t",
+        )
+        .unwrap();
+        let lines = h.console().snapshot();
+        assert!(lines.iter().any(|l| l == "hi"));
+        assert!(lines.iter().any(|l| l == "[warn] careful"));
+        assert!(lines.iter().any(|l| l == "[error] boom"));
+    }
+
+    #[test]
+    fn on_unload_fires_on_reload_and_can_persist() {
+        let dir = std::env::temp_dir().join(format!("snilua_unload_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("u.json");
+        let _ = std::fs::remove_file(&file);
+
+        let mut h = host();
+        h.bind_store(Some(file.clone()));
+        h.load_script(
+            r#"
+            function on_unload()
+              store.set("saved_on_unload", 7)
+            end
+            "#,
+            "a",
+        )
+        .unwrap();
+        // Reloading a different script must fire the old on_unload first.
+        h.load_script(r#"-- empty"#, "b").unwrap();
+        h.store().flush_if_dirty();
+
+        let mut h2 = host();
+        h2.bind_store(Some(file.clone()));
+        h2.load_script(r#"v = store.get("saved_on_unload")"#, "c")
+            .unwrap();
+        assert_eq!(h2.lua.globals().get::<i64>("v").unwrap(), 7);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn http_concurrency_cap_rejects_overflow() {
+        use std::sync::OnceLock;
+        static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        let rt = RT.get_or_init(|| tokio::runtime::Runtime::new().unwrap());
+        let _g = rt.enter();
+        let bridge = crate::runtime::HttpBridge::spawn();
+        let mk = || crate::runtime::HttpRequest {
+            // Unroutable: the request stays in-flight (connect timeout) long
+            // enough that the in-flight count doesn't drain during the test,
+            // so the cap is observed synchronously — no network needed.
+            method: "GET".into(),
+            url: "http://10.255.255.1:9/".into(),
+            headers: vec![],
+            body: None,
+            timeout_ms: 30_000,
+            id: 0,
+        };
+        // First MAX submissions reserve their slot and succeed.
+        for _ in 0..crate::runtime::HTTP_MAX_IN_FLIGHT {
+            assert!(bridge.submit(mk()).is_some());
+        }
+        // The next one is over the cap -> dropped.
+        assert!(
+            bridge.submit(mk()).is_none(),
+            "request past the concurrency cap must be rejected"
+        );
+    }
+
+    #[test]
+    fn ui_exists_reports_declared_controls() {
+        let mut h = host();
+        h.load_script(
+            r#"
+            function on_init() ui.checkbox("flag", "Flag", true) end
+            function on_frame()
+              a = ui.exists("flag")
+              b = ui.exists("nope")
+            end
+            "#,
+            "t",
+        )
+        .unwrap();
+        h.run_frame();
+        assert!(h.lua.globals().get::<bool>("a").unwrap());
+        assert!(!h.lua.globals().get::<bool>("b").unwrap());
+    }
+
+    #[test]
+    fn gfx_text_options_table_and_back_compat_scale() {
+        let mut h = host();
+        h.load_script(
+            r#"
+            function on_frame()
+              gfx.text(1, 1, "plain")
+              gfx.text(1, 9, "scaled", 0xFFFFFFFF, 3)              -- numeric 5th = scale
+              gfx.text(1, 17, "fancy", 0xFFFFFFFF,
+                       { scale = 2, bg = 0xA0000000, outline = 0xFF000000 })
+            end
+            "#,
+            "t",
+        )
+        .unwrap();
+        let dl = h.run_frame();
+        let texts: Vec<_> = dl
+            .cmds
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Text {
+                    text,
+                    scale,
+                    bg,
+                    outline,
+                    ..
+                } => Some((text.clone(), *scale, bg.is_some(), outline.is_some())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts[0], ("plain".into(), 1.0, false, false));
+        assert_eq!(texts[1], ("scaled".into(), 3.0, false, false));
+        assert_eq!(texts[2], ("fancy".into(), 2.0, true, true));
+    }
+
+    #[test]
+    fn gfx_text_sizing_request_is_recorded_and_resets_on_reload() {
+        let mut h = host();
+        h.load_script(r#"gfx.text_sizing("screen", 1.25)"#, "t")
+            .unwrap();
+        assert_eq!(
+            h.requested_text_sizing(),
+            Some(TextSizingRequest {
+                mode: "screen".into(),
+                size: 1.25,
+            })
+        );
+
+        h.load_script("-- no text sizing request", "t2").unwrap();
+        assert_eq!(h.requested_text_sizing(), None);
+    }
+
+    #[test]
+    fn gfx_poly_and_arc_emit_commands() {
+        let mut h = host();
+        h.load_script(
+            r#"
+            function on_frame()
+              gfx.poly({ {x=0,y=0}, {x=10,y=0}, {5,10} }, 0xFFFFFFFF,
+                       0x4000FF00, 1)                 -- closed (default), filled
+              gfx.poly({ {0,0}, {20,20} }, 0xFFFFFFFF, nil, 1, false)  -- open
+              gfx.arc(50, 50, 12, 0, 270, 0xFFFFFFFF, nil, 2)
+            end
+            "#,
+            "t",
+        )
+        .unwrap();
+        let dl = h.run_frame();
+        let polys: Vec<_> = dl
+            .cmds
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Poly {
+                    points,
+                    closed,
+                    fill,
+                    ..
+                } => Some((points.len(), *closed, fill.is_some())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(polys, vec![(3, true, true), (2, false, false)]);
+        let arc = dl
+            .cmds
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::Arc {
+                    start_deg, end_deg, ..
+                } => Some((*start_deg, *end_deg)),
+                _ => None,
+            })
+            .expect("arc emitted");
+        assert_eq!(arc, (0.0, 270.0));
+    }
+
+    #[test]
+    fn gfx_poly_respects_origin_offset() {
+        let mut h = host();
+        h.load_script(
+            r#"
+            function on_frame()
+              gfx.push_origin(100, 200)
+              gfx.poly({ {1,2}, {3,4}, {5,6} })
+              gfx.pop_origin()
+            end
+            "#,
+            "t",
+        )
+        .unwrap();
+        let dl = h.run_frame();
+        let pts = dl
+            .cmds
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::Poly { points, .. } => Some(points.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(pts, vec![(101.0, 202.0), (103.0, 204.0), (105.0, 206.0)]);
+    }
+
+    #[test]
+    fn gfx_color_lerp_blends_channels() {
+        let mut h = host();
+        h.load_script(
+            r#"
+            a    = gfx.color_lerp(0xFF000000, 0xFFFFFFFF, 0.0)
+            b    = gfx.color_lerp(0xFF000000, 0xFFFFFFFF, 1.0)
+            mid  = gfx.color_lerp(0xFF000000, 0xFFFFFFFF, 0.5)
+            clamp= gfx.color_lerp(0xFF000000, 0xFFFFFFFF, 5.0)   -- clamps to 1
+            "#,
+            "t",
+        )
+        .unwrap();
+        let g = h.lua.globals();
+        assert_eq!(g.get::<i64>("a").unwrap() as u32, 0xFF000000);
+        assert_eq!(g.get::<i64>("b").unwrap() as u32, 0xFFFFFFFF);
+        // Halfway: each RGB channel ~0x80, alpha stays 0xFF.
+        assert_eq!(g.get::<i64>("mid").unwrap() as u32, 0xFF808080);
+        assert_eq!(g.get::<i64>("clamp").unwrap() as u32, 0xFFFFFFFF);
+    }
+
+    #[test]
+    fn draw_anim_demo_example_loads_and_runs() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/draw_anim_demo.lua"
+        );
+        let src = std::fs::read_to_string(path).expect("draw_anim_demo present");
+        let mut h = host();
+        h.load_script(&src, "draw_anim_demo.lua")
+            .expect("draw_anim_demo loads");
+        for _ in 0..4 {
+            h.run_frame();
+            assert!(h.is_loaded(), "console: {:?}", h.console().snapshot());
+        }
+        let dl = h.run_frame();
+        // Should exercise text(bg/outline) + poly + arc + box.
+        assert!(dl.cmds.iter().any(|c| matches!(c, DrawCmd::Poly { .. })));
+        assert!(dl.cmds.iter().any(|c| matches!(c, DrawCmd::Arc { .. })));
+    }
+
+    #[test]
+    fn anim_prelude_helpers_work() {
+        let mut h = host();
+        h.load_script(
+            r#"
+            lerp_mid = anim.lerp(0, 100, 0.5)
+            lerp_clamp = anim.lerp(0, 100, 2.0)        -- t clamps to 1
+            ease_lin = anim.ease(0.5, "linear")
+            ease_oq  = anim.ease(0.5, "out_quad")      -- > linear at 0.5
+            pulse    = anim.pulse(2)                   -- in 0..1
+            blink    = anim.blink(1)                   -- boolean
+            saw      = anim.saw(2)                      -- in 0..1
+            clamped  = anim.clamp(150, 0, 100)
+            "#,
+            "t",
+        )
+        .unwrap();
+        let g = h.lua.globals();
+        assert_eq!(g.get::<f64>("lerp_mid").unwrap(), 50.0);
+        assert_eq!(g.get::<f64>("lerp_clamp").unwrap(), 100.0);
+        assert_eq!(g.get::<f64>("ease_lin").unwrap(), 0.5);
+        assert!(g.get::<f64>("ease_oq").unwrap() > 0.5);
+        let p = g.get::<f64>("pulse").unwrap();
+        assert!((0.0..=1.0).contains(&p));
+        assert!(g.get::<bool>("blink").unwrap()); // t≈0 -> first half
+        let s = g.get::<f64>("saw").unwrap();
+        assert!((0.0..=1.0).contains(&s));
+        assert_eq!(g.get::<f64>("clamped").unwrap(), 100.0);
     }
 }

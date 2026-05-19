@@ -39,6 +39,8 @@ sni-lua is built around that constraint:
 | M5 | Overlay renderer (text, rect, line, hitbox; 5x7 + 8x8 fonts) | ✅ |
 | M6 | Capture modes: composited + transparent click-through + streaming output | ✅ |
 | M7 | Tabbed UI + file dialog; script `store.*` / async `http.*` / `ui.*` settings panel | ✅ |
+| M8 | API round-out: `time.*`, `log.*`, `snes.buttons`/signed reads, `gfx` circle/triangle/metrics/origin, `on_unload` | ✅ |
+| M9 | Drawing/anim helpers: text bg+outline, `gfx.poly`/`arc`/`color_lerp`, `anim.*` easing/oscillators | ✅ |
 
 ## Build & run
 
@@ -70,99 +72,65 @@ The left panel is tabbed so the everyday view stays uncluttered:
 The console (script `print` + errors) is a collapsible bottom panel toggled
 from **Setup → Show console**.
 
-### Overlay text
+### Overlay text & canvas (app side)
 
-Scripts draw with two embedded pixel fonts: a compact **5x7** (default) and
-the classic **8x8** (`gfx.font("normal")`). Size is controlled per-label via
-the `gfx.text` scale arg, and globally via **Overlay → Text size** plus a
-sizing mode: *game-scaled* (zooms with the view, pixel-aligned) or *fixed
-screen px* (constant on-screen size). Settings persist.
+The app has global overrides that sit on top of what a script requests
+(API details for the script side are in [`docs/SCRIPTING.md`](docs/SCRIPTING.md)):
 
-### Render resolution (canvas)
+* **Overlay → Text size** + sizing mode: *game-scaled* (zooms with the view,
+  pixel-aligned) or *fixed screen px* (constant on-screen size). Scripts can
+  request their intended load-time default with `gfx.text_sizing(...)`; the
+  app controls still let the user adjust it afterwards.
+* **Overlay → Canvas**: *Script-controlled* (honor the script's
+  `gfx.scale`/`canvas`) or a forced *Native / 2x / 3x / 4x*. The *canvas* is
+  the script's coordinate space, decoupled from on-screen size — a higher-res
+  canvas adds precision in the same screen area.
 
-The *canvas* is the coordinate space scripts draw into, decoupled from
-on-screen size. Default is native 256x224; a higher-res canvas lets scripts
-place sub-SNES-pixel detail and crisper HUDs (it occupies the same screen
-area — only precision changes).
+Both persist. There is intentionally no supersampling/AA knob — the overlay
+is deliberately crisp pixel art; canvas resolution is the higher-res lever.
 
-* Scripts: `gfx.scale(2)` (→512x448), `gfx.canvas(w, h)` (custom).
-  Always read `gfx.width()` / `gfx.height()` for layout — never hardcode
-  256/224, since the app may override the canvas.
-* App: **Overlay → Canvas** = *Script-controlled* (honor the script) or a
-  forced *Native / 2x / 3x / 4x*. Persisted.
+### Writing scripts
 
-See `examples/hires_grid.lua` for a 2x demo.
+A script is a Lua file with optional `on_init` / `on_frame` / `on_unload`
+functions. It declares **watches** on memory, reads the latest cached
+snapshot each frame, and emits retained `gfx.*` draw calls — nothing ever
+blocks the frame (see [why](#why-this-is-non-trivial)).
 
-> Note: there is intentionally no supersampling/AA knob — the overlay is
-> deliberately crisp pixel art; canvas resolution is the higher-res lever.
+**→ The complete, precise API reference is [`docs/SCRIPTING.md`](docs/SCRIPTING.md).**
 
-### Persistence & HTTP (`store.*`, `http.*`)
+It documents every call with signatures, defaults and return types:
 
-Scripts can keep state across runs and talk to a REST API without ever
-blocking the frame — the same async discipline as `snes.*`.
+| Table | What |
+|---|---|
+| `snes` | declare watches, typed/signed reads, `snes.buttons` input, `snes.write` |
+| `gfx` | text (with bg/outline), box/line/circle/triangle/poly/arc, canvas, origin stack, `color_lerp` |
+| `ui` | script-declared settings panel (auto-persisted, shown in the **Script** tab) |
+| `store` | per-script JSON persistence (auto-saved) |
+| `http` | async REST (`get/post/put/delete`, JSON helpers, callback on a later frame) |
+| `time` | monotonic clock / frame counter / dt |
+| `log` | levelled console output |
+| `anim` | tweening + easing + time-driven oscillators |
 
-**`store`** — a per-script JSON document, auto-saved by the app (debounced,
-and on exit) to a file keyed by the script's path, so two scripts never
-collide:
-
-```lua
-store.set("pb", 5423)          -- key/value; value is any JSON-able Lua value
-local pb = store.get("pb")     -- nil if unset
-store.delete("pb")
-local all = store.load()       -- whole document as a table
-store.save({ pb = 5423, splits = { 61, 122 } })   -- replace it wholesale
-```
-
-**`http`** — async; the call returns immediately and your callback runs on a
-later frame (UI thread, VM idle — no re-entrancy):
+A short tour by example:
 
 ```lua
-http.get("https://api.example.com/runs", function(r)
-  if r.ok then print(r.status, r.body) end   -- r: { ok,status,headers,body,error }
-end)
-http.post(url, http.json({ run = 1 }),
-          { headers = { ["content-type"] = "application/json" } },
-          function(r) ... end)
--- http.put / http.delete likewise; http.parse(str) decodes JSON to a table.
-```
+local hp = snes.watch(0x09C2, 2, "normal")   -- WRAM offset, size, priority
 
-`r.ok` is false only on a transport/timeout failure (see `r.error`); a 4xx/5xx
-response still has `ok = true` with `r.status` set. Any method/host/headers are
-allowed — scripts are local and trusted. See `examples/store_http_demo.lua`.
-
-### Script settings panel (`ui.*`)
-
-A script can expose its own settings so users tweak behaviour without editing
-Lua. Declare controls once (typically in `on_init`); the app renders them in a
-**Script** tab that appears *only* when a script declares some (and is
-auto-selected on load). Read the live value any frame with `ui.get(id)`. Every
-value auto-persists via the per-script store and restores on reload — no extra
-code.
-
-```lua
 function on_init()
-  ui.header("Hitbox")
-  ui.checkbox("show",  "Show box",   true)
-  ui.slider("thick",   "Line width", 1, 6, 2)        -- min, max, default
-  ui.color("col",      "Box color",  0xFF40FF40)     -- 0xAARRGGBB
-  ui.select("mode",    "Mode", { "off", "lo", "hi" }, 2)  -- 1-based
-  ui.text("label",     "Caption",    "hello")
-  ui.button("reset",   "Recenter")
-  ui.label("Free-standing helper text.")
+  ui.slider("scale", "HUD size", 1, 4, 1)    -- a user-tweakable setting
 end
 
 function on_frame()
-  if ui.get("show") then
-    gfx.box(x, y, w, h, ui.get("col"), nil, ui.get("thick"))
+  local v = snes.u16(hp)                      -- cached read; nil until polled
+  if v then
+    gfx.text(8, 8, ("Energy %d"):format(v), 0xFFFFFFFF,
+             { bg = 0xA0000000, scale = ui.get("scale") })
   end
-  if ui.pressed("reset") then ... end   -- true once per click
 end
 ```
 
-`ui.get(id)` returns bool / number / string per control (`select` returns its
-1-based index); `ui.pressed(id)` drains a button's one-shot click; `ui.set(id,
-v)` updates a control programmatically. Header/label are layout-only. See
-`examples/controls_demo.lua`.
+The runnable demos in `examples/` each focus on one area — see the table at
+the bottom of [`docs/SCRIPTING.md`](docs/SCRIPTING.md#example-scripts).
 
 ### Capture background
 
@@ -221,6 +189,14 @@ adapter points at LuaJIT's `bit.*`, so the body needs **no source patching**.
 when you re-sync an upstream drop; it fails loudly if upstream moved a splice
 boundary.
 
+Part 2 also surfaces the most-used Any% Glitched toggles (RAM dashboard,
+route highlights, warnings, PLM/freeze, etc.) plus overlay opacity as `ui.*`
+controls, so they appear in the app's **Script** tab and can be flipped live
+without editing the file. Only settings the body reads fresh each frame are
+exposed; the block-viewer scale/layout (captured into body-locals once at
+load) stays file-edited. Defaults mirror the verbatim upstream `CONFIG`; the
+user's saved choices override on reload.
+
 ## Layout
 
 ```
@@ -232,5 +208,6 @@ crates/
   sni-capture/   capture device backends                     (M6)
   sni-lua-app/   binary: wires it all together + UI
 proto/sni.proto  vendored SNI protocol definition
+docs/SCRIPTING.md  complete Lua scripting API reference
 examples/        Super Metroid scripts
 ```

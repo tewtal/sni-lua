@@ -58,15 +58,24 @@ pub type SharedState = Arc<Mutex<SniState>>;
 /// [`SharedState`] and the UI polls them (egui is an immediate-mode loop).
 #[derive(Debug)]
 pub enum Cmd {
-    Connect { endpoint: String },
+    Connect {
+        endpoint: String,
+    },
     Disconnect,
     RefreshDevices,
-    SelectDevice { uri: String },
+    SelectDevice {
+        uri: String,
+    },
     /// One-shot read used by the live inspector to demonstrate latency.
-    Probe { region: MemRegion },
+    Probe {
+        region: MemRegion,
+    },
     /// Fire-and-forget memory write from a script (`snes.write`). Never
     /// blocks the frame; failures are logged, not surfaced per-call.
-    Write { region: MemRegion, data: Vec<u8> },
+    Write {
+        region: MemRegion,
+        data: Vec<u8>,
+    },
 }
 
 /// Handle the UI keeps. Dropping it stops the actor.
@@ -272,10 +281,7 @@ impl Actor {
             return;
         };
         if let Err(e) = client.single_write(&uri, region, data).await {
-            tracing::warn!(
-                "snes.write to 0x{:06X} failed: {e}",
-                region.address
-            );
+            tracing::warn!("snes.write to 0x{:06X} failed: {e}", region.address);
         }
     }
 }

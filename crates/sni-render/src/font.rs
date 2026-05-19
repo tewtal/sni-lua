@@ -79,7 +79,6 @@ impl Font {
     }
 }
 
-
 // 0x20..=0x7E, 95 glyphs. Public-domain font8x8 (basic) data.
 #[rustfmt::skip]
 static FONT_8X8: [[u8; 8]; 95] = [

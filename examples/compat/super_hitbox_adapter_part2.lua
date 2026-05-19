@@ -17,6 +17,65 @@ if _state and _state.consoleType
     return
 end
 
+-- ---- script settings panel (sni-lua ui.*) -----------------------------------
+--
+-- Surface the most-used CONFIG toggles as app controls so the user can flip
+-- them without editing this file. We deliberately only expose settings the
+-- body reads LIVE from the ANYG table every frame -- toggling those takes
+-- effect immediately. (Block-viewer draw sub-toggles and the HUD scale are
+-- captured into body-locals once at load and can't be live-driven without
+-- patching the verbatim upstream body, which the build intentionally never
+-- does; they stay file-edited.)
+--
+-- Defaults are seeded from the current CONFIG values, so the panel mirrors
+-- whatever the file says; the user's saved choices then override on reload.
+
+local _anyg_on = (ANYG and ANYG.enabled) and true or false
+
+ui.header("Any% Glitched assist")
+ui.checkbox("anyg_enabled", "Assist enabled", _anyg_on)
+ui.checkbox("anyg_dashboard",  "RAM dashboard",       ANYG.showRamDashboard ~= false)
+ui.checkbox("anyg_highlights", "Route block highlights", ANYG.showRouteBlockHighlights ~= false)
+ui.checkbox("anyg_0380",       "$0380 helper",        ANYG.show0380Helper ~= false)
+ui.checkbox("anyg_plm",        "PLM count",           ANYG.showPlmCount ~= false)
+ui.checkbox("anyg_freeze",     "Freeze timer",        ANYG.showFreezeTimer ~= false)
+ui.checkbox("anyg_warnings",   "Warnings",            ANYG.showWarnings ~= false)
+ui.checkbox("anyg_inputwarn",  "Input warnings",      ANYG.showInputWarnings ~= false)
+ui.checkbox("anyg_waypoints",  "Practice waypoints",  ANYG.showPracticeWaypoints ~= false)
+
+ui.header("Overlay")
+-- colours.opacity is 0..0xFF and IS read live by the colour packer.
+ui.slider("opacity", "Opacity", 0, 255,
+          (CONFIG.colours and CONFIG.colours.opacity) or 0xFF)
+ui.label("Toggles take effect immediately. Scale/viewer layout still edited in the file.")
+
+-- Push the current control values onto the live CONFIG/ANYG tables. Called
+-- every frame (cheap: a handful of table writes) so flipping a checkbox in
+-- the app shows up on the very next paint.
+local function _apply_ui_settings()
+    if not ANYG then return end
+    ANYG.enabled                 = ui.get("anyg_enabled")
+    ANYG.showRamDashboard        = ui.get("anyg_dashboard")
+    ANYG.showRouteBlockHighlights= ui.get("anyg_highlights")
+    ANYG.show0380Helper          = ui.get("anyg_0380")
+    ANYG.showPlmCount            = ui.get("anyg_plm")
+    ANYG.showFreezeTimer         = ui.get("anyg_freeze")
+    ANYG.showWarnings            = ui.get("anyg_warnings")
+    ANYG.showInputWarnings       = ui.get("anyg_inputwarn")
+    ANYG.showPracticeWaypoints   = ui.get("anyg_waypoints")
+    if CONFIG.colours then
+        CONFIG.colours.opacity = ui.get("opacity")
+    end
+end
+
+-- Wrap the PART 1 on_frame so settings are synced before the body paints.
+-- (PART 2 is spliced after PART 1, so this redefinition wins.)
+local _base_on_frame = on_frame
+function on_frame()
+    _apply_ui_settings()
+    if _base_on_frame then _base_on_frame() end
+end
+
 -- ---- draw surface -> sni-lua canvas -----------------------------------------
 --
 -- The Samus-centered block viewer draws into a scaled HUD coordinate space

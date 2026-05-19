@@ -170,11 +170,7 @@ impl SniClient {
 
     /// Batch-read many regions in one round trip. This is the workhorse the
     /// poll engine uses to amortize FXPAK latency across all active watches.
-    pub async fn multi_read(
-        &mut self,
-        uri: &str,
-        regions: &[MemRegion],
-    ) -> Result<Vec<Vec<u8>>> {
+    pub async fn multi_read(&mut self, uri: &str, regions: &[MemRegion]) -> Result<Vec<Vec<u8>>> {
         let requests = regions.iter().map(|r| r.to_read_req()).collect();
         let resp = self
             .memory

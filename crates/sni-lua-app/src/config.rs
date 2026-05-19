@@ -69,8 +69,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             sni_endpoint: format!("http://127.0.0.1:{}", sni_client::DEFAULT_GRPC_PORT),
-            poll_interval_ms: 16, // ~60 logical poll cycles/sec target
-            frame_budget_ms: 16,  // adaptive budget keeps bulk reads ≤ 1 frame
+            poll_interval_ms: 16,   // ~60 logical poll cycles/sec target
+            frame_budget_ms: 16,    // adaptive budget keeps bulk reads ≤ 1 frame
             demand_window_ms: 1000, // unread ~1s -> dormant
             capture_mode: "composited".to_string(),
             capture_device: 0,

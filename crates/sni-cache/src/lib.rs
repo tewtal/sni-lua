@@ -12,6 +12,4 @@ mod watch;
 
 pub use engine::{spawn, PollConfig, PollEngine, PollStats};
 pub use snapshot::Snapshot;
-pub use watch::{
-    coalesce, CoalescedRead, WatchHandle, WatchId, WatchPriority, WatchRegistry,
-};
+pub use watch::{coalesce, CoalescedRead, WatchHandle, WatchId, WatchPriority, WatchRegistry};
