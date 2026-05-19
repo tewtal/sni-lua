@@ -38,6 +38,10 @@ git push origin v0.1.0
 2. attaches all three archives to a single GitHub Release for the tag,
    with auto-generated release notes.
 
+You can also run the same packaging matrix manually from **Actions → release →
+Run workflow** (`workflow_dispatch`) to validate the pipeline without creating a
+tag or publishing a Release.
+
 `.github/workflows/ci.yml` runs `fmt --check`, `clippy -D warnings`, the
 test suite, and a release build on every push/PR across all three OSes, so a
 tag should only ever be cut from already-green `main`.
