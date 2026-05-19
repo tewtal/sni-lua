@@ -448,4 +448,5 @@ if anim.blink(0.5) then gfx.text(8, 8, "!", 0xFFFF4040) end
 | `examples/new_api_demo.lua` | `time`, `log`, `snes.buttons`, signed reads, origin, `on_unload` |
 | `examples/draw_anim_demo.lua` | text bg/outline, `poly`, `arc`, `color_lerp`, `anim.*` |
 | `examples/animated_input_viewer.lua` | animated SNES controller/input viewer with glow, ripples, history, and settings |
+| `examples/sm_stream_overlay.lua` | viewer-facing stream telemetry: room splits, boss timers, RNG proxy |
 | `examples/super_hitbox_sni.lua` | a real 4500-line ported Super Metroid script |

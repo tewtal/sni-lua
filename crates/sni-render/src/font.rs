@@ -13,18 +13,13 @@
 //! step `font.advance()` pixels horizontally.
 
 /// Selectable typeface. Scripts choose via `gfx.font("small"|"normal")`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Font {
     /// 5x7 compact (default).
+    #[default]
     Small,
     /// 8x8 classic.
     Normal,
-}
-
-impl Default for Font {
-    fn default() -> Self {
-        Font::Small
-    }
 }
 
 impl Font {

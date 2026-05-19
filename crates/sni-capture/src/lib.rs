@@ -29,17 +29,12 @@ use nokhwa::utils::{
 };
 use nokhwa::{Camera, FormatDecoder};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CaptureMode {
+    #[default]
     Composited,
     TransparentOverlay,
     StreamingOverlay,
-}
-
-impl Default for CaptureMode {
-    fn default() -> Self {
-        CaptureMode::Composited
-    }
 }
 
 impl CaptureMode {
@@ -72,21 +67,11 @@ pub struct DeviceDesc {
 }
 
 /// Capture format preferences. A zero value means "auto".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CaptureSettings {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
-}
-
-impl Default for CaptureSettings {
-    fn default() -> Self {
-        Self {
-            width: 0,
-            height: 0,
-            fps: 0,
-        }
-    }
 }
 
 impl CaptureSettings {

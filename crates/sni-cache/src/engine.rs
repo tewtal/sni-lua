@@ -432,7 +432,7 @@ pub fn spawn(
 
             // Garbage-collect read-state entries for watches that no longer
             // exist so it can't grow unbounded across room/script changes.
-            if cycle % 256 == 0 {
+            if cycle.is_multiple_of(256) {
                 read_state.retain(|id, _| live_ids.contains(id));
             }
 

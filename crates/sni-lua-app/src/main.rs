@@ -1,9 +1,10 @@
 //! sni-lua: Lua overlay scripting for SNES over SNI/USB2SNES.
 //!
-//! M2 deliverable: the SNI gRPC client wired into the app via a background
-//! actor. Connect/disconnect, device listing + selection, memory-mapping
-//! detection, and a live read probe that surfaces real bytes + round-trip
-//! latency — the number the M3 poll engine exists to hide.
+//! The desktop binary. It wires together the SNI gRPC client (behind a
+//! background actor so the UI thread never blocks on the device), the poll
+//! engine, the LuaJIT script host, the overlay renderer, and the capture
+//! pipeline into a single egui application: connect to SNI, pick a device,
+//! load a script, and draw its overlay over the captured video.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -140,7 +141,7 @@ struct App {
     /// Lua script host. Runs `on_frame` from egui's update loop (UI thread).
     host: ScriptHost,
     console: Arc<Console>,
-    /// Latest script-produced draw list (M5 paints it).
+    /// Latest script-produced draw list; the renderer paints it each frame.
     draw_list: DrawList,
     status: String,
     script_path: String,
@@ -149,11 +150,11 @@ struct App {
     /// only the essentials; tuning/diagnostics live behind the other tabs.
     tab: Tab,
 
-    // Live memory inspector (M2 demo of real reads + latency).
+    // Live memory inspector (Debug tab): one-shot reads + round-trip latency.
     probe_addr_hex: String,
     probe_size: u32,
 
-    // Capture (M6). Source runs only in composited mode; transparent mode
+    // Capture. Source runs only in composited mode; transparent mode
     // opens no device and relies on window transparency instead.
     capture: Option<sni_capture::CaptureSource>,
     capture_devices: Vec<sni_capture::DeviceDesc>,
@@ -193,7 +194,7 @@ impl App {
         let sink = Arc::new(ActorWriteSink { tx: sni.sender() });
         let host = ScriptHost::with_sink(engine.clone(), sink).expect("LuaJIT init failed");
         let console = host.console();
-        // M1 LuaJIT health check, now via the real host.
+        // LuaJIT health check: prove the VM evaluates before loading scripts.
         let lua_status = match host.eval_number("return 2 ^ 10") {
             Ok(v) => format!("LuaJIT OK (2^10 = {v})"),
             Err(e) => format!("LuaJIT FAILED: {e}"),
@@ -558,6 +559,9 @@ impl App {
         }
     }
 
+    // Private paint helper: every argument is one facet of a single paint
+    // operation, so grouping them into a struct would only add indirection.
+    #[allow(clippy::too_many_arguments)]
     fn paint_overlay_canvas(
         &self,
         ui: &mut egui::Ui,
@@ -1433,7 +1437,7 @@ impl eframe::App for App {
                     }
                 }
 
-                // --- Poll engine HUD: the M3 deliverable, live ---
+                // --- Poll engine live telemetry ---
                 section(ui, "Poll engine");
                 let stats = self.engine.stats();
                 egui::Grid::new("poll_stats")

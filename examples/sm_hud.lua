@@ -28,12 +28,12 @@ local GREEN  = 0xFF40FF40
 local YELLOW = 0xFFFFD040
 local RED    = 0xFFFF4040
 local CYAN   = 0xFF40D0FF
-local SHADOW = 0xC0000000
+local OUTLINE = 0xFF000000
 
--- Tiny helper: text with a 1px shadow so it stays readable over any capture.
+-- Tiny helper: outlined text so it stays readable over any capture. The
+-- `outline` draw option replaces the old "draw it twice offset" trick.
 local function label(x, y, str, color)
-  gfx.text(x + 1, y + 1, str, SHADOW)
-  gfx.text(x, y, str, color or WHITE)
+  gfx.text(x, y, str, color or WHITE, { outline = OUTLINE })
 end
 
 function on_init()

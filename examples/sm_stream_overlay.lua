@@ -12,11 +12,13 @@
 --   * resource bars and cache staleness warnings
 --
 -- Notes:
---   * Room/boss history is session-only. Persisting PBs would need a tiny
---     script storage API.
---   * True SM music RNG lives in ARAM/APU state. sni-lua currently exposes
---     cached SNES/FxPak memory reads, so this script uses boss AI variables
---     as a useful on-stream proxy until an ARAM watch API exists.
+--   * Room/boss history is session-only here to keep the example focused.
+--     To persist personal-best room times across runs, use the `store.*`
+--     API (see examples/store_http_demo.lua) — e.g. store.get/set keyed by
+--     room id, loaded in on_init and written when a split improves.
+--   * sni-lua reads cached SNES/FxPak memory; APU/ARAM (true SM music RNG)
+--     is not exposed, so this script uses boss AI variables as a practical
+--     on-stream RNG proxy.
 --   * Add more boss enemy IDs below as they are verified for your route or
 --     ROM hack. Unknown boss rooms still fall back to the highest-health
 --     active enemy while $7E179C says a boss is active.

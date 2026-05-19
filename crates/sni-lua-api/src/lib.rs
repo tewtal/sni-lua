@@ -4,10 +4,10 @@
 //!
 //! * **Scripts never block on SNI.** There is no synchronous "read memory"
 //!   call. Scripts *declare watches* once, then read the latest cached
-//!   snapshot every frame. The poll engine (M3) hides FXPAK latency behind
+//!   snapshot every frame. The poll engine hides FXPAK latency behind
 //!   batched `MultiRead`s.
 //! * **Drawing is retained, not immediate.** `gfx.*` calls push into a
-//!   per-frame [`DrawList`]; the renderer (M5) consumes it. Script frame rate
+//!   per-frame [`DrawList`]; the renderer consumes it. Script frame rate
 //!   and screen refresh are decoupled.
 //! * **Writes are fire-and-forget.** `snes.write` queues a command on the SNI
 //!   actor and returns immediately; it never stalls the frame.
@@ -247,7 +247,8 @@ impl ScriptHost {
         self.console.clone()
     }
 
-    /// Smoke test retained from M1 (used by the app's LuaJIT health check).
+    /// Evaluate a Lua expression to a number. Used by the app's startup
+    /// LuaJIT health check.
     pub fn eval_number(&self, src: &str) -> ScriptResult<f64> {
         Ok(self.lua.load(src).eval::<f64>()?)
     }
@@ -2595,6 +2596,43 @@ mod tests {
         // Should exercise text(bg/outline) + poly + arc + box.
         assert!(dl.cmds.iter().any(|c| matches!(c, DrawCmd::Poly { .. })));
         assert!(dl.cmds.iter().any(|c| matches!(c, DrawCmd::Arc { .. })));
+    }
+
+    /// Every shipped example must at least load and survive a few frames, so
+    /// an API change can't silently break the docs-by-example.
+    fn smoke_example(file: &str) {
+        let path = format!(
+            "{}/../../examples/{file}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let src =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let mut h = host();
+        h.load_script(&src, file)
+            .unwrap_or_else(|e| panic!("{file} failed to load: {e}"));
+        for _ in 0..4 {
+            h.run_frame();
+            assert!(
+                h.is_loaded(),
+                "{file} disabled itself: {:?}",
+                h.console().snapshot()
+            );
+        }
+    }
+
+    #[test]
+    fn sm_hud_example_loads_and_runs() {
+        smoke_example("sm_hud.lua");
+    }
+
+    #[test]
+    fn hires_grid_example_loads_and_runs() {
+        smoke_example("hires_grid.lua");
+    }
+
+    #[test]
+    fn store_http_demo_example_loads_and_runs() {
+        smoke_example("store_http_demo.lua");
     }
 
     #[test]

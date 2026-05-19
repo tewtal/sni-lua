@@ -27,8 +27,8 @@ pub enum TextSizing {
 
 impl Default for TextSizing {
     fn default() -> Self {
-        // Compact-friendly default; with the 5x7 font this is much smaller
-        // than the old fixed 8x8 @ full viewport scale.
+        // Pixel-aligned and zooms with the view; mult 1.0 keeps the compact
+        // 5x7 font readable without dominating the overlay.
         TextSizing::GameScaled { mult: 1.0 }
     }
 }

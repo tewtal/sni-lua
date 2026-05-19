@@ -4,8 +4,9 @@
 //! happens on this Tokio task; the UI talks to it over an mpsc command channel
 //! and observes results through a shared, lock-light [`SniState`] snapshot.
 //!
-//! This is the seam the M3 poll engine plugs into: the actor already owns the
-//! connected [`SniClient`] and the selected device URI.
+//! This is the seam the poll engine plugs into: the actor owns the connected
+//! [`SniClient`] and the selected device URI, and publishes them in a shared
+//! slot the engine reads each cycle.
 
 use std::sync::Arc;
 

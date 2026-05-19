@@ -97,7 +97,6 @@ pub struct DeviceInfo {
 pub struct SniClient {
     devices: pb::devices_client::DevicesClient<Channel>,
     memory: pb::device_memory_client::DeviceMemoryClient<Channel>,
-    control: pb::device_control_client::DeviceControlClient<Channel>,
 }
 
 impl SniClient {
@@ -111,8 +110,7 @@ impl SniClient {
         let channel = endpoint.connect().await?;
         Ok(Self {
             devices: pb::devices_client::DevicesClient::new(channel.clone()),
-            memory: pb::device_memory_client::DeviceMemoryClient::new(channel.clone()),
-            control: pb::device_control_client::DeviceControlClient::new(channel),
+            memory: pb::device_memory_client::DeviceMemoryClient::new(channel),
         })
     }
 

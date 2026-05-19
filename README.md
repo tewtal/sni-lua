@@ -28,19 +28,27 @@ sni-lua is built around that constraint:
 - **LuaJIT** via `mlua` (vendored)
 - Demo target: **Super Metroid**
 
-## Status — incremental build
+## Features
 
-| Milestone | Scope | State |
-|-----------|-------|-------|
-| M1 | Workspace, egui/wgpu window, config, LuaJIT smoke test | ✅ |
-| M2 | SNI gRPC client: connect, list devices, single/multi read | ✅ |
-| M3 | Watch registry, snapshot cache, async poll engine | ✅ |
-| M4 | Unified async-aware Lua API (`snes.*`, `gfx.*`, lifecycle) | ✅ |
-| M5 | Overlay renderer (text, rect, line, hitbox; 5x7 + 8x8 fonts) | ✅ |
-| M6 | Capture modes: composited + transparent click-through + streaming output | ✅ |
-| M7 | Tabbed UI + file dialog; script `store.*` / async `http.*` / `ui.*` settings panel | ✅ |
-| M8 | API round-out: `time.*`, `log.*`, `snes.buttons`/signed reads, `gfx` circle/triangle/metrics/origin, `on_unload` | ✅ |
-| M9 | Drawing/anim helpers: text bg+outline, `gfx.poly`/`arc`/`color_lerp`, `anim.*` easing/oscillators | ✅ |
+- **SNI gRPC client** — connect, enumerate devices, memory-mapping
+  detection; works against real hardware (FXPAK/SD2SNES) or any
+  SNI-compatible emulator.
+- **Async poll engine** — watch registry, immutable snapshot cache, batched
+  `MultiRead`, per-watch priority, demand-based eviction, adaptive bandwidth
+  budget. Scripts never block on I/O.
+- **Full Lua scripting API** — memory (`snes.*`, typed/signed reads,
+  controller decode), retained drawing (`gfx.*`: text with bg/outline,
+  shapes incl. circle/triangle/poly/arc, origin stack, colour lerp),
+  persistence (`store.*`), async HTTP (`http.*`), timing (`time.*`),
+  logging (`log.*`), tweening (`anim.*`), and a script-declared settings
+  panel (`ui.*`). See [`docs/SCRIPTING.md`](docs/SCRIPTING.md).
+- **Overlay renderer** — crisp pixel-art text (5×7 + 8×8 fonts),
+  script-controlled or app-forced canvas resolution.
+- **Capture modes** — composited (in-app capture device), transparent
+  always-on-top overlay (Windows click-through), and detached chroma-key
+  output for OBS.
+- **Tabbed desktop UI** — native file dialog, live memory probe, poll-engine
+  telemetry, and the per-script settings panel.
 
 ## Build & run
 
@@ -201,13 +209,17 @@ user's saved choices override on reload.
 
 ```
 crates/
-  sni-client/    gRPC client + MemRegion abstraction        (M2)
-  sni-cache/     watch registry, snapshot, poll engine       (M3)
-  sni-lua-api/   LuaJIT host + snes/gfx API                  (M4)
-  sni-render/    retained draw-list + egui painter           (M5)
-  sni-capture/   capture device backends                     (M6)
-  sni-lua-app/   binary: wires it all together + UI
-proto/sni.proto  vendored SNI protocol definition
+  sni-client/      gRPC client + MemRegion abstraction
+  sni-cache/       watch registry, snapshot, poll engine
+  sni-lua-api/     LuaJIT host + snes/gfx/ui/store/http API
+  sni-render/      retained draw-list + egui painter
+  sni-capture/     capture device backends
+  sni-lua-app/     binary: wires it all together + UI
+proto/sni.proto    vendored SNI protocol definition
 docs/SCRIPTING.md  complete Lua scripting API reference
-examples/        Super Metroid scripts
+examples/          example overlay scripts (Super Metroid)
 ```
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
