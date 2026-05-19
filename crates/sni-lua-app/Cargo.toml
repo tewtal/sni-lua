@@ -26,7 +26,15 @@ serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true
 arc-swap.workspace = true
-# Native file-open dialog for picking a script. xdg-portal off keeps the
-# Windows build dependency-free; the dialog is only used on an explicit
-# click, off the render loop.
+# Native file-open dialog for picking a script.
+# - Windows: keep xdg-portal off and force modern common controls.
+# - Linux: enable a required backend explicitly (GTK3 in CI/dev images).
+# - macOS: no extra backend feature required.
+[target.'cfg(target_os = "windows")'.dependencies]
 rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rfd = { version = "0.15", default-features = false }
