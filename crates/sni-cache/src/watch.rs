@@ -82,9 +82,14 @@ struct WatchEntry {
     handle: WatchHandle,
     /// Last time a Lua accessor read this watch's value.
     last_touch: Instant,
+    /// Monotonic request marker. Incremented when the script asks for this
+    /// watch's cached value; the poll engine fulfils the latest marker after
+    /// it successfully refreshes the watch from SNI.
+    request_seq: u64,
     /// Declared watches (controller mirror, frame counter, explicit
-    /// snes.tier) are pinned: always polled, never demand-evicted. Only the
-    /// auto-registered read-through watches are demand-driven.
+    /// snes.tier) are pinned: never demand-evicted. Non-realtime pinned
+    /// watches are still bulk-fetched only when requested; realtime active
+    /// watches are read every cycle.
     pinned: bool,
 }
 
@@ -94,6 +99,7 @@ struct WatchEntry {
 #[derive(Default)]
 pub struct WatchRegistry {
     next_id: AtomicU64,
+    next_request: AtomicU64,
     inner: RwLock<BTreeMap<WatchId, WatchEntry>>,
 }
 
@@ -104,6 +110,7 @@ impl WatchRegistry {
 
     pub fn register(&self, region: MemRegion, priority: WatchPriority) -> WatchHandle {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let request_seq = self.next_request.fetch_add(1, Ordering::Relaxed) + 1;
         let handle = WatchHandle {
             id,
             region,
@@ -114,6 +121,7 @@ impl WatchRegistry {
             WatchEntry {
                 handle: handle.clone(),
                 last_touch: Instant::now(), // just-registered counts as wanted
+                request_seq,
                 pinned: false,
             },
         );
@@ -125,17 +133,23 @@ impl WatchRegistry {
     /// demand-eviction timer. Cheap (write lock, O(log n)) and only on actual
     /// reads.
     pub fn touch(&self, id: WatchId) {
+        let request_seq = self.next_request.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(e) = self.inner.write().get_mut(&id) {
             e.last_touch = Instant::now();
+            e.request_seq = request_seq;
         }
     }
 
-    /// Pin a watch so it is always polled regardless of demand. For declared
-    /// watches (controller mirror, frame counter, explicit `snes.tier`) — the
-    /// script means "keep this fresh" even across frames it doesn't read it.
+    /// Pin a watch so it stays active regardless of demand. For declared
+    /// watches (controller mirror, frame counter, explicit `snes.tier`) that
+    /// should not go dormant just because the script skips reading them for a
+    /// few frames.
     pub fn pin(&self, id: WatchId) {
+        let request_seq = self.next_request.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(e) = self.inner.write().get_mut(&id) {
             e.pinned = true;
+            e.last_touch = Instant::now();
+            e.request_seq = request_seq;
         }
     }
 
@@ -146,11 +160,14 @@ impl WatchRegistry {
     /// An explicit tier hint also pins the watch (it's now declared, not
     /// demand-driven).
     pub fn upgrade_priority(&self, id: WatchId, priority: WatchPriority) {
+        let request_seq = self.next_request.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(e) = self.inner.write().get_mut(&id) {
             if priority < e.handle.priority {
                 e.handle.priority = priority;
             }
             e.pinned = true;
+            e.last_touch = Instant::now();
+            e.request_seq = request_seq;
         }
     }
 
@@ -166,7 +183,11 @@ impl WatchRegistry {
     /// (demand-evicted) watches keep their last cached value — the script can
     /// still read stale data, it just isn't refreshed.
     pub fn all(&self) -> Vec<WatchHandle> {
-        self.inner.read().values().map(|e| e.handle.clone()).collect()
+        self.inner
+            .read()
+            .values()
+            .map(|e| e.handle.clone())
+            .collect()
     }
 
     /// Watches the engine should actively poll this cycle: pinned ones, plus
@@ -174,14 +195,25 @@ impl WatchRegistry {
     /// demand filter that stops us spending bandwidth on data the script
     /// stopped caring about (e.g. blocks from rooms ago).
     pub fn active(&self, window: std::time::Duration) -> Vec<WatchHandle> {
+        self.active_with_requests(window)
+            .into_iter()
+            .map(|(handle, _)| handle)
+            .collect()
+    }
+
+    /// Active watches plus their latest request marker. The engine uses this
+    /// to distinguish active-but-already-fulfilled cache entries from data
+    /// the script has requested since the last successful SNI refresh.
+    pub(crate) fn active_with_requests(
+        &self,
+        window: std::time::Duration,
+    ) -> Vec<(WatchHandle, u64)> {
         let now = Instant::now();
         self.inner
             .read()
             .values()
-            .filter(|e| {
-                e.pinned || now.duration_since(e.last_touch) < window
-            })
-            .map(|e| e.handle.clone())
+            .filter(|e| e.pinned || now.duration_since(e.last_touch) < window)
+            .map(|e| (e.handle.clone(), e.request_seq))
             .collect()
     }
 
@@ -195,9 +227,7 @@ impl WatchRegistry {
         self.inner
             .read()
             .values()
-            .filter(|e| {
-                e.pinned || now.duration_since(e.last_touch) < window
-            })
+            .filter(|e| e.pinned || now.duration_since(e.last_touch) < window)
             .count()
     }
 
@@ -398,8 +428,10 @@ mod tests {
         assert!(!active.contains(&b.id), "unread watch goes dormant");
 
         // Dormant != gone: it's still registered (cache retained via all()).
-        assert!(reg.all().iter().any(|w| w.id == b.id),
-            "dormant watch keeps its cached value");
+        assert!(
+            reg.all().iter().any(|w| w.id == b.id),
+            "dormant watch keeps its cached value"
+        );
 
         // Pinning overrides demand: pin b, it's active despite being unread.
         reg.pin(b.id);

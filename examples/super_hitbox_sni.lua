@@ -1,435 +1,379 @@
 -- =============================================================================
--- Mesen2 -> sni-lua compatibility prelude
+-- Super Hitbox -- sni-lua native adapter (PART 1 of 2: pre-CONFIG)
 -- =============================================================================
--- This defines a fake `emu` table (Mesen2's Lua API surface) backed by
--- sni-lua's async snes/gfx API, so an UNMODIFIED Mesen2 SNES script can run
--- on top of the SNI/USB2SNES pipeline.
+-- super_hitbox_sni.lua is assembled as:
+--     [PART 1: this]  ->  [verbatim upstream CONFIG block]  ->
+--     [PART 2: draw + surface glue]  ->  [verbatim upstream body]
+-- The two adapter parts are the ONLY non-upstream code. Everything from the
+-- CONFIG block onward is pristine upstream, so an upstream re-sync is a clean
+-- splice (drop in the new file, re-run the build).
 --
--- THE HARD PART: bandwidth.
---   Mesen2's emu.read(addr,...) is synchronous & instant -- it reads emulator
---   RAM directly, thousands of times per frame, at addresses computed at
---   runtime. sni-lua has NO synchronous read by design: the FXPAK is
---   latency-bound, so scripts must declare watches and read cached snapshots.
+-- WHY THIS EXISTS / WHAT IT REPLACES
+--   The upstream script already abstracts every emulator touchpoint behind its
+--   own `xemu` table (xemu.read_*/write_*/draw*). Earlier ports faked Mesen2's
+--   entire `emu` API *underneath* that, so a value made a needless round trip:
+--   a CPU address was un-mapped then re-mapped to FxPakPro, and a colour's
+--   alpha was inverted then un-inverted -- two cancelling layers plus a second
+--   cache. This adapter deletes all of that: `xemu` binds DIRECTLY to
+--   sni-lua's `snes`/`gfx`, with one honest address map and one colour
+--   conversion. It also provides the small *real* `emu`/`event` surface the
+--   verbatim body still references directly.
 --
---   Bridge: a read-through cache. emu.read(addr) checks a persistent cache.
---   HIT  -> return the cached byte (free, no round trip).
---   MISS -> lazily register a watch for that address (so the poll engine
---           batches it from next cycle on) and return the last-known value
---           (0 the very first time). Within a few frames every address the
---           script actually touches is being batched automatically. The
---           script's synchronous-looking code "just works" on the async
---           model -- this is exactly the bandwidth-hiding the app is built
---           for, applied transparently to a foreign script.
+-- THE ONE HARD PART -- bandwidth (kept, because it is essential):
+--   Upstream reads synchronously thousands of times per frame at addresses
+--   computed at runtime. sni-lua has no synchronous read -- the FXPAK is
+--   latency-bound, so data is declared as watches and read from cached
+--   snapshots. Bridge: a read-through cache. A read HIT returns the cached
+--   byte (free). A MISS lazily registers a watch (the poll engine batches it
+--   from the next cycle) and returns the last-known value (0 the first time).
+--   Within a few frames every address the script touches is being batched.
 --
--- Address mapping (Mesen S-CPU debug space -> sni-lua FxPakPro space):
---   $7E0000-$7FFFFF  WRAM   -> FxPakPro $F50000 + (addr-$7E0000)
---   ROM (LoROM)             -> FxPakPro linear ROM via snes2pc
---   ARAM/SPC                -> not bandwidth-friendly over SNI; served as 0
---                              (the hitbox/route logic doesn't need it).
+-- Address mapping (SNES S-CPU address -> sni-lua memory region):
+--   $7E0000-$7FFFFF / banks $7E,$7F   -> WRAM offset (addr - $7E0000)
+--   LoROM mapped ROM                  -> linear FxPakPro ROM via snes2pc
+--   banks >= $80                      -> mirror of the low banks
+--   anything else (ARAM/SPC)          -> not served over SNI; reads as 0
+--                                        (no upstream draw path consumes it)
 -- =============================================================================
 
-local PRELUDE_VERSION = "mesen2-compat/1"
+local ADAPTER_VERSION = "sni-native/1"
 
--- ---- low-level: cached byte access over sni-lua watches ----------------------
+-- LuaJIT is Lua 5.1-based: no native >> << & | ~ (those are 5.3+). Use the
+-- `bit` library. The upstream body routes its own bit ops through xemu.* which
+-- we point at bit.* below, so the whole script stays LuaJIT-clean with NO
+-- source patching (earlier ports had to gsub the body's xemu helpers).
+local band, bor, bxor, bnot, lsh, rsh =
+    bit.band, bit.bor, bit.bxor, bit.bnot, bit.lshift, bit.rshift
 
--- One watch per touched address-region. We register byte-granular watches and
--- let the poll engine's coalescer fuse adjacent ones into batched MultiReads,
--- so this stays efficient even though the script asks byte-by-byte.
-local _watch_of = {}          -- fxpak addr -> watch id
-local _byte_cache = {}        -- fxpak addr -> last known byte (0..255)
-
--- LuaJIT is Lua 5.1-based: NO native >> << & | ~ operators (those are 5.3+).
--- It ships the `bit` library instead; use it everywhere here. (The original
--- script body routes its own bit ops through xemu.* helpers, which the
--- splicer rewrites to bit.* for the same reason.)
-local band, bor, rsh, lsh =
-    bit.band, bit.bor, bit.rshift, bit.lshift
+-- ---- address mapping --------------------------------------------------------
 
 local function snes2pc(p)
-    -- LoROM CPU address -> unheadered ROM offset (FxPakPro ROM is linear).
+    -- LoROM CPU address -> unheadered linear ROM offset.
     return band(rsh(p, 1), 0x3F8000) + band(p, 0x7FFF)
 end
 
--- Translate a Mesen S-CPU debug address to an sni-lua FxPakPro address,
--- or return nil for spaces we deliberately don't serve over SNI.
-local function to_fxpak(cpu_addr)
-    local bank = band(rsh(cpu_addr, 16), 0xFF)
-    local off  = band(cpu_addr, 0xFFFF)
+-- Classify a 24-bit S-CPU address into ("wram", wram_offset) |
+-- ("rom", fxpak_addr) | nil for spaces we don't serve over SNI.
+local function classify(cpu_addr)
+    local bank   = band(rsh(cpu_addr, 16), 0xFF)
+    local off    = band(cpu_addr, 0xFFFF)
     local lobank = band(bank, 0x7F)
     if cpu_addr >= 0x7E0000 and cpu_addr <= 0x7FFFFF then
-        -- WRAM linear window.
-        return 0xF50000 + (cpu_addr - 0x7E0000)
-    elseif (bank == 0x7E or bank == 0x7F) then
-        return 0xF50000 + (cpu_addr - 0x7E0000)
+        return "wram", cpu_addr - 0x7E0000
+    elseif bank == 0x7E or bank == 0x7F then
+        return "wram", cpu_addr - 0x7E0000
     elseif lobank <= 0x3F and off >= 0x8000 then
-        -- LoROM mapped ROM.
-        return snes2pc(cpu_addr)
+        return "rom", snes2pc(cpu_addr)
     elseif lobank >= 0x40 and lobank <= 0x7D then
-        -- LoROM upper ROM banks.
-        return snes2pc(cpu_addr)
+        return "rom", snes2pc(cpu_addr)
     elseif bank >= 0x80 then
-        -- Mirror of the low banks.
-        return to_fxpak(band(cpu_addr, 0x7FFFFF))
+        return classify(band(cpu_addr, 0x7FFFFF))
     end
     return nil
 end
 
 -- ---- tiered auto-classification ---------------------------------------------
 --
--- The cache-aware model: every address the script touches is auto-assigned a
--- poll tier so the script renders at full rate from cache while the engine
--- streams fresh data in by priority.
+-- Every address the script touches is auto-assigned a poll tier so the script
+-- renders at full rate from cache while the engine streams fresh data in by
+-- priority. An explicit xemu.tier() hint always wins (the engine only ever
+-- raises urgency, never lowers it).
 --
---   realtime : controller state. Tiny, latency-critical -> the poll engine's
---              dedicated sub-poll (never queued behind block data).
+--   realtime : controller + viewport origins + frame clock. Tiny,
+--              latency-critical -> the poll engine's dedicated sub-poll.
 --   high     : Samus/camera/sprite/enemy WRAM that moves every frame.
 --   normal   : slower WRAM (HUD-ish values).
---   low      : level/block/room tables + ROM. Large and slow-changing;
+--   low      : level/block/room tables + ROM. Large, slow-changing;
 --              prefetched in the background, always served from cache.
---
--- WRAM offset = fxpak - 0xF50000. Ranges are SM-specific but the buckets are
--- conservative; an explicit snes.tier() hint from the script always wins
--- (the engine only ever upgrades urgency, never downgrades).
 
-local WRAM_BASE = 0xF50000
-
--- Controller 1 mirror ($7E:008B held, $7E:008F newly-pressed) -> realtime.
-local function is_controller(off)
-    return off == 0x008B or off == 0x008C   -- $008B u16
-        or off == 0x008F or off == 0x0090   -- $008F u16
+local function is_controller(off)        -- $7E:008B held, $7E:008F newly-pressed
+    return off == 0x008B or off == 0x008C
+        or off == 0x008F or off == 0x0090
 end
 
--- Frame-volatile player/world state -> high.
+local function is_realtime(off)
+    return (off >= 0x00B0 and off <= 0x00BB)   -- BG scroll mirrors
+        or (off >= 0x0998 and off <= 0x0999)   -- game mode (pause/unpause)
+        or (off >= 0x0911 and off <= 0x0916)   -- layer 1 camera X/Y
+        or (off >= 0x0AF6 and off <= 0x0AFB)   -- Samus X/Y (centered view)
+        or (off >= 0x05B8 and off <= 0x05BB)   -- NMI frame counter (emu.framecount)
+end
+
 local function is_high_volatility(off)
-    return (off >= 0x00B0 and off <= 0x00B7)   -- layer1/2 scroll (camera)
-        or (off >= 0x0911 and off <= 0x0B0F)   -- Samus pos/vel/pose/hitbox
-        or (off >= 0x0D00 and off <= 0x1FFF)  -- sprite/enemy/projectile tbls
+    return (off >= 0x0911 and off <= 0x0B0F)   -- Samus pos/vel/pose/hitbox
+        or (off >= 0x0D00 and off <= 0x1FFF)   -- sprite/enemy/projectile tbls
         or (off >= 0x0790 and off <= 0x07BF)   -- room/scroll pointers (read hot)
 end
 
-local function tier_for(fxpak)
-    if fxpak >= WRAM_BASE and fxpak <= 0xF6FFFF then
-        local off = fxpak - WRAM_BASE
-        if is_controller(off) then return "realtime" end
-        if is_high_volatility(off) then return "high" end
-        return "normal"
-    end
-    -- ROM / level / everything else: large, static-ish -> prefetch in bg.
-    return "low"
+local function default_tier(kind, off)
+    if kind == "rom" then return "low" end
+    if is_controller(off) then return "realtime" end
+    if is_realtime(off) then return "realtime" end
+    if is_high_volatility(off) then return "high" end
+    return "normal"
 end
 
-local function cached_byte(fxpak)
-    local v = _byte_cache[fxpak]
-    if v ~= nil then
-        -- Refresh from the latest snapshot if the watch has produced data.
-        local w = _watch_of[fxpak]
-        if w then
-            local b = snes.u8(w)
-            if b ~= nil then
-                _byte_cache[fxpak] = b
-                return b
+local PRIORITY_RANK = { low = 1, normal = 2, high = 3, realtime = 4 }
+
+local function stronger(current, requested)
+    if requested == nil then return current end
+    if current == nil then return requested end
+    if (PRIORITY_RANK[requested] or 0) > (PRIORITY_RANK[current] or 0) then
+        return requested
+    end
+    return current
+end
+
+-- ---- read-through cache over sni-lua watches --------------------------------
+
+-- Keep separate 1-byte and 2-byte watches. The runtime publishes a watched
+-- u16 atomically from one snapshot; stitching two independently refreshed
+-- bytes can make edge-sensitive inputs (controller) flap.
+local _watch = { [1] = {}, [2] = {} }  -- size -> (key -> watch id)
+local _byte  = {}                      -- key -> last known byte
+local _word  = {}                      -- key -> last known u16
+local _hint  = {}                      -- key -> strongest requested tier
+
+-- A stable cache key per (kind, addr): WRAM keyed by offset, ROM by fxpak
+-- addr + a high bit so the two address spaces never collide.
+local function keyof(kind, addr)
+    if kind == "rom" then return addr + 0x1000000 end
+    return addr
+end
+
+local function register(kind, addr, size, prio)
+    local key = keyof(kind, addr)
+    local w = _watch[size][key]
+    if w == nil then
+        local p = prio
+        if p == nil then
+            p = default_tier(kind, kind == "wram" and addr or 0)
+            for k = 0, size - 1 do
+                p = stronger(p, _hint[keyof(kind, addr + k)])
             end
         end
+        if kind == "wram" then
+            w = snes.watch(addr, size, p)            -- WRAM offset form
+        else
+            w = snes.watch_abs(addr, size, p)        -- raw FxPakPro addr (ROM)
+        end
+        _watch[size][key] = w
+    elseif prio ~= nil then
+        snes.tier(w, prio)
+    end
+    return w
+end
+
+local function cached_byte(kind, addr)
+    local key = keyof(kind, addr)
+    local w = _watch[1][key] or register(kind, addr, 1)
+    local b = snes.u8(w)
+    if b ~= nil then
+        b = band(b, 0xFF)
+        _byte[key] = b
+        return b
+    end
+    return _byte[key] or 0
+end
+
+local function cached_u16(kind, addr)
+    local key = keyof(kind, addr)
+    local w = _watch[2][key] or register(kind, addr, 2)
+    local v = snes.u16(w)
+    if v ~= nil then
+        _word[key] = v
         return v
     end
-    -- First touch: register a 1-byte watch (the engine coalesces adjacent
-    -- ones into batched reads) at its auto-classified tier, and return 0
-    -- until the poll loop fills it in.
-    local w = _watch_of[fxpak]
-    if w == nil then
-        w = snes.watch_abs(fxpak, 1, tier_for(fxpak))
-        _watch_of[fxpak] = w
-    end
-    local b = snes.u8(w)
-    b = b or 0
-    _byte_cache[fxpak] = b
-    return b
+    if _word[key] ~= nil then return _word[key] end
+    -- Reuse warmed byte caches until the native u16 watch has a snapshot.
+    return cached_byte(kind, addr) + cached_byte(kind, addr + 1) * 256
 end
 
--- Public hook so the script (or our own setup below) can force a tier on a
--- CPU address. Registers the watch if not seen yet, then upgrades it.
--- Exposed as xemu.tier / snes_tier for the body to opt into.
-local function tier_cpu(cpu_addr, class)
-    local fx = to_fxpak(cpu_addr)
-    if fx == nil then return end
-    local w = _watch_of[fx]
-    if w == nil then
-        w = snes.watch_abs(fx, 1, class)
-        _watch_of[fx] = w
-    else
-        snes.tier(w, class)
+local function invalidate_words(kind, addr, size)
+    for a = addr - 1, addr + size - 1 do
+        if a >= 0 then _word[keyof(kind, a)] = nil end
     end
 end
 
--- Read 1 or 2 bytes (little-endian) with optional sign extension.
+-- ---- the xemu read/write/bit surface ----------------------------------------
+
+xemu = {}
+
+xemu.emuId_bizhawk = 0
+xemu.emuId_snes9x  = 1
+xemu.emuId_lsnes   = 2
+xemu.emuId_mesen   = 3
+xemu.emuId_mesen2  = 4
+-- The upstream tail dispatch branches on this. emuId_mesen selects the
+-- addEventCallback path, which we drive from on_frame.
+xemu.emuId = xemu.emuId_mesen
+
+xemu.rshift = function(x, y) return rsh(x, y) end
+xemu.lshift = function(x, y) return lsh(x, y) end
+xemu.not_   = function(x)    return bnot(x)   end
+xemu.and_   = function(x, y) return band(x, y) end
+xemu.or_    = function(x, y) return bor(x, y)  end
+xemu.xor    = function(x, y) return bxor(x, y) end
+
 local function read_n(cpu_addr, n, signed)
-    local fx = to_fxpak(cpu_addr)
-    if fx == nil then
-        return 0 -- unmapped (e.g. ARAM) -> benign zero
-    end
-    local lo = cached_byte(fx)
-    local val
+    local kind, addr = classify(cpu_addr)
+    if kind == nil then return 0 end  -- ARAM/SPC: benign zero
+    local v
     if n == 2 then
-        local hi = cached_byte(fx + 1)
-        val = lo + hi * 256
-        if signed and val >= 0x8000 then val = val - 0x10000 end
+        v = cached_u16(kind, addr)
+        if signed and v >= 0x8000 then v = v - 0x10000 end
     else
-        val = lo
-        if signed and val >= 0x80 then val = val - 0x100 end
-    end
-    return val
-end
-
--- ---- fake `emu` table : Mesen2 API surface ----------------------------------
-
-emu = {}
-
--- Memory type tokens. The script only switches on identity, so opaque
--- sentinels are fine; our read()/write() ignore the type and use the
--- address mapping above (which already distinguishes WRAM vs ROM).
-emu.memType = {
-    snesMemory   = "snesMemory",
-    snesDebug    = "snesDebug",
-    snesWorkRam  = "snesWorkRam",
-    workRam      = "workRam",
-    snesPrgRom   = "snesPrgRom",
-    prgRom       = "prgRom",
-    spcRam       = "spcRam",
-    spcMemory    = "spcMemory",
-}
-
-emu.eventType = { nmi = "nmi", startFrame = "startFrame", endFrame = "endFrame" }
-
-emu.emuId_bizhawk = 0
-emu.emuId_snes9x  = 1
-emu.emuId_lsnes   = 2
-emu.emuId_mesen   = 3
-emu.emuId_mesen2  = 4
-
-function emu.getState()
-    -- Enough for the script's SNES-core guard.
-    return { consoleType = "Snes" }
-end
-
-function emu.read(addr, _memType, signed)
-    return read_n(addr, 1, signed or false)
-end
-
-function emu.read16(addr, _memType, signed)
-    return read_n(addr, 2, signed or false)
-end
-
--- Writes go through sni-lua's fire-and-forget snes.write (queued on the SNI
--- actor; never blocks the frame). Only WRAM writes are honored.
-function emu.write(addr, value, _memType)
-    local fx = to_fxpak(addr)
-    if fx and fx >= 0xF50000 and fx <= 0xF6FFFF then
-        local b = band(value, 0xFF)
-        snes.write(fx, b, 1)
-        _byte_cache[fx] = b
-    end
-end
-
-function emu.write16(addr, value, _memType)
-    local fx = to_fxpak(addr)
-    if fx and fx >= 0xF50000 and fx <= 0xF6FFFF then
-        snes.write(fx, band(value, 0xFFFF), 2)
-        _byte_cache[fx]     = band(value, 0xFF)
-        _byte_cache[fx + 1] = band(rsh(value, 8), 0xFF)
-    end
-end
-
--- emu.framecount(): the CONSOLE's frame clock, not our render loop.
---
--- Over SNI we are a latency-bound external observer -- we cannot see every
--- console frame (the poll RTT means we sample ~50/sec of a 60fps game). A
--- self-incremented render counter would be OUR cadence and would drift vs
--- the console, breaking any "frames since X" math. Instead we report Super
--- Metroid's own NMI frame counter at $7E:05B8 (a 16-bit value the engine
--- bumps every NMI regardless of pause/door/menu state -- monotonic and
--- console-paced). It is read at REALTIME tier so it tracks as closely as
--- the link allows; it will jump by 1-3 when RTT lags, but elapsed-frame
--- arithmetic stays game-accurate (we never invent intermediate values).
---
--- $05B8 is the low word; SM also keeps a high word at $05BA for a 32-bit
--- count that won't wrap for ~828 days of play -- we combine both so long
--- sessions don't see the 16-bit rollover (~18 min) corrupt a delta.
-local FRAMECOUNT_FALLBACK = 0     -- our tick, used only until SNI fills in
-
-function emu.framecount()
-    local lo = read_n(0x7E05B8, 2, false)
-    local hi = read_n(0x7E05BA, 2, false)
-    local v = hi * 0x10000 + lo
-    if v == 0 then
-        -- Pre-connect / cache cold: fall back to our render tick so the
-        -- value is still monotonic and non-nil for the script's logging.
-        return FRAMECOUNT_FALLBACK
+        v = cached_byte(kind, addr)
+        if signed and v >= 0x80 then v = v - 0x100 end
     end
     return v
 end
 
+xemu.read_u8     = function(p) return read_n(p, 1, false) end
+xemu.read_u16_le = function(p) return read_n(p, 2, false) end
+xemu.read_s8     = function(p) return read_n(p, 1, true)  end
+xemu.read_s16_le = function(p) return read_n(p, 2, true)  end
+
+-- The body's bank-wrapped readers (makeBankWrappedReader, kept verbatim) call
+-- these two as free globals. Upstream defined them in its glue zone delegating
+-- to emu.read(...,snesDebug,...); ours delegate straight to read_n.
+function readCpu8(p, signed)  return read_n(p, 1, signed or false) end
+function readCpu16(p, signed) return read_n(p, 2, signed or false) end
+
+-- ARAM/SPC isn't bandwidth-friendly over SNI and no draw path consumes it
+-- (the upstream sound-engine readers are defined but never called). Serve 0.
+xemu.read_aram_u8     = function() return 0 end
+xemu.read_aram_u16_le = function() return 0 end
+xemu.read_aram_s8     = function() return 0 end
+xemu.read_aram_s16_le = function() return 0 end
+
+-- Writes are fire-and-forget on the SNI actor (never block the frame). Only
+-- WRAM is honored. The upstream writers pass a bank-masked offset relative to
+-- $7E0000 (& 0x1FFFF) -- already a raw WRAM offset.
+local function write_wram(off, value, size)
+    off = band(off, 0x1FFFF)
+    snes.write(0xF50000 + off, value, size)
+    if size == 2 then
+        _byte[off]     = band(value, 0xFF)
+        _byte[off + 1] = band(rsh(value, 8), 0xFF)
+        invalidate_words("wram", off, 2)
+        _word[off]     = band(value, 0xFFFF)
+    else
+        _byte[off] = band(value, 0xFF)
+        invalidate_words("wram", off, 1)
+    end
+end
+
+xemu.write_u8     = function(off, v) write_wram(off, band(v, 0xFF), 1) end
+xemu.write_u16_le = function(off, v) write_wram(off, band(v, 0xFFFF), 2) end
+
+-- xemu.tier(cpuAddr, class): force a poll tier on an address. Used by on_init
+-- to pin controller/camera/frame-clock into the realtime sub-poll from cycle
+-- 1; also exposed for the body to opt into.
+local function tier_cpu(cpu_addr, class, size)
+    local kind, addr = classify(cpu_addr)
+    if kind == nil then return end
+    size = size or 1
+    for k = 0, size - 1 do
+        local kk = keyof(kind, addr + k)
+        _hint[kk] = stronger(_hint[kk], class)
+    end
+    local w = register(kind, addr, size, class)
+    snes.tier(w, class)
+    -- A u16 watch starting one byte earlier overlaps this address too.
+    local prev = _watch[2][keyof(kind, addr - 1)]
+    if prev ~= nil then snes.tier(prev, class) end
+end
+xemu.tier = function(cpu_addr, class) tier_cpu(cpu_addr, class, 1) end
+
+-- ---- minimal real `emu` / `event` the verbatim body calls directly ----------
+--
+-- These are the ONLY symbols the upstream body uses outside its xemu table
+-- (audited: framecount, displayMessage/log, drawRectangle, clearScreen,
+-- getState, addEventCallback + the event.* the never-taken non-Mesen tail
+-- branches reference). Each gets a direct sni-lua-native implementation; we do
+-- NOT fake the rest of the Mesen2 API.
+
+emu = {}
+
+-- The body indexes emu.memType for opaque memory-type tokens it only ever
+-- compares by identity; any stable value works since our address map (not the
+-- token) decides WRAM vs ROM.
+emu.memType = setmetatable({}, { __index = function() return "snes" end })
+emu.eventType   = { nmi = "nmi", startFrame = "startFrame", endFrame = "endFrame" }
+
+function emu.getState() return { consoleType = "Snes" } end
 function emu.log(msg) print(tostring(msg)) end
 function emu.displayMessage(_cat, msg) print(tostring(msg)) end
+-- sni-lua clears the canvas every frame, so a one-time clear is a no-op.
+function emu.clearScreen() end
 
--- Draw-surface API. The script's Samus-centered block viewer selects the
--- "scriptHud" surface at a scale (default 3) and then draws in that scaled
--- coordinate space (e.g. 768x672). sni-lua's equivalent is the resolution
--- canvas: selecting the HUD surface at scale N => gfx.scale(N), so the
--- script's coords map 1:1 onto our canvas. Without this the script falls
--- back to a 256x224 console-screen space while its layout assumes the
--- larger one -> everything draws off-canvas / wrong size.
-emu.drawSurface = { scriptHud = "scriptHud", consoleScreen = "consoleScreen" }
-
-local _hud_scale = 1
-function emu.selectDrawSurface(which, scale)
-    if which == "scriptHud" then
-        _hud_scale = math.max(1, math.floor((scale or 1) + 0.5))
-        gfx.scale(_hud_scale)          -- canvas becomes 256*N x 224*N
-    else
-        _hud_scale = 1
-        gfx.scale(1)
-    end
+-- emu.framecount(): the CONSOLE's NMI frame clock, NOT our render loop. Over
+-- SNI we are a latency-bound observer and cannot see every console frame; a
+-- self-incremented render tick would drift vs the console and break the
+-- body's frame-delta math (its hotkey edge-detector keys off this). SM bumps
+-- a 32-bit NMI counter at $7E:05B8 (lo) / $05BA (hi) every NMI regardless of
+-- pause/door/menu -- monotonic and console-paced. on_init pins it realtime so
+-- it tracks as tightly as the link allows. The 32-bit form won't wrap for
+-- ~828 days, so long sessions never see the 16-bit (~18 min) rollover corrupt
+-- a delta.
+local FRAMECOUNT_FALLBACK = 0
+function emu.framecount()
+    local lo = read_n(0x7E05B8, 2, false)
+    local hi = read_n(0x7E05BA, 2, false)
+    local v = hi * 0x10000 + lo
+    if v == 0 then return FRAMECOUNT_FALLBACK end  -- cache cold / pre-connect
+    return v
 end
 
-function emu.getDrawSurfaceSize(_which)
-    -- Report the active scaled HUD size so the script's centering math is
-    -- correct. gfx.width()/height() reflect the canvas we just set.
-    return {
-        width = gfx.width(),  height = gfx.height(),
-        visibleWidth = gfx.width(), visibleHeight = gfx.height(),
-    }
-end
-
-function emu.getScreenSize()
-    return { width = gfx.width(), height = gfx.height() }
-end
-
--- Colour handling. The script's mesenDrawColourFromRgba already encodes
--- colours as 0xAARRGGBB AND, with CONFIG.drawing.mesenDrawAlphaInverted =
--- true (the default), it INVERTS alpha (00 = opaque, FF = transparent --
--- Mesen's convention). sni-lua's gfx.* expect standard 0xAARRGGBB where
--- FF = opaque. So we must un-invert the alpha byte here, otherwise every
--- "opaque" thing the script draws arrives as alpha 0x00 = fully
--- transparent (the "nothing renders" symptom).
-local MESEN_ALPHA_INVERTED = true
--- NOTE on integer width: LuaJIT's `bit` ops are signed 32-bit, so
--- bit.lshift(0xFF,24) yields a NEGATIVE number, and `a*0x1000000` for
--- a>=0x80 exceeds i32. sni-lua's gfx.* take a u32 0xAARRGGBB. So we must
--- hand back a plain Lua number in the unsigned range [0, 0xFFFFFFFF] and
--- never a bit-op result for the top byte. Decompose, then recompose with
--- arithmetic (which stays a double, exact to 2^53).
-local function argb(c)
-    if c == nil then return nil end
-    -- Pull bytes out of whatever the script gave us (it may itself be a
-    -- signed/negative 32-bit value from its own lshift(a,24)).
-    if c < 0 then c = c + 0x100000000 end
-    local a = math.floor(c / 0x1000000) % 0x100
-    local r = math.floor(c / 0x10000)   % 0x100
-    local g = math.floor(c / 0x100)     % 0x100
-    local b = c % 0x100
-    if MESEN_ALPHA_INVERTED then
-        a = 0xFF - a
-    end
-    -- Recompose as an unsigned double in [0, 0xFFFFFFFF].
-    return a * 0x1000000 + r * 0x10000 + g * 0x100 + b
-end
-
-function emu.drawPixel(x, y, color, _alpha)
-    gfx.pixel(x, y, argb(color))
-end
-
-function emu.drawLine(x0, y0, x1, y1, color, _alpha)
-    gfx.line(x0, y0, x1, y1, argb(color), 1.0)
-end
-
-function emu.drawRectangle(x, y, w, h, color, filled, _alpha)
-    local c = argb(color)
-    if filled then
-        gfx.box(x, y, w, h, c, c, 1.0)      -- outline + fill same colour
-    else
-        gfx.box(x, y, w, h, c, nil, 1.0)    -- outline only
-    end
-end
-
-function emu.drawString(x, y, text, color, _bgColor, _maxWidth, _scale)
-    -- Background colour is dropped (sni-lua text has no per-call bg); the
-    -- script already draws its own backing boxes for panels.
-    gfx.text(x, y, tostring(text), argb(color))
-end
-
--- Frame dispatch: the script calls emu.addEventCallback(on_paint, nmi) at the
--- end. We capture that callback and drive it from sni-lua's on_frame.
+-- The body's tail dispatch calls emu.addEventCallback(on_paint, nmi) on the
+-- Mesen branch; capture it and pump from on_frame. The bizhawk/snes9x
+-- branches are never taken (emuId == emuId_mesen) but `event` must exist as a
+-- table for that elseif chain to parse.
 local _paint_cb = nil
 function emu.addEventCallback(cb, _evt) _paint_cb = cb end
 function emu.removeEventCallback() _paint_cb = nil end
+function emu.frameadvance() end
 
--- Some scripts also reference these globals (BizHawk/snes9x paths). Stub them
--- so the dispatch tail's branches don't error even though we use the Mesen
--- branch.
-event = { unregisterbyname = function() end, onframestart = function() end }
-console = { log = function(m) print(tostring(m)) end }
+event = {
+    unregisterbyname = function() end,
+    onframestart     = function() end,
+}
 
--- Expose the tier hook so the script body (or future scripts) can override
--- classification, e.g. xemu.tier(0x7E0AF6, "high"). emu.tier mirrors it.
-xemu_tier = tier_cpu          -- picked up if the body's xemu refers to it
-function emu.tier(cpu_addr, class) tier_cpu(cpu_addr, class) end
+-- ---- sni-lua lifecycle ------------------------------------------------------
 
--- sni-lua lifecycle. The original script body (appended after this prelude)
--- runs at load: it builds everything and calls emu.addEventCallback(on_paint).
--- We then pump that callback every frame.
 function on_init()
-    print("Super Hitbox running via " .. PRELUDE_VERSION ..
-          " (Mesen2 compat over SNI)")
+    print("Super Hitbox running via " .. ADAPTER_VERSION .. " (sni-lua native)")
 
-    -- Pre-register the controller mirror at REALTIME priority so it lands in
-    -- the poll engine's dedicated fast sub-poll from cycle 1 -- not lazily on
-    -- the script's first input read. $7E:008B held, $7E:008F newly-pressed
-    -- (the $4218 mirror + edge bits the script's sm.getInput/getChangedInput
-    -- read). Read-only: we never inject synthetic inputs (SNI write latency
-    -- makes that unsafe for real play); the script just sees the real pad.
-    tier_cpu(0x7E008B, "realtime")
-    tier_cpu(0x7E008C, "realtime")
-    tier_cpu(0x7E008F, "realtime")
-    tier_cpu(0x7E0090, "realtime")
+    -- Pin controller + game-mode mirrors to the realtime sub-poll from cycle 1
+    -- so input and pause/unpause timing aren't queued behind block data.
+    tier_cpu(0x7E008B, "realtime", 2)   -- held buttons
+    tier_cpu(0x7E008F, "realtime", 2)   -- newly-pressed
+    tier_cpu(0x7E0998, "realtime", 2)   -- game mode
 
-    -- SM NMI frame counter ($7E:05B8 lo, $05BA hi) at realtime so
-    -- emu.framecount() tracks the console's clock as tightly as the link
-    -- allows (see emu.framecount above for why this, not our render tick).
-    tier_cpu(0x7E05B8, "realtime")
-    tier_cpu(0x7E05B9, "realtime")
-    tier_cpu(0x7E05BA, "realtime")
-    tier_cpu(0x7E05BB, "realtime")
+    -- SM NMI frame counter -> realtime so emu.framecount() tracks the
+    -- console clock as tightly as the link allows.
+    tier_cpu(0x7E05B8, "realtime", 2)
+    tier_cpu(0x7E05BA, "realtime", 2)
 
-    print("controller mirror @ realtime ($7E:008B/$008F)")
-    print("frame clock = SNES NMI counter $7E:05B8 @ realtime")
-    print("rendering runs at full rate from cache; data streams in by tier")
+    -- Block/hitbox grid origin = Samus position (centered/follow) or layer-1
+    -- camera (normal). Keep both paths realtime so it scrolls smoothly.
+    for a = 0x7E00B0, 0x7E00BB do tier_cpu(a, "realtime") end  -- BG scroll
+    for a = 0x7E0911, 0x7E0916 do tier_cpu(a, "realtime") end  -- camera X/Y
+    for a = 0x7E0AF6, 0x7E0AFB do tier_cpu(a, "realtime") end  -- Samus X/Y
+
+    print("controller @ realtime ($7E:008B/$008F), frame clock = NMI $7E:05B8")
+    print("grid origin = camera/Samus @ realtime; rendering full-rate from cache")
 end
 
 function on_frame()
-    -- Advance the pre-connect fallback only (real count comes from $05B8).
-    FRAMECOUNT_FALLBACK = FRAMECOUNT_FALLBACK + 1
-    if _paint_cb then
-        _paint_cb()
-    end
+    FRAMECOUNT_FALLBACK = FRAMECOUNT_FALLBACK + 1  -- pre-connect only
+    if _paint_cb then _paint_cb() end
 end
 
--- =============================================================================
--- Original Super Hitbox script body follows (unmodified).
--- =============================================================================
-
--- Super Hitbox for Mesen2 (SNES)
--- Standalone conversion generated from the provided Super Hitbox script plus the upstream
--- Super Metroid helper definitions. Load this file from Mesen2's Script Window while a
--- Super Metroid ROM is running.
---
--- Mesen2 notes:
---   * This version does not require "cross emu.lua" or "Super Metroid.lua".
---   * It uses Mesen2 API names: emu.read/read16/write/write16 and SNES memory types.
---   * If you prefer the HUD surface instead of the console framebuffer, change
---     USE_SCRIPT_HUD to true below.
---   * This variant includes Any% Glitched route assists, a Doorskip timing analyzer,
---     and a separate block-viewer layer toggle.
-
+-- PART 2 (draw layer + draw-surface selection) is spliced in AFTER the
+-- upstream CONFIG block, since it reads CONFIG (Samus-centered scale,
+-- y-offset, view mode). It uses the globals `xemu` and `emu` defined above.
 -- =============================================================================
 -- USER CONFIGURATION - edit this section first
 -- =============================================================================
@@ -1050,154 +994,104 @@ local SAMUS_CENTERED_BLOCK_VIEW_DRAW_FX = CONFIG.samusCenteredBlockView.drawFx
 local SAMUS_CENTERED_BLOCK_VIEW_DRAW_HITBOXES = CONFIG.samusCenteredBlockView.drawHitboxes
 local SAMUS_CENTERED_BLOCK_VIEW_DRAW_STATUS_TEXT = CONFIG.samusCenteredBlockView.drawStatusText
 local ANYG = CONFIG.anyGlitchedAssist or {}
+-- =============================================================================
+-- Super Hitbox -- sni-lua native adapter (PART 2 of 2: post-CONFIG)
+-- =============================================================================
+-- Spliced in AFTER the upstream CONFIG block + its `local USE_*` aliases,
+-- because the draw layer and draw-surface selection read CONFIG (Samus-
+-- centered scale, y-offset, view mode). Everything below this part is the
+-- pristine upstream body, verbatim.
+-- =============================================================================
 
-if not emu or not emu.getState then
-    error("This standalone version must be run inside Mesen2's Lua script window.")
-end
-
-local state = emu.getState()
-if state and state.consoleType and state.consoleType ~= "Snes" and state.consoleType ~= "SNES" then
-    emu.displayMessage("Super Hitbox", "This script is for the SNES core. Current console: " .. tostring(state.consoleType))
+-- Console / SNES-core guard (upstream had this inline; emu.getState is real).
+local _state = emu.getState()
+if _state and _state.consoleType
+   and _state.consoleType ~= "Snes" and _state.consoleType ~= "SNES" then
+    emu.displayMessage("Super Hitbox",
+        "This script is for the SNES core. Current console: "
+        .. tostring(_state.consoleType))
     return
 end
 
-local function selectConfiguredDrawSurface()
-    if USE_SAMUS_CENTERED_BLOCK_VIEW and emu.drawSurface and emu.drawSurface.scriptHud then
-        emu.selectDrawSurface(emu.drawSurface.scriptHud, SAMUS_CENTERED_BLOCK_VIEW_SCALE)
-    elseif USE_SCRIPT_HUD and emu.drawSurface and emu.drawSurface.scriptHud then
-        emu.selectDrawSurface(emu.drawSurface.scriptHud, 1)
-    elseif emu.drawSurface and emu.drawSurface.consoleScreen then
-        emu.selectDrawSurface(emu.drawSurface.consoleScreen)
-    end
+-- ---- draw surface -> sni-lua canvas -----------------------------------------
+--
+-- The Samus-centered block viewer draws into a scaled HUD coordinate space
+-- (e.g. 3x -> 768x672) and its layout math assumes that larger space. sni-lua's
+-- equivalent is gfx.scale(N): the canvas becomes 256N x 224N and the script's
+-- coords map 1:1. Without this the body would lay out for the big space on a
+-- 256x224 canvas -> everything off-canvas. (This IS load-bearing; only the
+-- Mesen drawSurface *indirection* was cruft, not the scaling itself.)
+
+local _hud_scale = 1
+if USE_SAMUS_CENTERED_BLOCK_VIEW then
+    _hud_scale = math.max(1, math.floor((SAMUS_CENTERED_BLOCK_VIEW_SCALE or 1) + 0.5))
+end
+gfx.scale(_hud_scale)
+
+-- Upstream's drawYOffset(): the legacy console-screen overlay needs a small
+-- vertical nudge; the Samus-centered scriptHud viewer is its own coord space
+-- and uses 0. We fold this into the draw primitives below, exactly as upstream
+-- did inside its xemu.draw* wrappers.
+local function drawYOffset()
+    if USE_SAMUS_CENTERED_BLOCK_VIEW then return 0 end
+    return MESEN_Y_OFFSET
 end
 
-selectConfiguredDrawSurface()
-
-local xemu = {}
-xemu.emuId_bizhawk = 0
-xemu.emuId_snes9x  = 1
-xemu.emuId_lsnes   = 2
-xemu.emuId_mesen   = 3
-xemu.emuId_mesen2  = 4
--- Keep emuId_mesen here because the original script's callback dispatch checks that value.
-xemu.emuId = xemu.emuId_mesen
-
--- Bitwise helpers. Mesen2 uses a modern Lua runtime with native bitwise operators.
-xemu.rshift = function(x, y) return bit.rshift(x, y) end
-xemu.lshift = function(x, y) return bit.lshift(x, y) end
-xemu.not_   = function(x) return bit.bnot(x) end
-xemu.and_   = function(x, y) return bit.band(x, y) end
-xemu.or_    = function(x, y) return bit.bor(x, y) end
-xemu.xor    = function(x, y) return bit.bxor(x, y) end
-
-local function snes2pc(p)
-    -- LoROM CPU address to unheadered ROM offset. This is kept for fallback direct ROM reads.
-    return xemu.and_(xemu.rshift(p, 1), 0x3F8000) + xemu.and_(p, 0x7FFF)
+-- Upstream's getConfiguredViewSize(): the body calls this once in on_paint to
+-- size its centered layout. sni-lua's gfx.width()/height() ALWAYS report the
+-- effective canvas (after gfx.scale and any app override), so this is exactly
+-- the right answer with none of the Mesen surface-size plumbing.
+function getConfiguredViewSize()
+    return gfx.width(), gfx.height()
 end
 
-local mem = emu.memType
-local snesDebug = mem.snesDebug or mem.snesMemory
-local snesMemory = mem.snesMemory or snesDebug
-local wram = mem.snesWorkRam or mem.workRam
-local spcRam = mem.spcRam or mem.spcMemory
-local prgRom = mem.snesPrgRom or mem.prgRom
+-- Upstream re-selects its draw surface at the top of every on_paint (Mesen
+-- needs the surface re-bound per frame). On sni-lua the canvas scale is set
+-- once at load (gfx.scale above) and never changes, so the per-frame call is
+-- a no-op -- but the body still calls it, so it must exist as a global.
+function selectConfiguredDrawSurface() end
 
-local function readCpu8(p, signed)
-    -- Prefer the S-CPU debug address space so 24-bit SNES CPU addresses work for both WRAM and ROM.
-    return emu.read(p, snesDebug, signed or false)
-end
+-- ---- colour: one conversion, no inversion -----------------------------------
+--
+-- The upstream body produces colours as 0xRRGGBBAA (FF alpha = opaque) and the
+-- string names below. sni-lua's gfx.* take 0xAARRGGBB (FF alpha = opaque). So
+-- exactly one re-pack, RRGGBBAA -> AARRGGBB. (The old Mesen path inverted
+-- alpha here and the prelude un-inverted it -- both deleted.)
+--
+-- Integer-width note: LuaJIT's bit ops are signed 32-bit, so lshift(0xFF,24)
+-- is negative while gfx.* want an unsigned 0..0xFFFFFFFF. Decompose with /%
+-- and recompose with arithmetic (stays an exact double).
 
-local function readCpu16(p, signed)
-    return emu.read16(p, snesDebug, signed or false)
-end
+local NAMED = {
+    red="FF0000", orange="FF8000", yellow="FFFF00", white="FFFFFF",
+    black="000000", green="00FF00", purple="FF00FF", cyan="00FFFF",
+    blue="0000FF", gray="808080", grey="808080",
+    darkgray="404040", darkgrey="404040",
+}
 
-local function writeWram8(p, v)
-    if p < 0x800000 then
-        return emu.write(xemu.and_(p, 0x1FFFF), xemu.and_(v, 0xFF), wram)
-    end
-    emu.log(string.format('Error: trying to write to ROM address %X', p))
-end
-
-local function writeWram16(p, v)
-    if p < 0x800000 then
-        return emu.write16(xemu.and_(p, 0x1FFFF), xemu.and_(v, 0xFFFF), wram)
-    end
-    emu.log(string.format('Error: trying to write to ROM address %X', p))
-end
-
-xemu.read_u8      = function(p) return readCpu8(p, false) end
-xemu.read_u16_le  = function(p) return readCpu16(p, false) end
-xemu.read_s8      = function(p) return readCpu8(p, true) end
-xemu.read_s16_le  = function(p) return readCpu16(p, true) end
-xemu.write_u8     = writeWram8
-xemu.write_u16_le = writeWram16
-
-xemu.read_aram_u8     = function(p) return emu.read(p, spcRam, false) end
-xemu.read_aram_u16_le = function(p) return emu.read16(p, spcRam, false) end
-xemu.read_aram_s8     = function(p) return emu.read(p, spcRam, true) end
-xemu.read_aram_s16_le = function(p) return emu.read16(p, spcRam, true) end
-
-local function mesenDrawColourFromRgba(r, g, b, a)
-    r = xemu.and_(math.floor(r or 0), 0xFF)
-    g = xemu.and_(math.floor(g or 0), 0xFF)
-    b = xemu.and_(math.floor(b or 0), 0xFF)
-    a = xemu.and_(math.floor(a == nil and 0xFF or a), 0xFF)
-
-    local drawAlpha = a
-    if MESEN_DRAW_ALPHA_INVERTED then
-        -- Mesen's draw APIs commonly use inverted alpha: 00 = opaque, FF = transparent.
-        drawAlpha = 0xFF - a
-    end
-
-    return xemu.lshift(drawAlpha, 24)
-         + xemu.lshift(r, 16)
-         + xemu.lshift(g, 8)
-         + b
-end
-
-local function mesenColour(colour)
-    if colour == nil then
-        return nil
-    end
-
+local function to_argb(colour)
+    if colour == nil then return nil end
+    local r, g, b, a
     if type(colour) == "string" then
-        if colour == "red" then
-            return mesenDrawColourFromRgba(0xFF, 0x00, 0x00, 0xFF)
-        elseif colour == "orange" then
-            return mesenDrawColourFromRgba(0xFF, 0x80, 0x00, 0xFF)
-        elseif colour == "yellow" then
-            return mesenDrawColourFromRgba(0xFF, 0xFF, 0x00, 0xFF)
-        elseif colour == "white" then
-            return mesenDrawColourFromRgba(0xFF, 0xFF, 0xFF, 0xFF)
-        elseif colour == "black" then
-            return mesenDrawColourFromRgba(0x00, 0x00, 0x00, 0xFF)
-        elseif colour == "green" then
-            return mesenDrawColourFromRgba(0x00, 0xFF, 0x00, 0xFF)
-        elseif colour == "purple" then
-            return mesenDrawColourFromRgba(0xFF, 0x00, 0xFF, 0xFF)
-        elseif colour == "cyan" then
-            return mesenDrawColourFromRgba(0x00, 0xFF, 0xFF, 0xFF)
-        elseif colour == "blue" then
-            return mesenDrawColourFromRgba(0x00, 0x00, 0xFF, 0xFF)
-        elseif colour == "gray" or colour == "grey" then
-            return mesenDrawColourFromRgba(0x80, 0x80, 0x80, 0xFF)
-        elseif colour == "darkgray" or colour == "darkgrey" then
-            return mesenDrawColourFromRgba(0x40, 0x40, 0x40, 0xFF)
-        elseif colour == "clear" then
-            return mesenDrawColourFromRgba(0x00, 0x00, 0x00, 0x00)
-        else
-            emu.log(string.format("Unknown colour = %s", colour))
-            return mesenDrawColourFromRgba(0xFF, 0xFF, 0xFF, 0xFF)
+        if colour == "clear" then return 0 end
+        local hex = NAMED[colour]
+        if hex == nil then
+            print("Unknown colour = " .. tostring(colour))
+            hex = "FFFFFF"
         end
+        r = tonumber(hex:sub(1, 2), 16)
+        g = tonumber(hex:sub(3, 4), 16)
+        b = tonumber(hex:sub(5, 6), 16)
+        a = 0xFF
+    else
+        local c = colour
+        if c < 0 then c = c + 0x100000000 end
+        r = math.floor(c / 0x1000000) % 0x100
+        g = math.floor(c / 0x10000)   % 0x100
+        b = math.floor(c / 0x100)     % 0x100
+        a = c % 0x100
     end
-
-    -- The original script stores numeric colours as 0xRRGGBBAA.
-    -- Convert that to the draw-call format expected by the selected Mesen alpha mode.
-    local a = xemu.and_(colour, 0xFF)
-    local b = xemu.and_(xemu.rshift(colour, 8), 0xFF)
-    local g = xemu.and_(xemu.rshift(colour, 16), 0xFF)
-    local r = xemu.and_(xemu.rshift(colour, 24), 0xFF)
-    return mesenDrawColourFromRgba(r, g, b, a)
+    return a * 0x1000000 + r * 0x10000 + g * 0x100 + b
 end
 
 local function i(v)
@@ -1205,60 +1099,57 @@ local function i(v)
     return math.floor(v + 0.5)
 end
 
-local function drawYOffset()
-    -- The old console-screen overlay needs a small vertical offset in Mesen.
-    -- The Samus-centered scriptHud viewer is its own coordinate space, so no offset is used.
-    if USE_SAMUS_CENTERED_BLOCK_VIEW and emu.drawSurface and emu.drawSurface.scriptHud then
-        return 0
-    end
-    return MESEN_Y_OFFSET
-end
+-- The body calls mesenColour(colour) in exactly ONE place -- it pre-converts
+-- a colour and passes the result to emu.drawRectangle. Our emu.drawRectangle
+-- (below) already does the single to_argb conversion, so to keep it at ONE
+-- conversion (not two), this is a passthrough: hand the raw upstream colour
+-- straight through. (Upstream's mesenColour did the Mesen alpha-invert here;
+-- deleting that is the whole point.)
+function mesenColour(colour) return colour end
 
-local function getConfiguredViewSize()
-    if USE_SAMUS_CENTERED_BLOCK_VIEW and emu.getDrawSurfaceSize and emu.drawSurface and emu.drawSurface.scriptHud then
-        local size = emu.getDrawSurfaceSize(emu.drawSurface.scriptHud)
-        if size then
-            return size.visibleWidth or size.width or (256 * SAMUS_CENTERED_BLOCK_VIEW_SCALE),
-                   size.visibleHeight or size.height or (224 * SAMUS_CENTERED_BLOCK_VIEW_SCALE)
-        end
-    end
-
-    if emu.getScreenSize then
-        local size = emu.getScreenSize()
-        if size then
-            return size.width or 256, size.height or 224
-        end
-    end
-
-    if USE_SAMUS_CENTERED_BLOCK_VIEW then
-        return 256 * SAMUS_CENTERED_BLOCK_VIEW_SCALE, 224 * SAMUS_CENTERED_BLOCK_VIEW_SCALE
-    end
-
-    return 256, 224
-end
+-- ---- the xemu draw surface --------------------------------------------------
 
 xemu.drawPixel = function(x, y, fg)
-    emu.drawPixel(i(x), i(y + drawYOffset()), mesenColour(fg), 1)
+    gfx.pixel(i(x), i(y + drawYOffset()), to_argb(fg))
 end
 
 xemu.drawBox = function(x0, y0, x1, y1, fg, bg)
-    local left = math.min(i(x0), i(x1))
-    local top = math.min(i(y0), i(y1)) + drawYOffset() - 1
-    local right = math.max(i(x0), i(x1))
-    local bottom = math.max(i(y0), i(y1)) + drawYOffset() - 1
-    local fill = bg ~= nil and bg ~= "clear" and mesenColour(bg) == mesenColour(fg)
-    emu.drawRectangle(left, top, right - left + 1, bottom - top + 1, mesenColour(fg), fill, 1)
+    local yo     = drawYOffset()
+    local left   = math.min(i(x0), i(x1))
+    local top    = math.min(i(y0), i(y1)) + yo - 1
+    local right  = math.max(i(x0), i(x1))
+    local bottom = math.max(i(y0), i(y1)) + yo - 1
+    local fillSame = bg ~= nil and bg ~= "clear" and to_argb(bg) == to_argb(fg)
+    local c = to_argb(fg)
+    gfx.box(left, top, right - left + 1, bottom - top + 1,
+            c, fillSame and c or nil, 1.0)
 end
 
 xemu.drawLine = function(x0, y0, x1, y1, fg)
-    emu.drawLine(i(x0), i(y0 + drawYOffset() - 1), i(x1), i(y1 + drawYOffset() - 1), mesenColour(fg), 1)
+    local yo = drawYOffset()
+    gfx.line(i(x0), i(y0 + yo - 1), i(x1), i(y1 + yo - 1), to_argb(fg), 1.0)
 end
 
 xemu.drawText = function(x, y, text, fg, bg)
-    emu.drawString(i(x), i(y + drawYOffset()), tostring(text), mesenColour(fg), mesenColour(bg or "black"), 0, 1)
+    -- sni-lua text has no per-call background; the body draws its own backing
+    -- boxes for panels, so dropping bg is faithful.
+    gfx.text(i(x), i(y + drawYOffset()), tostring(text), to_argb(fg))
 end
 
+-- The body issues one direct emu.drawRectangle (drawMiniText backing); keep it
+-- aligned with xemu.drawBox (same y-offset, same colour conversion).
+function emu.drawRectangle(x, y, w, h, color, filled, _alpha)
+    local c = to_argb(color)
+    gfx.box(i(x), i(y + drawYOffset()), i(w), i(h),
+            c, filled and c or nil, 1.0)
+end
 
+-- =============================================================================
+-- Original Super Hitbox script body follows (verbatim upstream, minus the
+-- permanently-dead `if xemu.emuId==emuId_bizhawk and false` CPU-profiling
+-- block, which referenced emu.getregister/event.onmemoryexecute/io that no
+-- sni-lua target provides and which never executed).
+-- =============================================================================
 -- ---------------------------------------------------------------------------
 -- Inline Super Metroid helper module
 -- ---------------------------------------------------------------------------
@@ -1308,6 +1199,56 @@ end
 
 function makeAramReader(p, n, is_signed, interval)
     return makeReader(p, n, is_signed, interval, true)
+end
+
+local function cpuBankWrapAddress(p)
+    return xemu.or_(xemu.and_(p, 0xFF0000), xemu.and_(p, 0xFFFF))
+end
+
+local function cpuBankWrappedOffsetAddress(p, offset)
+    return xemu.or_(xemu.and_(p, 0xFF0000), xemu.and_(xemu.and_(p, 0xFFFF) + offset, 0xFFFF))
+end
+
+local function readCpu8BankWrapped(p, signed)
+    return readCpu8(cpuBankWrapAddress(p), signed or false)
+end
+
+local function readCpu16BankWrapped(p, signed)
+    local addr = cpuBankWrapAddress(p)
+    local lo = readCpu8(addr, false)
+    local hi = readCpu8(cpuBankWrappedOffsetAddress(addr, 1), false)
+    local value = lo + xemu.lshift(hi, 8)
+    if signed and value >= 0x8000 then
+        value = value - 0x10000
+    end
+    return value
+end
+
+function makeBankWrappedReader(p, n, is_signed, interval)
+    -- p: 24-bit CPU address. Indexed accesses wrap within the original bank.
+    if n < 1 or n > 2 then
+        error(string.format('Trying to make bank-wrapped reader with n = %d', n))
+    end
+
+    local unsignedReaders = {
+        [1] = function(addr) return readCpu8BankWrapped(addr, false) end,
+        [2] = function(addr) return readCpu16BankWrapped(addr, false) end,
+    }
+    local signedReaders = {
+        [1] = function(addr) return readCpu8BankWrapped(addr, true) end,
+        [2] = function(addr) return readCpu16BankWrapped(addr, true) end,
+    }
+
+    local reader = unsignedReaders[n] or function() return 0 end
+    if is_signed then
+        reader = signedReaders[n] or function() return 0 end
+    end
+
+    if interval then
+        return function(i) return reader(cpuBankWrappedOffsetAddress(p, i * interval)) end
+    else
+        return function() return reader(p) end
+    end
 end
 
 function makeAggregateReader(readers)
@@ -1381,6 +1322,33 @@ local function hotkeyModifierHeld(input, cfg)
     end
     return xemu.and_(input, sm.button_select) ~= 0 and xemu.and_(input, sm.button_B) ~= 0
 end
+
+local hotkeyFrameState = {
+    frame = nil,
+    input = 0,
+    pressed = 0,
+    initialized = false,
+}
+
+local function getHotkeyFrameState()
+    local frame = emu.framecount()
+    if hotkeyFrameState.frame ~= frame then
+        local previousInput = hotkeyFrameState.input or 0
+        local input = sm.getInput()
+        hotkeyFrameState.frame = frame
+        hotkeyFrameState.input = input
+        if hotkeyFrameState.initialized then
+            hotkeyFrameState.pressed = xemu.and_(input, xemu.not_(previousInput))
+        else
+            hotkeyFrameState.pressed = 0
+            hotkeyFrameState.initialized = true
+        end
+    end
+    return hotkeyFrameState.input, hotkeyFrameState.pressed, frame
+end
+
+local lastDebugControlsFrame = nil
+local lastAnygUpdateFrame = nil
 
 local function hotkeyPressed(input, changed, cfg, fieldName, defaultButton)
     cfg = cfg or {}
@@ -1648,10 +1616,10 @@ sm.getSpriteObjectXPosition       = makeReader(0x7EF0F8, 2, false, 2)
 sm.getSpriteObjectYPosition       = makeReader(0x7EF1F8, 2, false, 2)
 
 -- Blocks
-sm.getLevelDatum      = makeReader(0x7F0002, 2, false, 2)
-sm.getBts             = makeReader(0x7F6402, 1, false, 1)
-sm.getBtsSigned       = makeReader(0x7F6402, 1, true,  1)
-sm.getBackgroundDatum = makeReader(0x7F9602, 2, false, 2)
+sm.getLevelDatum      = makeBankWrappedReader(0x7F0002, 2, false, 2)
+sm.getBts             = makeBankWrappedReader(0x7F6402, 1, false, 1)
+sm.getBtsSigned       = makeBankWrappedReader(0x7F6402, 1, true,  1)
+sm.getBackgroundDatum = makeBankWrappedReader(0x7F9602, 2, false, 2)
 
 
 -- ARAM --
@@ -2275,41 +2243,6 @@ function drawRightTriangle(x0, y0, x1, y1, fg)
     drawLine(x1, y0, x1, y1, fg)
 end
 
--- Display CPU usage
-if xemu.emuId == xemu.emuId_bizhawk and false then -- GUI drawing functions from on_paint are clearing this text output for some reason...
-    idling = false
-    lagFrames = 0
-    if recordLagHotspots then
-        outfile = io.open("lag.txt", "w")
-    end
-
-    function idleHook()
-        -- Report CPU time used by current frame
-        -- NMI occurs at v = 225
-        local v = emu.getregister('V')
-        local cpu = lagFrames * 100 + (v - 225) % 262 * 100 / 262
-        if recordLagHotspots and 100 <= cpu and cpu < 110 then
-            outfile:write(string.format("%d: %f\n", emu.framecount(), cpu))
-            console.log(string.format("%d: %f", emu.framecount(), cpu))
-        end
-        drawText(4, 36, string.format('CPU used: %.2f%%', cpu), cpu < 100 and "white" or "red", 0x000000FF)
-
-        idling = true
-        lagFrames = 0
-    end
-
-    function nmiHook()
-        if not idling then
-            lagFrames = lagFrames + 1
-            drawText(4, 36, string.format('CPU used: %.2f%%', lagFrames * 100), "red", 0x000000FF)
-        end
-
-        idling = false
-    end
-
-    event.onmemoryexecute(nmiHook, 0x009583)
-    event.onmemoryexecute(idleHook, 0x82897A)
-end
 
 
 -- A door database for finding valid OoB doors
@@ -2544,9 +2477,13 @@ function isValidLevelData()
 end
 
 function handleDebugControls()
-    local input = sm.getInput()
-    local changedInput = sm.getChangedInput()
+    local input, changedInput, frame = getHotkeyFrameState()
     local controls = ((CONFIG.blockLabels or {}).controls or {})
+
+    if lastDebugControlsFrame == frame then
+        return
+    end
+    lastDebugControlsFrame = frame
 
     if not hotkeyModifierHeld(input, controls) then
         return
@@ -3229,6 +3166,29 @@ local function anygTimingColour(status)
     return cfg.badColour or "red"
 end
 
+-- When $0998 advances to $0D after the pause-start, SM has already latched a
+-- stable animation timer/frame pair that tells us how early/late the D-pad
+-- direction press was. This avoids relying on live per-frame edge sampling.
+local ANYG_DOORSKIP_DIRECTION_SAMPLE_TO_DIFF = {
+    ["0001:0002"] = -4,
+    ["0002:0002"] = -3,
+    ["0001:0001"] = -2,
+    ["0002:0001"] = -1,
+    ["0003:0001"] = 0,
+    ["0001:0008"] = 1,
+    ["0002:0008"] = 2,
+    ["0001:0007"] = 3,
+    ["0002:0007"] = 4,
+}
+
+local function anygDoorskipDirectionSampleKey(timer, frame)
+    return string.format("%04X:%04X", xemu.and_(timer or 0, 0xFFFF), xemu.and_(frame or 0, 0xFFFF))
+end
+
+local function anygDecodeDoorskipDirectionDiff(timer, frame)
+    return ANYG_DOORSKIP_DIRECTION_SAMPLE_TO_DIFF[anygDoorskipDirectionSampleKey(timer, frame)]
+end
+
 local function anygButtonNameFromMask(mask)
     if mask == sm.button_left then return "Left" end
     if mask == sm.button_right then return "Right" end
@@ -3256,6 +3216,8 @@ local function anygStartDoorskipAttempt(input)
     ds.directionOffset = nil
     ds.directionDiff = nil
     ds.directionStatus = nil
+    ds.directionTimerValue = nil
+    ds.directionAnimationFrameValue = nil
     ds.lastDirectionPressFrame = nil
     ds.lastDirectionButton = nil
     ds.downFrame = nil
@@ -3316,8 +3278,10 @@ end
 
 local function anygBuildDoorskipResultText(ds)
     local dirText = "dir ?"
-    if ds.directionOffset ~= nil then
+    if ds.directionDiff ~= nil then
         dirText = string.format("dir %+d %s", ds.directionDiff or 0, ds.directionStatus or "?")
+    elseif ds.directionTimerValue ~= nil and ds.directionAnimationFrameValue ~= nil then
+        dirText = string.format("dir raw %s/%s", anygHex(ds.directionTimerValue, 2), anygHex(ds.directionAnimationFrameValue, 2))
     end
 
     local downText = "down ?"
@@ -3440,7 +3404,6 @@ local function anygUpdateDoorskipTiming()
     local prevGameState = anygState.prevGameState
     local ds = anygState.doorskip
 
-    local startPressed = xemu.and_(changed, sm.button_start) ~= 0
     local leftPressed = xemu.and_(changed, sm.button_left) ~= 0
     local rightPressed = xemu.and_(changed, sm.button_right) ~= 0
     local downPressed = xemu.and_(changed, sm.button_down) ~= 0
@@ -3448,8 +3411,10 @@ local function anygUpdateDoorskipTiming()
     local shoulderRPressed = xemu.and_(changed, sm.button_R) ~= 0
     local shoulderHeld = xemu.and_(input, sm.button_L + sm.button_R) ~= 0
     local shoulderPressed = shoulderLPressed or shoulderRPressed
+    local enteredPauseStart = prevGameState ~= nil and prevGameState ~= gameState and gameState == 0x0C
+    local directionLatched = prevGameState ~= nil and prevGameState ~= gameState and gameState == 0x0D
 
-    if startPressed then
+    if enteredPauseStart and xemu.and_(input, sm.button_A) ~= 0 then
         anygStartDoorskipAttempt(input)
     end
 
@@ -3459,20 +3424,56 @@ local function anygUpdateDoorskipTiming()
         local button = leftPressed and sm.button_left or sm.button_right
         ds.lastDirectionPressFrame = anygState.frame
         ds.lastDirectionButton = button
-        if ds.directionFrame == nil then
-            local offset = anygState.frame - ds.startFrame
-            local diff = offset - (cfg.targetDirectionFramesAfterStart or 5)
+    end
+
+    if attemptActive and directionLatched and ds.directionFrame == nil then
+        local timer = sm.getSamusAnimationFrameTimer()
+        local frame = sm.getSamusAnimationFrame()
+        local diff = anygDecodeDoorskipDirectionDiff(timer, frame)
+        local button = ds.lastDirectionButton
+        if button == nil then
+            if xemu.and_(input, sm.button_left) ~= 0 then
+                button = sm.button_left
+            elseif xemu.and_(input, sm.button_right) ~= 0 then
+                button = sm.button_right
+            else
+                button = sm.button_left
+            end
+        end
+
+        ds.directionFrame = anygState.frame
+        ds.directionButton = button
+        ds.directionTimerValue = timer
+        ds.directionAnimationFrameValue = frame
+
+        if diff ~= nil then
             local status = anygTimingStatus(diff, cfg.directionGoodWindow or 0, cfg.directionNearWindow or 2)
-            ds.directionFrame = anygState.frame
-            ds.directionButton = button
-            ds.directionOffset = offset
+            ds.directionOffset = diff
             ds.directionDiff = diff
             ds.directionStatus = status
-            ds.lastResultText = string.format("D-pad %s at +%df: %s (%+d)", anygButtonNameFromMask(button), offset, status, diff)
+            ds.lastResultText = string.format(
+                "D-pad %s via $0A94/$0A96 %s/%s: %s (%+d)",
+                anygButtonNameFromMask(button),
+                anygHex(timer, 2),
+                anygHex(frame, 2),
+                status,
+                diff
+            )
             ds.lastResultColour = anygTimingColour(status)
-            if status ~= "GOOD" and cfg.warnOnBadAttempt then
-                anygAddWarning(ds.lastResultText, ds.lastResultColour)
-            end
+        else
+            ds.directionOffset = nil
+            ds.directionDiff = nil
+            ds.directionStatus = "UNKNOWN"
+            ds.lastResultText = string.format(
+                "D-pad timing raw $0A94/$0A96 = %s/%s at $0998=0D",
+                anygHex(timer, 2),
+                anygHex(frame, 2)
+            )
+            ds.lastResultColour = cfg.badColour or "red"
+        end
+
+        if ds.directionStatus ~= "GOOD" and cfg.warnOnBadAttempt then
+            anygAddWarning(ds.lastResultText, ds.lastResultColour)
         end
     end
 
@@ -3594,8 +3595,7 @@ end
 
 local function anygHandleControls()
     local cfg = ANYG.controls or {}
-    local input = sm.getInput()
-    local changed = sm.getChangedInput()
+    local input, changed = getHotkeyFrameState()
     if not hotkeyModifierHeld(input, cfg) then
         return
     end
@@ -3656,7 +3656,17 @@ local function anygHandleControls()
 end
 local function anygUpdateState()
     if not anygEnabled() then return end
-    anygState.frame = anygState.frame + 1
+    local _, _, frame = getHotkeyFrameState()
+    if lastAnygUpdateFrame == frame then
+        return
+    end
+    lastAnygUpdateFrame = frame
+
+    if anygState.frame == nil then
+        anygState.frame = frame
+    else
+        anygState.frame = math.max(anygState.frame + 1, frame)
+    end
     anygHandleControls()
     anygUpdateDoorskipTiming()
 
@@ -4052,14 +4062,27 @@ local function anygDrawDoorskipTiming(viewWidth, viewHeight)
     y = y + lh
 
     local dirColour = warnC
-    local dirText = string.format("D-pad L/R: target +%df", cfg.targetDirectionFramesAfterStart or 5)
-    if ds.directionOffset ~= nil then
+    local dirText = "D-pad timing: wait for $0998=0D"
+    if ds.directionDiff ~= nil then
         dirColour = anygTimingColour(ds.directionStatus)
-        dirText = string.format("D-pad %s: %+d  %s", anygButtonNameFromMask(ds.directionButton), ds.directionDiff or 0, ds.directionStatus or "?")
+        dirText = string.format(
+            "D-pad %s: %+d  %s (%s/%s)",
+            anygButtonNameFromMask(ds.directionButton),
+            ds.directionDiff or 0,
+            ds.directionStatus or "?",
+            anygHex(ds.directionTimerValue, 2),
+            anygHex(ds.directionAnimationFrameValue, 2)
+        )
+    elseif ds.directionTimerValue ~= nil and ds.directionAnimationFrameValue ~= nil then
+        dirColour = badC
+        dirText = string.format(
+            "D-pad latch: raw %s/%s",
+            anygHex(ds.directionTimerValue, 2),
+            anygHex(ds.directionAnimationFrameValue, 2)
+        )
     elseif ds.startFrame ~= nil then
-        local due = (cfg.targetDirectionFramesAfterStart or 5) - (anygState.frame - ds.startFrame)
-        dirText = string.format("D-pad L/R: due %+df", due)
-        dirColour = math.abs(due) <= 1 and warnC or textC
+        dirText = "D-pad timing: waiting for 0D latch"
+        dirColour = textC
     end
     anygDrawPanelLine(x, y, dirText, dirColour, bg)
     y = y + lh

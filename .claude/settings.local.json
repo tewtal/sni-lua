@@ -48,7 +48,28 @@
       "Bash(lua -v)",
       "Bash(luajit -v)",
       "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test -p sni-lua-api ported_super_hitbox -- --nocapture 2>&1 | Select-String -Pattern \"test result|ported script loads|panicked at|\\\\.lua:\\\\d+|attempt to|nil value|disabled itself|on_frame error|on_init error\" | Select-Object -First 12)",
-      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test 2>&1 | Select-String -Pattern \"test result:|FAILED|error\\\\[\" | Select-Object -First 12)"
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test 2>&1 | Select-String -Pattern \"test result:|FAILED|error\\\\[\" | Select-Object -First 12)",
+      "Bash(awk '{print $5, $NF}')",
+      "Bash(git rm *)",
+      "Bash(git -c user.email=backmark@gmail.com -c user.name=sni-lua commit -q -m \"chore: remove stray root super_hitbox_sni.lua \\(dup; canonical is examples/\\)\")",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test -p sni-lua-api ported_super_hitbox -- --nocapture 2>&1 | Select-String -Pattern \"super_hitbox draw:|test result|NO draw commands|panicked at|\\\\.lua:\\\\d+:|attempt to|disabled itself|console:\" | Select-Object -First 12)",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test -p sni-lua-api ported_super_hitbox -- --nocapture 2>&1 | Select-String -Pattern \"super_hitbox draw:|test result|NO draw commands|panicked at|\\\\.lua:\\\\d+:|attempt to|on_frame error|out of range\" | Select-Object -First 10)",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test 2>&1 | Select-String -Pattern \"test result:|FAILED|error\\\\[|error:\" | Select-Object -First 14)",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo build 2>&1 | Select-String -Pattern \"error\\\\[|^error|error:|Finished\" | Select-Object -Last 4)",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test -p sni-render 2>&1 | Select-String -Pattern \"test result|error\\\\[|^error|cannot|mismatched|expected\" | Select-Object -First 12)",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test 2>&1 | Select-String -Pattern \"test result:|FAILED|error\\\\[\" | Select-Object -First 12; cargo build 2>&1 | Select-String -Pattern \"Finished|error\\\\[|^error\" | Select-Object -Last 2)",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test 2>&1 | Select-String -Pattern \"test result:|FAILED|error\\\\[|^error|super_hitbox draw:|panicked at|\\\\.lua:\\\\d+:\" | Select-Object -First 16)",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo build 2>&1 | Select-String -Pattern \"Finished|error\\\\[|^error|warning: unused\" | Select-Object -Last 3)",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test -p sni-cache 2>&1 | Select-String -Pattern \"test result|error\\\\[|^error|cannot find|mismatched|byte_budget\" | Select-Object -First 12)",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test 2>&1 | Select-String -Pattern \"test result:|FAILED|error\\\\[|^error\" | Select-Object -First 12; cargo build 2>&1 | Select-String -Pattern \"Finished|error\\\\[|^error\" | Select-Object -Last 2)",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test -p sni-cache 2>&1 | Select-String -Pattern \"test result|error\\\\[|^error|cannot find|mismatched|expected|priority\" | Select-Object -First 15)",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test -p sni-cache 2>&1 | Select-String -Pattern \"^test |test result|error\\\\[|^error|cannot find|mismatched|--> crates\" | Select-Object -First 25)",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test -p sni-cache 2>&1 | Select-String -Pattern \"^test engine::|^test watch::|test result|error\\\\[|^error|mismatched|cannot find\" | Select-Object -First 28)",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test -p sni-cache 2>&1 | Select-String -Pattern \"test result|error\\\\[|^error|cannot find|unused variable\" | Select-Object -First 8)",
+      "PowerShell(Set-Location F:\\\\Code\\\\sni-lua; $env:NoDefaultCurrentDirectoryInExePath=$null; cargo test -p sni-cache 2>&1 | Select-String -Pattern \"^test engine::tests::\\(realtime|always\\)|test result|error\\\\[|^error|FAILED\" | Select-Object -First 8)",
+      "Bash(grep -vE \"^-- ====|^--$|^--\\\\s*$\")",
+      "Bash(sort -t: -k2)",
+      "Bash(awk -F: '{print $2}')"
     ]
   }
 }

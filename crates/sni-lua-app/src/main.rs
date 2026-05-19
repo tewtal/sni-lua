@@ -18,7 +18,7 @@ use eframe::egui;
 use sni_actor::{Cmd, CmdSender, ConnState, SniHandle};
 use sni_cache::{PollConfig, PollEngine};
 use sni_client::MemRegion;
-use sni_lua_api::{Console, ScriptHost, WriteSink};
+use sni_lua_api::{Console, Control, ScriptHost, WriteSink};
 use sni_render::DrawList;
 use tokio::runtime::Runtime;
 
@@ -84,6 +84,59 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+/// Side-panel tabs. Setup carries everything a user needs day to day;
+/// Capture and Debug hide the dense tuning/diagnostics that previously made
+/// the single panel overwhelming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Setup,
+    /// Shown only when the loaded script declared `ui.*` controls.
+    Script,
+    Capture,
+    Debug,
+}
+
+/// Consistent section header: a little space above, a bold heading, a rule.
+/// Used everywhere so every panel section has the same rhythm.
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(14.0);
+    ui.heading(title);
+    ui.separator();
+    ui.add_space(2.0);
+}
+
+/// A settings row whose label occupies a fixed leading column so the widgets
+/// in a section line up vertically regardless of label length. The widget(s)
+/// are added by `add` to the right of the label.
+fn row<R>(
+    ui: &mut egui::Ui,
+    label: &str,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.horizontal(|ui| {
+        // Width tuned to the longest label in the panels ("Crop mode").
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(78.0, ui.spacing().interact_size.y),
+            egui::Sense::hover(),
+        );
+        ui.painter().text(
+            egui::pos2(rect.left(), rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(14.0),
+            ui.visuals().text_color(),
+        );
+        add(ui)
+    })
+    .inner
+}
+
+/// Small dimmed helper/explanatory text — the recurring "small().weak()"
+/// pattern in one place.
+fn hint(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).small().weak());
+}
+
 struct App {
     _rt: Runtime,
     config: Config,
@@ -97,6 +150,9 @@ struct App {
     status: String,
     script_path: String,
     show_console: bool,
+    /// Which side-panel tab is visible. Defaults to Setup so a new user sees
+    /// only the essentials; tuning/diagnostics live behind the other tabs.
+    tab: Tab,
 
     // Live memory inspector (M2 demo of real reads + latency).
     probe_addr_hex: String,
@@ -114,6 +170,8 @@ struct App {
     window_overlay_applied: Option<bool>,
     /// Last click-through mouse state pushed to the native window.
     click_through_applied: bool,
+    /// Whether the detached stream viewport has been given its initial size.
+    stream_viewport_initialized: bool,
 }
 
 impl App {
@@ -175,6 +233,7 @@ impl App {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             show_console: true,
+            tab: Tab::Setup,
             // Super Metroid: WRAM $7E:0AF6 = Samus X position (u16). In the
             // FxPakPro space that's $F5_0AF6.
             probe_addr_hex: "F50AF6".to_string(),
@@ -185,6 +244,7 @@ impl App {
             capture_tex_seq: 0,
             window_overlay_applied: None,
             click_through_applied: false,
+            stream_viewport_initialized: false,
         };
         // Auto-load the last script if one was remembered.
         if !app.script_path.is_empty() {
@@ -203,16 +263,213 @@ impl App {
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| path.clone());
+                // Bind the persistent store to this script *before* loading,
+                // so `on_init` can already read saved state.
+                let script_path = std::path::PathBuf::from(&path);
+                self.host
+                    .bind_store(Config::store_path_for(&script_path));
                 match self.host.load_script(&src, &name) {
                     Ok(()) => {
                         self.status = format!("Loaded script: {name}");
-                        self.config.last_script = Some(path.into());
+                        self.config.last_script = Some(script_path);
                         self.config.save();
+                        // Jump to the script's settings panel if it declared
+                        // one, so its options are immediately visible. Don't
+                        // yank focus away from Capture/Debug otherwise.
+                        if !self.host.controls().borrow().is_empty() {
+                            self.tab = Tab::Script;
+                        } else if self.tab == Tab::Script {
+                            self.tab = Tab::Setup;
+                        }
                     }
                     Err(e) => self.status = format!("Script error: {e}"),
                 }
             }
             Err(e) => self.status = format!("Cannot read {path}: {e}"),
+        }
+    }
+
+    /// Open the OS file picker for a `.lua` script. Modal (rfd blocks until
+    /// the user chooses) — acceptable here because it's an explicit click,
+    /// not part of the render loop, and the SNI/poll work runs off-thread.
+    /// On pick we update the path and load immediately, the common intent.
+    fn pick_script_file(&mut self) {
+        let mut dlg = rfd::FileDialog::new()
+            .set_title("Select a Lua overlay script")
+            .add_filter("Lua script", &["lua"])
+            .add_filter("All files", &["*"]);
+        // Start in the current script's directory if we have one, else the
+        // bundled examples folder, else CWD.
+        let start = std::path::Path::new(&self.script_path)
+            .parent()
+            .filter(|p| p.is_dir())
+            .map(|p| p.to_path_buf())
+            .or_else(|| {
+                let ex = std::path::Path::new("examples");
+                ex.is_dir().then(|| ex.to_path_buf())
+            });
+        if let Some(dir) = start {
+            dlg = dlg.set_directory(dir);
+        }
+        if let Some(path) = dlg.pick_file() {
+            self.script_path = path.display().to_string();
+            self.load_script_from_path();
+        }
+    }
+
+    /// Render the loaded script's declared settings panel. Edits mutate the
+    /// shared [`Control`] values in place (the script reads them via
+    /// `ui.get`); any change is mirrored back to the persistent store so it
+    /// survives a reload. Buttons latch a one-shot `pressed` the script drains
+    /// with `ui.pressed`.
+    fn render_script_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Script settings");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("↻ Reload")
+                    .on_hover_text("Reload the script from disk")
+                    .clicked()
+                {
+                    self.load_script_from_path();
+                }
+            });
+        });
+        ui.label(
+            egui::RichText::new("Defined by the script. Changes save automatically.")
+                .small()
+                .weak(),
+        );
+        ui.separator();
+        ui.add_space(4.0);
+
+        let controls = self.host.controls();
+        let mut changed = false;
+        {
+            let mut c = controls.borrow_mut();
+            // A two-column grid keeps every label/widget pair aligned; full-
+            // width items (header/label/button) break out of it.
+            egui::Grid::new("script_controls")
+                .num_columns(2)
+                .spacing([10.0, 8.0])
+                .min_col_width(70.0)
+                .show(ui, |ui| {
+                    for ctrl in c.items.iter_mut() {
+                        match ctrl {
+                            Control::Header { text } => {
+                                ui.add_space(2.0);
+                                ui.end_row();
+                                ui.label(egui::RichText::new(text.as_str()).strong());
+                                ui.end_row();
+                            }
+                            Control::Label { text } => {
+                                ui.label(
+                                    egui::RichText::new(text.as_str()).small().weak(),
+                                );
+                                ui.end_row();
+                            }
+                            Control::Checkbox { label, value, .. } => {
+                                ui.label(label.as_str());
+                                changed |= ui.checkbox(value, "").changed();
+                                ui.end_row();
+                            }
+                            Control::Slider {
+                                label,
+                                min,
+                                max,
+                                value,
+                                ..
+                            } => {
+                                ui.label(label.as_str());
+                                // Whole-number bounds read as an integer
+                                // slider; otherwise show 2 decimals.
+                                let whole =
+                                    min.fract() == 0.0 && max.fract() == 0.0;
+                                let mut s = egui::Slider::new(value, *min..=*max);
+                                s = if whole {
+                                    s.integer()
+                                } else {
+                                    s.fixed_decimals(2)
+                                };
+                                changed |= ui.add(s).changed();
+                                ui.end_row();
+                            }
+                            Control::Text { label, value, .. } => {
+                                ui.label(label.as_str());
+                                changed |= ui
+                                    .add(
+                                        egui::TextEdit::singleline(value)
+                                            .desired_width(160.0),
+                                    )
+                                    .changed();
+                                ui.end_row();
+                            }
+                            Control::Color { label, value, .. } => {
+                                ui.label(label.as_str());
+                                // egui edits linear RGBA; our value is packed
+                                // 0xAARRGGBB. Convert in/out.
+                                let a = (*value >> 24) as u8;
+                                let r = (*value >> 16) as u8;
+                                let g = (*value >> 8) as u8;
+                                let b = *value as u8;
+                                let mut col =
+                                    egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+                                if ui
+                                    .color_edit_button_srgba(&mut col)
+                                    .changed()
+                                {
+                                    let [r, g, b, a] = col.to_array();
+                                    *value = ((a as u32) << 24)
+                                        | ((r as u32) << 16)
+                                        | ((g as u32) << 8)
+                                        | b as u32;
+                                    changed = true;
+                                }
+                                ui.end_row();
+                            }
+                            Control::Select {
+                                label,
+                                options,
+                                value,
+                                ..
+                            } => {
+                                ui.label(label.as_str());
+                                let id = label.clone();
+                                let cur = options
+                                    .get(*value)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                egui::ComboBox::from_id_salt(id)
+                                    .selected_text(cur)
+                                    .show_ui(ui, |ui| {
+                                        for (i, opt) in options.iter().enumerate() {
+                                            changed |= ui
+                                                .selectable_value(
+                                                    value,
+                                                    i,
+                                                    opt.as_str(),
+                                                )
+                                                .changed();
+                                        }
+                                    });
+                                ui.end_row();
+                            }
+                            Control::Button {
+                                label, pressed, ..
+                            } => {
+                                if ui.button(label.as_str()).clicked() {
+                                    *pressed = true;
+                                }
+                                ui.end_row();
+                            }
+                        }
+                    }
+                });
+        }
+        if changed {
+            // Mirror the new values to the store. Cheap; only writes disk if
+            // the document actually changed.
+            self.host.persist_controls();
         }
     }
 
@@ -222,6 +479,24 @@ impl App {
             return None;
         }
         Some(MemRegion::fxpak(addr, self.probe_size))
+    }
+
+    fn capture_mode(&self) -> sni_capture::CaptureMode {
+        sni_capture::CaptureMode::parse(&self.config.capture_mode)
+    }
+
+    fn stream_viewport_id() -> egui::ViewportId {
+        egui::ViewportId::from_hash_of("sni-lua-stream-output")
+    }
+
+    fn stream_key_color(&self) -> egui::Color32 {
+        let [r, g, b] = self.config.stream_key_color;
+        egui::Color32::from_rgb(r, g, b)
+    }
+
+    fn stream_key_color_hex(&self) -> String {
+        let [r, g, b] = self.config.stream_key_color;
+        format!("#{r:02X}{g:02X}{b:02X}")
     }
 
     /// Build the engine's PollConfig from the persisted settings. One place
@@ -268,16 +543,14 @@ impl App {
     }
 
     /// (Re)open the capture source to match the current mode + device.
-    /// Composited opens the device; transparent closes it (the window's
-    /// transparency provides the "background" instead).
+    /// Composited opens the device; overlay-only modes close it and render
+    /// against either true transparency or a keyed background instead.
     fn restart_capture(&mut self) {
         // Dropping the old source stops its thread cleanly first.
         self.capture = None;
         self.capture_tex = None;
         self.capture_tex_seq = 0;
-        if sni_capture::CaptureMode::parse(&self.config.capture_mode)
-            == sni_capture::CaptureMode::Composited
-        {
+        if self.capture_mode() == sni_capture::CaptureMode::Composited {
             self.capture = Some(sni_capture::CaptureSource::open(
                 self.config.capture_device,
                 capture_settings(&self.config),
@@ -303,6 +576,141 @@ impl App {
             platform::set_click_through(frame, want_click_through);
             self.click_through_applied = want_click_through;
         }
+    }
+
+    fn paint_overlay_canvas(
+        &self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        active_canvas: sni_render::Canvas,
+        capture_mode: sni_capture::CaptureMode,
+        cap_tex: Option<(egui::TextureId, [usize; 2])>,
+        sizing: sni_render::TextSizing,
+        loaded: bool,
+    ) {
+        let transparent = capture_mode == sni_capture::CaptureMode::TransparentOverlay;
+        let streaming = capture_mode == sni_capture::CaptureMode::StreamingOverlay;
+
+        let avail = ui.available_size();
+        let sense = if transparent {
+            egui::Sense::drag()
+        } else {
+            egui::Sense::hover()
+        };
+        let (rect, resp) = ui.allocate_exact_size(avail, sense);
+        if transparent && resp.drag_started() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        let painter = ui.painter_at(rect);
+
+        if streaming {
+            painter.rect_filled(rect, 0.0, self.stream_key_color());
+        } else if !transparent {
+            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 18, 22));
+        }
+
+        let vp = sni_render::Viewport::fit(rect, active_canvas);
+        let view = vp.screen_rect();
+
+        if transparent {
+            // Faint guide so the user can place the window; not painted
+            // opaque so it stays see-through.
+            painter.rect_stroke(
+                view,
+                0.0,
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(120, 120, 120, 60),
+                ),
+            );
+        } else if let Some((tex, frame_size)) = cap_tex {
+            // Composited: draw the capture feed to fill the canvas rect,
+            // overlay goes on top. Same rect as the overlay viewport so
+            // script pixel coords line up with the game pixels.
+            painter.image(
+                tex,
+                view,
+                self.capture_uv_rect(frame_size, active_canvas),
+                egui::Color32::WHITE,
+            );
+        } else if capture_mode == sni_capture::CaptureMode::Composited {
+            // No device frame yet — placeholder screen so the overlay
+            // still reads against something.
+            painter.rect_filled(view, 0.0, egui::Color32::from_rgb(8, 10, 16));
+            painter.rect_stroke(
+                view,
+                0.0,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+            );
+            painter.text(
+                view.center(),
+                egui::Align2::CENTER_CENTER,
+                "Waiting for capture device…\n(pick one under Capture)",
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_gray(110),
+            );
+        }
+
+        // Overlay always on top of whatever background.
+        sni_render::paint(&painter, &vp, &self.draw_list, sizing);
+
+        if !loaded && capture_mode == sni_capture::CaptureMode::Composited {
+            painter.text(
+                egui::pos2(view.center().x, view.min.y + 16.0),
+                egui::Align2::CENTER_CENTER,
+                "No script running. Set a Lua path and click Load.",
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_gray(120),
+            );
+        }
+    }
+
+    fn show_stream_viewport(
+        &mut self,
+        ctx: &egui::Context,
+        active_canvas: sni_render::Canvas,
+        sizing: sni_render::TextSizing,
+        loaded: bool,
+    ) {
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title("sni-lua stream output")
+            .with_min_inner_size([256.0, 224.0]);
+        if !self.stream_viewport_initialized {
+            builder = builder.with_inner_size([768.0, 672.0]);
+        }
+
+        ctx.show_viewport_immediate(Self::stream_viewport_id(), builder, |ctx, class| {
+            if class == egui::ViewportClass::Embedded {
+                egui::Window::new("Stream output")
+                    .default_size([768.0, 672.0])
+                    .show(ctx, |ui| {
+                        self.paint_overlay_canvas(
+                            ui,
+                            ctx,
+                            active_canvas,
+                            sni_capture::CaptureMode::StreamingOverlay,
+                            None,
+                            sizing,
+                            loaded,
+                        );
+                    });
+            } else {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none().fill(self.stream_key_color()))
+                    .show(ctx, |ui| {
+                        self.paint_overlay_canvas(
+                            ui,
+                            ctx,
+                            active_canvas,
+                            sni_capture::CaptureMode::StreamingOverlay,
+                            None,
+                            sizing,
+                            loaded,
+                        );
+                    });
+            }
+        });
+        self.stream_viewport_initialized = true;
     }
 
     fn capture_uv_rect(&self, frame_size: [usize; 2], canvas: sni_render::Canvas) -> egui::Rect {
@@ -392,7 +800,7 @@ impl App {
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        if self.config.capture_mode == "transparent" {
+        if self.capture_mode() == sni_capture::CaptureMode::TransparentOverlay {
             [0.0, 0.0, 0.0, 0.0]
         } else {
             egui::Color32::from_rgba_unmultiplied(12, 12, 12, 180).to_normalized_gamma_f32()
@@ -407,7 +815,7 @@ impl eframe::App for App {
         // Transparent overlay and click-through are separate states: the
         // window can be transparent and borderless while still letting the
         // user interact with the app controls.
-        let want_transparent = self.config.capture_mode == "transparent";
+        let want_transparent = self.capture_mode() == sni_capture::CaptureMode::TransparentOverlay;
         if ctx.input_mut(|i| {
             i.consume_key(
                 egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
@@ -441,6 +849,9 @@ impl eframe::App for App {
         // so re-read it afterwards for the viewport.
         self.apply_canvas();
         self.draw_list = self.host.run_frame();
+        // Persist script state if it changed this frame. No-op (one atomic
+        // flag check) when the script didn't touch the store.
+        self.host.store().flush_if_dirty();
         let active_canvas = if self.config.canvas_mode == "script" {
             self.host.requested_canvas()
         } else {
@@ -448,12 +859,15 @@ impl eframe::App for App {
         };
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.heading("sni-lua");
                 ui.separator();
-                ui.label("SNI:");
+                ui.label("SNI");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.config.sni_endpoint).desired_width(220.0),
+                    egui::TextEdit::singleline(&mut self.config.sni_endpoint)
+                        .desired_width(210.0)
+                        .hint_text("http://127.0.0.1:8191"),
                 );
 
                 let connected = matches!(conn, ConnState::Connected);
@@ -476,7 +890,8 @@ impl eframe::App for App {
                     }
                 }
 
-                ui.separator();
+                // Connection status pinned to the right edge so the bar
+                // doesn't reflow as the button set changes.
                 let (txt, col) = match &conn {
                     ConnState::Disconnected => ("● disconnected".to_string(), egui::Color32::GRAY),
                     ConnState::Connecting => ("● connecting…".to_string(), egui::Color32::YELLOW),
@@ -489,23 +904,63 @@ impl eframe::App for App {
                         egui::Color32::from_rgb(220, 60, 60),
                     ),
                 };
-                ui.colored_label(col, txt);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.colored_label(col, txt);
+                });
             });
+            ui.add_space(4.0);
         });
 
         egui::SidePanel::left("scripts")
             .resizable(true)
-            .default_width(260.0)
+            .default_width(280.0)
             .show(ctx, |ui| {
-                ui.heading("Script");
+                // Tab bar: Setup is the everyday view; Capture and Debug hold
+                // the dense controls that used to crowd a single scroll. The
+                // Script tab only appears when the loaded script declared a
+                // settings panel via `ui.*`.
+                let has_controls = !self.host.controls().borrow().is_empty();
+                if !has_controls && self.tab == Tab::Script {
+                    self.tab = Tab::Setup;
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.selectable_value(&mut self.tab, Tab::Setup, "  Setup  ");
+                    if has_controls {
+                        ui.selectable_value(&mut self.tab, Tab::Script, "  Script  ");
+                    }
+                    ui.selectable_value(&mut self.tab, Tab::Capture, "  Capture  ");
+                    ui.selectable_value(&mut self.tab, Tab::Debug, "  Debug  ");
+                });
+                ui.add_space(4.0);
                 ui.separator();
-                ui.label(egui::RichText::new("Lua file path").small().weak());
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                // A little breathing room from the panel edges; every tab
+                // body renders inside this inset.
+                ui.add_space(6.0);
+                egui::Frame::none()
+                    .inner_margin(egui::Margin::symmetric(8.0, 0.0))
+                    .show(ui, |ui| {
+
+                if self.tab == Tab::Script {
+                    self.render_script_tab(ui);
+                }
+
+                if self.tab == Tab::Setup {
+                section(ui, "Script");
+                hint(ui, "Lua script");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.script_path)
                         .desired_width(f32::INFINITY)
-                        .hint_text("examples/sm_hud.lua"),
+                        .hint_text("Click Browse… or type a path"),
                 );
                 ui.horizontal(|ui| {
+                    if ui.button("📂 Browse…").clicked() {
+                        self.pick_script_file();
+                    }
                     let has_path = !self.script_path.trim().is_empty();
                     if ui
                         .add_enabled(has_path, egui::Button::new("Load"))
@@ -522,7 +977,6 @@ impl eframe::App for App {
                     {
                         self.load_script_from_path();
                     }
-                    ui.checkbox(&mut self.show_console, "Console");
                 });
                 let (txt, col) = if self.host.is_loaded() {
                     ("● script running", egui::Color32::from_rgb(0, 200, 0))
@@ -535,26 +989,22 @@ impl eframe::App for App {
                     )
                 };
                 ui.colored_label(col, txt);
+                ui.checkbox(&mut self.show_console, "Show console");
 
-                ui.add_space(12.0);
-                ui.heading("Overlay");
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Text size");
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut self.config.text_size, 0.3..=4.0)
-                                .fixed_decimals(2),
-                        )
-                        .changed()
-                    {
-                        self.config.save();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Sizing");
-                    let mut mode = self.config.text_sizing_mode.clone();
+                section(ui, "Overlay");
+                if row(ui, "Text size", |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.config.text_size, 0.3..=4.0)
+                            .fixed_decimals(2),
+                    )
+                    .changed()
+                }) {
+                    self.config.save();
+                }
+                let mut mode = self.config.text_sizing_mode.clone();
+                row(ui, "Sizing", |ui| {
                     egui::ComboBox::from_id_salt("text_sizing")
+                        .width(170.0)
                         .selected_text(if mode == "screen" {
                             "Fixed screen px"
                         } else {
@@ -572,24 +1022,20 @@ impl eframe::App for App {
                                 "Fixed screen px (constant size)",
                             );
                         });
-                    if mode != self.config.text_sizing_mode {
-                        self.config.text_sizing_mode = mode;
-                        self.config.save();
-                    }
                 });
-                ui.label(
-                    egui::RichText::new(
-                        "Scripts default to the compact 5x7 font; \
-                         gfx.font(\"normal\") selects the larger 8x8.",
-                    )
-                    .small()
-                    .weak(),
+                if mode != self.config.text_sizing_mode {
+                    self.config.text_sizing_mode = mode;
+                    self.config.save();
+                }
+                hint(
+                    ui,
+                    "Scripts default to the compact 5x7 font; \
+                     gfx.font(\"normal\") selects the larger 8x8.",
                 );
 
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("Canvas");
-                    let mut m = self.config.canvas_mode.clone();
+                let mut m = self.config.canvas_mode.clone();
+                row(ui, "Canvas", |ui| {
                     let label = match m.as_str() {
                         "native" => "Native 256x224",
                         "2x" => "2x  512x448",
@@ -598,6 +1044,7 @@ impl eframe::App for App {
                         _ => "Script-controlled",
                     };
                     egui::ComboBox::from_id_salt("canvas_mode")
+                        .width(170.0)
                         .selected_text(label)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
@@ -610,38 +1057,43 @@ impl eframe::App for App {
                             ui.selectable_value(&mut m, "3x".into(), "3x  768x672");
                             ui.selectable_value(&mut m, "4x".into(), "4x  1024x896");
                         });
-                    if m != self.config.canvas_mode {
-                        self.config.canvas_mode = m;
-                        self.config.save();
-                    }
                 });
+                if m != self.config.canvas_mode {
+                    self.config.canvas_mode = m;
+                    self.config.save();
+                }
                 let ac = self.host.requested_canvas();
-                ui.label(
-                    egui::RichText::new(format!(
+                hint(
+                    ui,
+                    &format!(
                         "active canvas: {}x{}  (gfx.width/height report this)",
                         ac.w as u32, ac.h as u32
-                    ))
-                    .small()
-                    .weak(),
+                    ),
                 );
 
-                ui.add_space(12.0);
-                ui.heading("Capture");
-                ui.separator();
+                } // end Tab::Setup (Script + Overlay)
+
+                if self.tab == Tab::Capture {
+                section(ui, "Capture");
                 ui.horizontal(|ui| {
                     ui.label("Mode");
                     let mut m = self.config.capture_mode.clone();
                     egui::ComboBox::from_id_salt("capture_mode")
-                        .selected_text(if m == "transparent" {
-                            "Transparent overlay"
-                        } else {
-                            "Composited"
+                        .selected_text(match m.as_str() {
+                            "transparent" => "Transparent overlay",
+                            "streaming" => "Streaming output",
+                            _ => "Composited",
                         })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut m,
                                 "composited".into(),
                                 "Composited (capture feed in-app)",
+                            );
+                            ui.selectable_value(
+                                &mut m,
+                                "streaming".into(),
+                                "Streaming output (detached keyed window)",
                             );
                             ui.selectable_value(
                                 &mut m,
@@ -657,6 +1109,7 @@ impl eframe::App for App {
                         self.config.save();
                         self.restart_capture();
                         self.window_overlay_applied = None;
+                        self.stream_viewport_initialized = false;
                     }
                 });
 
@@ -819,7 +1272,7 @@ impl eframe::App for App {
                             .weak(),
                         );
                     }
-                } else {
+                } else if self.config.capture_mode == "transparent" {
                     let mut click = self.config.overlay_click_through;
                     if ui.checkbox(&mut click, "Click-through mouse").changed() {
                         self.config.overlay_click_through = click;
@@ -833,11 +1286,64 @@ impl eframe::App for App {
                         .small()
                         .weak(),
                     );
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("Key color");
+                        let mut changed = false;
+                        ui.label("R");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.config.stream_key_color[0])
+                                    .range(0..=255)
+                                    .speed(1),
+                            )
+                            .changed();
+                        ui.label("G");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.config.stream_key_color[1])
+                                    .range(0..=255)
+                                    .speed(1),
+                            )
+                            .changed();
+                        ui.label("B");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.config.stream_key_color[2])
+                                    .range(0..=255)
+                                    .speed(1),
+                            )
+                            .changed();
+                        let (swatch, _) =
+                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                        ui.painter().rect_filled(swatch, 2.0, self.stream_key_color());
+                        ui.monospace(self.stream_key_color_hex());
+                        if changed {
+                            self.config.save();
+                        }
+                    });
+                    if ui
+                        .checkbox(
+                            &mut self.config.stream_show_in_app_canvas,
+                            "Show in-app canvas preview",
+                        )
+                        .changed()
+                    {
+                        self.config.save();
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "A detached \"sni-lua stream output\" window stays open in this mode. \
+                             Capture that window in OBS, then chroma-key the selected background color.",
+                        )
+                        .small()
+                        .weak(),
+                    );
                 }
+                } // end Tab::Capture
 
-                ui.add_space(12.0);
-                ui.heading("Device");
-                ui.separator();
+                if self.tab == Tab::Setup {
+                section(ui, "Device");
                 if devices.is_empty() {
                     ui.label(
                         egui::RichText::new(
@@ -878,10 +1384,17 @@ impl eframe::App for App {
                             .unwrap_or_else(|| "—".into())
                     ));
                 }
+                } // end Tab::Setup (Device)
 
-                ui.add_space(12.0);
-                ui.heading("Live memory probe");
-                ui.separator();
+                if self.tab == Tab::Debug {
+                ui.add_space(6.0);
+                hint(
+                    ui,
+                    "Diagnostics — not needed for normal use. The live probe \
+                     and poll-engine stats below help tune bandwidth and \
+                     debug scripts.",
+                );
+                section(ui, "Live memory probe");
                 ui.label(
                     egui::RichText::new("FxPakPro address (hex). SM Samus X = F50AF6, Y = F50AFA.")
                         .small()
@@ -940,9 +1453,7 @@ impl eframe::App for App {
                 }
 
                 // --- Poll engine HUD: the M3 deliverable, live ---
-                ui.add_space(12.0);
-                ui.heading("Poll engine");
-                ui.separator();
+                section(ui, "Poll engine");
                 let stats = self.engine.stats();
                 egui::Grid::new("poll_stats")
                     .num_columns(2)
@@ -981,13 +1492,40 @@ impl eframe::App for App {
                             stats.byte_budget, stats.throughput_bpms
                         ));
                         ui.end_row();
+                        ui.label("deferred");
+                        ui.monospace(format!(
+                            "{} w · {} B",
+                            stats.deferred_watches, stats.deferred_bytes
+                        ));
+                        ui.end_row();
+                        ui.label("staleness");
+                        ui.monospace(format!(
+                            "oldest {} cyc · avg {:.1} cyc",
+                            stats.deferred_oldest_cycles, stats.deferred_avg_cycles
+                        ));
+                        ui.end_row();
+                        ui.label("drain");
+                        ui.monospace(format!(
+                            "{} B last · {:.1} KB/s",
+                            stats.deferred_bytes_processed_last_cycle,
+                            stats.deferred_drain_bpms_ewma * 1000.0 / 1024.0
+                        ));
+                        ui.end_row();
+                        ui.label("frame time");
+                        ui.monospace(format!(
+                            "{} / {} ms",
+                            stats.cycle_elapsed_ms, stats.frame_budget_ms
+                        ));
+                        ui.end_row();
+                        ui.label("overruns");
+                        ui.monospace(format!(
+                            "{:.1}% recent · {} total · +{} ms last",
+                            stats.frame_budget_overrun_rate * 100.0,
+                            stats.frame_budget_overruns,
+                            stats.frame_budget_overrun_ms
+                        ));
+                        ui.end_row();
                     });
-                if stats.budget_capped {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(255, 170, 0),
-                        "byte budget hit — some watches deferred",
-                    );
-                }
                 if let Some(e) = stats.last_error {
                     ui.colored_label(
                         egui::Color32::from_rgb(220, 60, 60),
@@ -1046,26 +1584,45 @@ impl eframe::App for App {
                     .small()
                     .weak(),
                 );
-
-            });
+                } // end Tab::Debug
+                }); // inset Frame
+                }); // ScrollArea
+            }); // SidePanel
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.add_space(3.0);
             ui.horizontal(|ui| {
-                ui.label("Status:");
+                ui.label(egui::RichText::new("Status").small().weak());
                 ui.label(&self.status);
             });
+            ui.add_space(3.0);
         });
 
         if self.show_console {
             egui::TopBottomPanel::bottom("console")
                 .resizable(true)
-                .default_height(140.0)
+                .default_height(150.0)
+                .min_height(80.0)
                 .show(ctx, |ui| {
+                    ui.add_space(3.0);
                     ui.horizontal(|ui| {
                         ui.heading("Console");
-                        if ui.small_button("clear").clicked() {
-                            self.console.lines.lock().clear();
-                        }
+                        let n = self.console.lines.lock().len();
+                        ui.label(
+                            egui::RichText::new(format!("{n} lines"))
+                                .small()
+                                .weak(),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.button("Clear").clicked() {
+                                    self.console.lines.lock().clear();
+                                }
+                                ui.checkbox(&mut self.show_console, "")
+                                    .on_hover_text("Hide console");
+                            },
+                        );
                     });
                     ui.separator();
                     let lines = self.console.snapshot();
@@ -1074,7 +1631,12 @@ impl eframe::App for App {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             for l in &lines {
-                                ui.monospace(l);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(l).monospace().size(12.0),
+                                    )
+                                    .wrap(),
+                                );
                             }
                         });
                 });
@@ -1082,12 +1644,12 @@ impl eframe::App for App {
 
         // Resolve everything that needs &mut self / ctx before the egui
         // closure (which borrows self immutably).
-        let transparent = sni_capture::CaptureMode::parse(&self.config.capture_mode)
-            == sni_capture::CaptureMode::TransparentOverlay;
-        let cap_tex = if transparent {
-            None
-        } else {
+        let capture_mode = self.capture_mode();
+        let transparent = capture_mode == sni_capture::CaptureMode::TransparentOverlay;
+        let cap_tex = if capture_mode == sni_capture::CaptureMode::Composited {
             self.capture_texture(ctx).map(|t| (t.id(), t.size()))
+        } else {
+            None
         };
         let sizing = self.text_sizing();
         let loaded = self.host.is_loaded();
@@ -1099,83 +1661,42 @@ impl eframe::App for App {
             central = central.frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT));
         }
         central.show(ctx, |ui| {
-            let avail = ui.available_size();
-            let sense = if transparent {
-                egui::Sense::drag()
-            } else {
-                egui::Sense::hover()
-            };
-            let (rect, resp) = ui.allocate_exact_size(avail, sense);
-            if transparent && resp.drag_started() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-            }
-            let painter = ui.painter_at(rect);
-
-            if !transparent {
-                painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 18, 22));
-            }
-
-            // Map the active script canvas onto the available area,
-            // letterboxed. A higher-res canvas lands in the same screen
-            // rect — only the script's drawing precision changes.
-            let vp = sni_render::Viewport::fit(rect, active_canvas);
-            let view = vp.screen_rect();
-
-            if transparent {
-                // Faint guide so the user can place the window; not painted
-                // opaque so it stays see-through.
-                painter.rect_stroke(
-                    view,
-                    0.0,
-                    egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgba_unmultiplied(120, 120, 120, 60),
-                    ),
-                );
-            } else if let Some((tex, frame_size)) = cap_tex {
-                // Composited: draw the capture feed to fill the canvas rect,
-                // overlay goes on top. Same rect as the overlay viewport so
-                // script pixel coords line up with the game pixels.
-                painter.image(
-                    tex,
-                    view,
-                    self.capture_uv_rect(frame_size, active_canvas),
-                    egui::Color32::WHITE,
+            if capture_mode == sni_capture::CaptureMode::StreamingOverlay
+                && !self.config.stream_show_in_app_canvas
+            {
+                ui.with_layout(
+                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "In-app preview hidden. The detached stream output window is still live.",
+                            )
+                            .weak(),
+                        );
+                    },
                 );
             } else {
-                // No device frame yet — placeholder screen so the overlay
-                // still reads against something.
-                painter.rect_filled(view, 0.0, egui::Color32::from_rgb(8, 10, 16));
-                painter.rect_stroke(
-                    view,
-                    0.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
-                );
-                painter.text(
-                    view.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "Waiting for capture device…\n(pick one under Capture)",
-                    egui::FontId::proportional(13.0),
-                    egui::Color32::from_gray(110),
-                );
-            }
-
-            // Overlay always on top of whatever background.
-            sni_render::paint(&painter, &vp, &self.draw_list, sizing);
-
-            if !loaded && !transparent {
-                painter.text(
-                    egui::pos2(view.center().x, view.min.y + 16.0),
-                    egui::Align2::CENTER_CENTER,
-                    "No script running. Set a Lua path and click Load.",
-                    egui::FontId::proportional(13.0),
-                    egui::Color32::from_gray(120),
+                self.paint_overlay_canvas(
+                    ui,
+                    ctx,
+                    active_canvas,
+                    capture_mode,
+                    cap_tex,
+                    sizing,
+                    loaded,
                 );
             }
         });
+
+        if capture_mode == sni_capture::CaptureMode::StreamingOverlay {
+            self.show_stream_viewport(ctx, active_canvas, sizing, loaded);
+        } else {
+            self.stream_viewport_initialized = false;
+        }
     }
 
     fn on_exit(&mut self) {
         self.config.save();
+        self.host.store().flush_if_dirty();
     }
 }

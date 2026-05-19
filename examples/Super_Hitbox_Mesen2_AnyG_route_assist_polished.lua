@@ -891,6 +891,56 @@ function makeAramReader(p, n, is_signed, interval)
     return makeReader(p, n, is_signed, interval, true)
 end
 
+local function cpuBankWrapAddress(p)
+    return xemu.or_(xemu.and_(p, 0xFF0000), xemu.and_(p, 0xFFFF))
+end
+
+local function cpuBankWrappedOffsetAddress(p, offset)
+    return xemu.or_(xemu.and_(p, 0xFF0000), xemu.and_(xemu.and_(p, 0xFFFF) + offset, 0xFFFF))
+end
+
+local function readCpu8BankWrapped(p, signed)
+    return readCpu8(cpuBankWrapAddress(p), signed or false)
+end
+
+local function readCpu16BankWrapped(p, signed)
+    local addr = cpuBankWrapAddress(p)
+    local lo = readCpu8(addr, false)
+    local hi = readCpu8(cpuBankWrappedOffsetAddress(addr, 1), false)
+    local value = lo + xemu.lshift(hi, 8)
+    if signed and value >= 0x8000 then
+        value = value - 0x10000
+    end
+    return value
+end
+
+function makeBankWrappedReader(p, n, is_signed, interval)
+    -- p: 24-bit CPU address. Indexed accesses wrap within the original bank.
+    if n < 1 or n > 2 then
+        error(string.format('Trying to make bank-wrapped reader with n = %d', n))
+    end
+
+    local unsignedReaders = {
+        [1] = function(addr) return readCpu8BankWrapped(addr, false) end,
+        [2] = function(addr) return readCpu16BankWrapped(addr, false) end,
+    }
+    local signedReaders = {
+        [1] = function(addr) return readCpu8BankWrapped(addr, true) end,
+        [2] = function(addr) return readCpu16BankWrapped(addr, true) end,
+    }
+
+    local reader = unsignedReaders[n] or function() return 0 end
+    if is_signed then
+        reader = signedReaders[n] or function() return 0 end
+    end
+
+    if interval then
+        return function(i) return reader(cpuBankWrappedOffsetAddress(p, i * interval)) end
+    else
+        return function() return reader(p) end
+    end
+end
+
 function makeAggregateReader(readers)
     return function(i) return readers[i + 1] end
 end
@@ -962,6 +1012,33 @@ local function hotkeyModifierHeld(input, cfg)
     end
     return xemu.and_(input, sm.button_select) ~= 0 and xemu.and_(input, sm.button_B) ~= 0
 end
+
+local hotkeyFrameState = {
+    frame = nil,
+    input = 0,
+    pressed = 0,
+    initialized = false,
+}
+
+local function getHotkeyFrameState()
+    local frame = emu.framecount()
+    if hotkeyFrameState.frame ~= frame then
+        local previousInput = hotkeyFrameState.input or 0
+        local input = sm.getInput()
+        hotkeyFrameState.frame = frame
+        hotkeyFrameState.input = input
+        if hotkeyFrameState.initialized then
+            hotkeyFrameState.pressed = xemu.and_(input, xemu.not_(previousInput))
+        else
+            hotkeyFrameState.pressed = 0
+            hotkeyFrameState.initialized = true
+        end
+    end
+    return hotkeyFrameState.input, hotkeyFrameState.pressed, frame
+end
+
+local lastDebugControlsFrame = nil
+local lastAnygUpdateFrame = nil
 
 local function hotkeyPressed(input, changed, cfg, fieldName, defaultButton)
     cfg = cfg or {}
@@ -1229,10 +1306,10 @@ sm.getSpriteObjectXPosition       = makeReader(0x7EF0F8, 2, false, 2)
 sm.getSpriteObjectYPosition       = makeReader(0x7EF1F8, 2, false, 2)
 
 -- Blocks
-sm.getLevelDatum      = makeReader(0x7F0002, 2, false, 2)
-sm.getBts             = makeReader(0x7F6402, 1, false, 1)
-sm.getBtsSigned       = makeReader(0x7F6402, 1, true,  1)
-sm.getBackgroundDatum = makeReader(0x7F9602, 2, false, 2)
+sm.getLevelDatum      = makeBankWrappedReader(0x7F0002, 2, false, 2)
+sm.getBts             = makeBankWrappedReader(0x7F6402, 1, false, 1)
+sm.getBtsSigned       = makeBankWrappedReader(0x7F6402, 1, true,  1)
+sm.getBackgroundDatum = makeBankWrappedReader(0x7F9602, 2, false, 2)
 
 
 -- ARAM --
@@ -2125,9 +2202,13 @@ function isValidLevelData()
 end
 
 function handleDebugControls()
-    local input = sm.getInput()
-    local changedInput = sm.getChangedInput()
+    local input, changedInput, frame = getHotkeyFrameState()
     local controls = ((CONFIG.blockLabels or {}).controls or {})
+
+    if lastDebugControlsFrame == frame then
+        return
+    end
+    lastDebugControlsFrame = frame
 
     if not hotkeyModifierHeld(input, controls) then
         return
@@ -2810,6 +2891,29 @@ local function anygTimingColour(status)
     return cfg.badColour or "red"
 end
 
+-- When $0998 advances to $0D after the pause-start, SM has already latched a
+-- stable animation timer/frame pair that tells us how early/late the D-pad
+-- direction press was. This avoids relying on live per-frame edge sampling.
+local ANYG_DOORSKIP_DIRECTION_SAMPLE_TO_DIFF = {
+    ["0001:0002"] = -4,
+    ["0002:0002"] = -3,
+    ["0001:0001"] = -2,
+    ["0002:0001"] = -1,
+    ["0003:0001"] = 0,
+    ["0001:0008"] = 1,
+    ["0002:0008"] = 2,
+    ["0001:0007"] = 3,
+    ["0002:0007"] = 4,
+}
+
+local function anygDoorskipDirectionSampleKey(timer, frame)
+    return string.format("%04X:%04X", xemu.and_(timer or 0, 0xFFFF), xemu.and_(frame or 0, 0xFFFF))
+end
+
+local function anygDecodeDoorskipDirectionDiff(timer, frame)
+    return ANYG_DOORSKIP_DIRECTION_SAMPLE_TO_DIFF[anygDoorskipDirectionSampleKey(timer, frame)]
+end
+
 local function anygButtonNameFromMask(mask)
     if mask == sm.button_left then return "Left" end
     if mask == sm.button_right then return "Right" end
@@ -2837,6 +2941,8 @@ local function anygStartDoorskipAttempt(input)
     ds.directionOffset = nil
     ds.directionDiff = nil
     ds.directionStatus = nil
+    ds.directionTimerValue = nil
+    ds.directionAnimationFrameValue = nil
     ds.lastDirectionPressFrame = nil
     ds.lastDirectionButton = nil
     ds.downFrame = nil
@@ -2897,8 +3003,10 @@ end
 
 local function anygBuildDoorskipResultText(ds)
     local dirText = "dir ?"
-    if ds.directionOffset ~= nil then
+    if ds.directionDiff ~= nil then
         dirText = string.format("dir %+d %s", ds.directionDiff or 0, ds.directionStatus or "?")
+    elseif ds.directionTimerValue ~= nil and ds.directionAnimationFrameValue ~= nil then
+        dirText = string.format("dir raw %s/%s", anygHex(ds.directionTimerValue, 2), anygHex(ds.directionAnimationFrameValue, 2))
     end
 
     local downText = "down ?"
@@ -3021,7 +3129,6 @@ local function anygUpdateDoorskipTiming()
     local prevGameState = anygState.prevGameState
     local ds = anygState.doorskip
 
-    local startPressed = xemu.and_(changed, sm.button_start) ~= 0
     local leftPressed = xemu.and_(changed, sm.button_left) ~= 0
     local rightPressed = xemu.and_(changed, sm.button_right) ~= 0
     local downPressed = xemu.and_(changed, sm.button_down) ~= 0
@@ -3029,8 +3136,10 @@ local function anygUpdateDoorskipTiming()
     local shoulderRPressed = xemu.and_(changed, sm.button_R) ~= 0
     local shoulderHeld = xemu.and_(input, sm.button_L + sm.button_R) ~= 0
     local shoulderPressed = shoulderLPressed or shoulderRPressed
+    local enteredPauseStart = prevGameState ~= nil and prevGameState ~= gameState and gameState == 0x0C
+    local directionLatched = prevGameState ~= nil and prevGameState ~= gameState and gameState == 0x0D
 
-    if startPressed then
+    if enteredPauseStart and xemu.and_(input, sm.button_A) ~= 0 then
         anygStartDoorskipAttempt(input)
     end
 
@@ -3040,20 +3149,56 @@ local function anygUpdateDoorskipTiming()
         local button = leftPressed and sm.button_left or sm.button_right
         ds.lastDirectionPressFrame = anygState.frame
         ds.lastDirectionButton = button
-        if ds.directionFrame == nil then
-            local offset = anygState.frame - ds.startFrame
-            local diff = offset - (cfg.targetDirectionFramesAfterStart or 5)
+    end
+
+    if attemptActive and directionLatched and ds.directionFrame == nil then
+        local timer = sm.getSamusAnimationFrameTimer()
+        local frame = sm.getSamusAnimationFrame()
+        local diff = anygDecodeDoorskipDirectionDiff(timer, frame)
+        local button = ds.lastDirectionButton
+        if button == nil then
+            if xemu.and_(input, sm.button_left) ~= 0 then
+                button = sm.button_left
+            elseif xemu.and_(input, sm.button_right) ~= 0 then
+                button = sm.button_right
+            else
+                button = sm.button_left
+            end
+        end
+
+        ds.directionFrame = anygState.frame
+        ds.directionButton = button
+        ds.directionTimerValue = timer
+        ds.directionAnimationFrameValue = frame
+
+        if diff ~= nil then
             local status = anygTimingStatus(diff, cfg.directionGoodWindow or 0, cfg.directionNearWindow or 2)
-            ds.directionFrame = anygState.frame
-            ds.directionButton = button
-            ds.directionOffset = offset
+            ds.directionOffset = diff
             ds.directionDiff = diff
             ds.directionStatus = status
-            ds.lastResultText = string.format("D-pad %s at +%df: %s (%+d)", anygButtonNameFromMask(button), offset, status, diff)
+            ds.lastResultText = string.format(
+                "D-pad %s via $0A94/$0A96 %s/%s: %s (%+d)",
+                anygButtonNameFromMask(button),
+                anygHex(timer, 2),
+                anygHex(frame, 2),
+                status,
+                diff
+            )
             ds.lastResultColour = anygTimingColour(status)
-            if status ~= "GOOD" and cfg.warnOnBadAttempt then
-                anygAddWarning(ds.lastResultText, ds.lastResultColour)
-            end
+        else
+            ds.directionOffset = nil
+            ds.directionDiff = nil
+            ds.directionStatus = "UNKNOWN"
+            ds.lastResultText = string.format(
+                "D-pad timing raw $0A94/$0A96 = %s/%s at $0998=0D",
+                anygHex(timer, 2),
+                anygHex(frame, 2)
+            )
+            ds.lastResultColour = cfg.badColour or "red"
+        end
+
+        if ds.directionStatus ~= "GOOD" and cfg.warnOnBadAttempt then
+            anygAddWarning(ds.lastResultText, ds.lastResultColour)
         end
     end
 
@@ -3175,8 +3320,7 @@ end
 
 local function anygHandleControls()
     local cfg = ANYG.controls or {}
-    local input = sm.getInput()
-    local changed = sm.getChangedInput()
+    local input, changed = getHotkeyFrameState()
     if not hotkeyModifierHeld(input, cfg) then
         return
     end
@@ -3237,7 +3381,17 @@ local function anygHandleControls()
 end
 local function anygUpdateState()
     if not anygEnabled() then return end
-    anygState.frame = anygState.frame + 1
+    local _, _, frame = getHotkeyFrameState()
+    if lastAnygUpdateFrame == frame then
+        return
+    end
+    lastAnygUpdateFrame = frame
+
+    if anygState.frame == nil then
+        anygState.frame = frame
+    else
+        anygState.frame = math.max(anygState.frame + 1, frame)
+    end
     anygHandleControls()
     anygUpdateDoorskipTiming()
 
@@ -3633,14 +3787,27 @@ local function anygDrawDoorskipTiming(viewWidth, viewHeight)
     y = y + lh
 
     local dirColour = warnC
-    local dirText = string.format("D-pad L/R: target +%df", cfg.targetDirectionFramesAfterStart or 5)
-    if ds.directionOffset ~= nil then
+    local dirText = "D-pad timing: wait for $0998=0D"
+    if ds.directionDiff ~= nil then
         dirColour = anygTimingColour(ds.directionStatus)
-        dirText = string.format("D-pad %s: %+d  %s", anygButtonNameFromMask(ds.directionButton), ds.directionDiff or 0, ds.directionStatus or "?")
+        dirText = string.format(
+            "D-pad %s: %+d  %s (%s/%s)",
+            anygButtonNameFromMask(ds.directionButton),
+            ds.directionDiff or 0,
+            ds.directionStatus or "?",
+            anygHex(ds.directionTimerValue, 2),
+            anygHex(ds.directionAnimationFrameValue, 2)
+        )
+    elseif ds.directionTimerValue ~= nil and ds.directionAnimationFrameValue ~= nil then
+        dirColour = badC
+        dirText = string.format(
+            "D-pad latch: raw %s/%s",
+            anygHex(ds.directionTimerValue, 2),
+            anygHex(ds.directionAnimationFrameValue, 2)
+        )
     elseif ds.startFrame ~= nil then
-        local due = (cfg.targetDirectionFramesAfterStart or 5) - (anygState.frame - ds.startFrame)
-        dirText = string.format("D-pad L/R: due %+df", due)
-        dirColour = math.abs(due) <= 1 and warnC or textC
+        dirText = "D-pad timing: waiting for 0D latch"
+        dirColour = textC
     end
     anygDrawPanelLine(x, y, dirText, dirColour, bg)
     y = y + lh

@@ -25,7 +25,7 @@ pub struct Config {
     /// script roams. Pinned watches (controller, frame counter, explicit
     /// snes.tier) are unaffected.
     pub demand_window_ms: u32,
-    /// Capture mode: "composited" or "transparent".
+    /// Capture mode: "composited", "transparent", or "streaming".
     pub capture_mode: String,
     /// Capture device index (composited mode). Capture cards enumerate as
     /// webcam-class devices.
@@ -45,6 +45,10 @@ pub struct Config {
     pub capture_crop_mode: String,
     /// Mouse input should pass through the transparent overlay window.
     pub overlay_click_through: bool,
+    /// RGB key color for the detached streaming-output window.
+    pub stream_key_color: [u8; 3],
+    /// Keep showing the overlay canvas inside the main app while streaming.
+    pub stream_show_in_app_canvas: bool,
     /// Last loaded script path, restored on launch.
     pub last_script: Option<PathBuf>,
     /// Canvas (script coordinate space) policy:
@@ -79,6 +83,8 @@ impl Default for Config {
             capture_crop_bottom: 0,
             capture_crop_mode: "aspect".to_string(),
             overlay_click_through: false,
+            stream_key_color: [255, 0, 255],
+            stream_show_in_app_canvas: true,
             last_script: None,
             canvas_mode: "script".to_string(),
             text_sizing_mode: "game".to_string(),
@@ -111,5 +117,29 @@ impl Config {
                 tracing::warn!("could not save config: {e}");
             }
         }
+    }
+
+    /// Per-script persistent-store file, kept in a `store/` dir next to the
+    /// config. Keyed by a hash of the script's absolute path so two scripts
+    /// with the same file name don't collide, and renaming the app dir keeps
+    /// each script's data with it. Best-effort: returns `None` if we can't
+    /// resolve a base dir (store then silently disables).
+    pub fn store_path_for(script: &std::path::Path) -> Option<PathBuf> {
+        let base = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("store")))?;
+        let _ = std::fs::create_dir_all(&base);
+        let abs = std::fs::canonicalize(script).unwrap_or_else(|_| script.to_path_buf());
+        // Cheap stable hash (FNV-1a) of the absolute path — no extra dep.
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in abs.to_string_lossy().as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        let stem = script
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "script".into());
+        Some(base.join(format!("{stem}.{h:016x}.json")))
     }
 }

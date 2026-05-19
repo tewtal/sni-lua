@@ -1,6 +1,6 @@
 //! Capture-device background.
 //!
-//! Two modes (both selectable, per the original design):
+//! Three modes (all selectable):
 //!
 //! * [`CaptureMode::Composited`] — the app grabs the capture feed and draws
 //!   the overlay on top inside its own window.
@@ -9,6 +9,9 @@
 //!   user's own capture software (OBS, etc.). No device is opened in this
 //!   mode; the window manager / Win32 layer handles transparency (the app
 //!   crate owns that since it owns the eframe window).
+//! * [`CaptureMode::StreamingOverlay`] — the app renders only the overlay in
+//!   a separate opaque window with a solid chroma-key background so it can be
+//!   captured directly as a normal window and keyed in streaming software.
 //!
 //! Pipeline philosophy mirrors the SNI side: a background thread always holds
 //! only the *newest* decoded frame in an [`ArcSwap`]; the UI thread loads the
@@ -30,6 +33,7 @@ use nokhwa::{Camera, FormatDecoder};
 pub enum CaptureMode {
     Composited,
     TransparentOverlay,
+    StreamingOverlay,
 }
 
 impl Default for CaptureMode {
@@ -42,6 +46,7 @@ impl CaptureMode {
     pub fn parse(s: &str) -> CaptureMode {
         match s {
             "transparent" => CaptureMode::TransparentOverlay,
+            "stream" | "streaming" => CaptureMode::StreamingOverlay,
             _ => CaptureMode::Composited,
         }
     }

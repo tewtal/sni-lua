@@ -3,11 +3,11 @@
 //!
 //! Per cycle:
 //!   1. retain set = all registered watches (dormant ones keep their cache)
-//!   2. poll set = active watches (pinned + within the demand window)
+//!   2. poll set = active watches plus their latest script request marker
 //!   3. Realtime sub-poll first (controller path), kept off the bulk batch
-//!   4. bulk DRAIN LOOP: repeatedly select (urgent-first, then stalest Low),
-//!      excluding watches already refreshed this cycle, issuing batches
-//!      back-to-back until the frame-time window is spent or all caught up
+//!   4. bulk DRAIN LOOP: repeatedly select pending non-realtime requests
+//!      round-robin by oldest refresh, issuing batches until the shared
+//!      frame-time window is spent or all requested data is caught up
 //!   5. slice results back to each member watch, carry stale data forward
 //!   6. publish via `ArcSwap` (lock-free for readers)
 //!   7. adaptive byte budget (AIMD vs frame target); sleep only the unused
@@ -26,7 +26,9 @@ use parking_lot::Mutex;
 use sni_client::SniClient;
 
 use crate::snapshot::{Snapshot, SnapshotBuilder};
-use crate::watch::{coalesce, WatchPriority, WatchRegistry};
+use crate::watch::{coalesce, CoalescedRead, WatchId, WatchPriority, WatchRegistry};
+
+const THROUGHPUT_HEADROOM: f32 = 0.8;
 
 #[derive(Debug, Clone)]
 pub struct PollConfig {
@@ -80,7 +82,7 @@ impl Default for PollConfig {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PollStats {
     pub cycle: u64,
-    /// Watches actively polled this cycle (pinned + within demand window).
+    /// Watches active this cycle (pinned + within demand window).
     pub watches: usize,
     /// Total registered watches incl. dormant (still cached, not polled).
     pub watches_total: usize,
@@ -95,6 +97,24 @@ pub struct PollStats {
     pub realtime_rtt_ms: u32,
     /// True if the last cycle hit the byte budget and deferred some watches.
     pub budget_capped: bool,
+    /// Active non-realtime requested data still waiting for a successful SNI
+    /// refresh after the last cycle.
+    pub deferred_watches: usize,
+    pub deferred_bytes: u32,
+    pub deferred_oldest_cycles: u32,
+    pub deferred_avg_cycles: f32,
+    /// Bulk deferred data refreshed last cycle, plus an EWMA of the drain
+    /// rate in bytes/ms.
+    pub deferred_bytes_processed_last_cycle: u32,
+    pub deferred_drain_bpms_ewma: f32,
+    /// Poll-cycle wall time before inter-cycle sleep, and frame-budget
+    /// overrun counters.
+    pub cycle_elapsed_ms: u32,
+    pub frame_budget_ms: u32,
+    pub frame_budget_overran: bool,
+    pub frame_budget_overrun_ms: u32,
+    pub frame_budget_overruns: u64,
+    pub frame_budget_overrun_rate: f32,
     /// Current adaptive bulk-read budget (bytes) and the throughput estimate
     /// (bytes/ms) it's derived from — so the HUD shows the self-tuning.
     pub byte_budget: u32,
@@ -164,12 +184,15 @@ pub fn spawn(
             c.min_byte_budget.max(2048).min(c.max_byte_budget)
         };
         let mut throughput: Option<f32> = None;
-        // Per-watch last-refreshed cycle. Drives stalest-first Low selection
-        // so deferred block/level data streams in completely and evenly, and
-        // stays correct as the registry grows mid-stream (a new watch has no
-        // entry → treated as maximally stale → read promptly). GC'd
-        // periodically against the live set so it can't grow unbounded.
-        let mut last_read: HashMap<u64, u64> = HashMap::new();
+        let mut deferred_drain_bpms_ewma = 0.0f32;
+        let mut frame_budget_overruns = 0u64;
+        let mut frame_budget_overrun_rate = 0.0f32;
+        // Per-watch fulfilment state. A Lua cached read bumps the registry's
+        // request marker; a successful SNI refresh copies that marker here.
+        // Bulk polling then handles only active watches with unfulfilled
+        // requests, ordered by oldest refresh so cold/pending data streams in
+        // round-robin instead of repeatedly restarting at the same prefix.
+        let mut read_state: HashMap<WatchId, ReadState> = HashMap::new();
         loop {
             let cfg = config.lock().clone();
             let cycle_start = Instant::now();
@@ -185,15 +208,16 @@ pub fn spawn(
             // ones must keep their last cached value so the script can still
             // read stale data without it vanishing.
             let all_watches = registry.all();
-            let live_ids: HashSet<u64> =
-                all_watches.iter().map(|w| w.id).collect();
+            let live_ids: HashSet<u64> = all_watches.iter().map(|w| w.id).collect();
 
             // Poll set = only ACTIVE watches: pinned + read by the script
-            // within the demand window. This is the fix for the watched set
-            // growing without bound — data the script stopped caring about
-            // (blocks from rooms ago) is no longer fetched, freeing the
-            // budget for what's actually wanted.
-            let watches = registry.active(cfg.demand_window);
+            // within the demand window. Alongside each handle we snapshot
+            // the latest request marker so bulk polling can fetch only data
+            // the script has requested since the last successful refresh.
+            let active = registry.active_with_requests(cfg.demand_window);
+            let request_seq: HashMap<WatchId, u64> =
+                active.iter().map(|(w, seq)| (w.id, *seq)).collect();
+            let watches: Vec<_> = active.into_iter().map(|(w, _)| w).collect();
 
             // Build the next snapshot on top of the previous one so watches
             // not refreshed this cycle keep their last value (just age).
@@ -216,13 +240,13 @@ pub fn spawn(
             let mut realtime_rtt = 0u32;
             if !realtime.is_empty() {
                 let rt_reads = coalesce(&realtime, cfg.coalesce_gap);
-                let rt_regions: Vec<_> =
-                    rt_reads.iter().map(|r| r.region).collect();
+                let rt_regions: Vec<_> = rt_reads.iter().map(|r| r.region).collect();
                 let t0 = Instant::now();
                 match client.multi_read(&uri, &rt_regions).await {
                     Ok(blobs) => {
                         realtime_rtt = t0.elapsed().as_millis() as u32;
                         apply_reads(&rt_reads, &blobs, &mut builder);
+                        mark_fulfilled(&rt_reads, &request_seq, cycle, &mut read_state);
                     }
                     Err(e) => {
                         realtime_rtt = t0.elapsed().as_millis() as u32;
@@ -233,42 +257,28 @@ pub fn spawn(
             }
 
             // --- Tier 2: bulk DRAIN LOOP ----------------------------------
-            // The previous design issued ONE bulk read then slept the rest of
-            // the frame — wasting the whole window while deferred reads
-            // starved. Instead we keep issuing reads back-to-back until the
-            // frame-time budget for this cycle is spent:
+            // Bulk drain: after realtime, spend whatever remains of this
+            // frame's time budget on active watches whose latest script
+            // request has not been fulfilled yet.
             //
-            //   * High/Normal are always eligible (no fixed cadence; the
-            //     staleness ordering paces Normal naturally — it's just less
-            //     stale than Low after a recent read).
-            //   * Within Low, stalest-first (longest since last refreshed),
-            //     so block/level data streams in completely and evenly; new
-            //     watches (registry grows as the script touches addresses)
-            //     are maximally stale and picked up promptly.
-            //   * Each admitted watch's last-read cycle is recorded so the
-            //     next selection skips what we just got and advances to the
-            //     next stalest — no index cursor to smear.
+            // Selection is round-robin by oldest successful refresh across
+            // all non-realtime priorities. Priority only breaks ties, so High
+            // data wins when equally stale, but a constantly-requested High
+            // set cannot permanently starve Low pending data.
             //
-            // Time budget for the whole cycle: frame_budget_ms, minus what
-            // the realtime sub-poll already spent. We stop issuing once
-            // we've used it (or there's nothing left / a single read would
-            // clearly overrun), then the adaptive byte budget is updated
-            // from the aggregate so it converges on "as much as fits".
+            // Each admitted watch is marked fulfilled for the request marker
+            // observed at cycle start. If Lua requests it again while the SNI
+            // read is in flight, that newer marker remains pending for a
+            // later cycle.
             let bulk_eligible: Vec<_> = watches
                 .iter()
                 .filter(|w| !w.priority.is_realtime())
                 .cloned()
                 .collect();
 
-            // IMPORTANT: the bulk drain window is measured from HERE (after
-            // the realtime sub-poll), not from cycle_start. The realtime
-            // poll is a tiny, separately-prioritised cost; on a real link
-            // its RTT alone can equal/exceed frame_budget_ms, and if the
-            // drain loop's time check were relative to cycle_start it would
-            // break on its first iteration and issue ZERO bulk reads —
-            // exactly the "adds a bit then stops, blank forever" symptom.
-            // The drain gets its own full frame_budget_ms window.
-            let bulk_start = Instant::now();
+            // One frame budget covers both tiers. Realtime is issued first;
+            // if it consumes the window, bulk waits for a later cycle rather
+            // than getting a second full budget.
             let frame_ms = cfg.frame_budget_ms.max(1) as u128;
             let mut bytes_requested: u32 = 0;
             let mut reads_issued: usize = 0;
@@ -276,54 +286,53 @@ pub fn spawn(
             let mut worst_rtt: u32 = 0;
             // Watches already refreshed in THIS cycle's drain loop. Each
             // iteration excludes them, so successive batches advance through
-            // the deferred set instead of re-selecting the same stalest
-            // prefix every time (the "fills then restarts" bug: the old
-            // `!capped` break stopped the loop the moment the remaining
-            // stale set fit one budget, so the tail never got read and the
-            // next cycle just re-read the front).
+            // the pending set instead of re-selecting the same stalest prefix.
             let mut done_this_cycle: HashSet<u64> = HashSet::new();
             // Coalesce once per cycle; re-filter the cheap members list each
             // iteration rather than re-coalescing.
-            let coalesced_all =
-                coalesce(&bulk_eligible, cfg.coalesce_gap);
-
+            let coalesced_all = coalesce(&bulk_eligible, cfg.coalesce_gap);
             loop {
-                // Stop if the drain's time window is spent — but ALWAYS
-                // issue at least one bulk batch per cycle (reads_issued == 0
-                // bypasses the check) so a slow realtime poll or a long
-                // previous batch can never starve bulk progress to zero.
-                if reads_issued > 0
-                    && bulk_start.elapsed().as_millis() >= frame_ms
-                {
+                // Stop once the shared frame window is spent. A read can
+                // still overrun on transport jitter, but after the first
+                // throughput sample we also shrink this iteration's byte cap
+                // to the time actually left in the frame.
+                let elapsed_ms = cycle_start.elapsed().as_millis();
+                if elapsed_ms >= frame_ms {
                     break;
                 }
+                let Some(iter_budget) = budget_for_remaining_time(
+                    budget,
+                    throughput,
+                    elapsed_ms,
+                    frame_ms,
+                ) else {
+                    break;
+                };
 
-                // Eligible = coalesced reads with at least one member not yet
-                // refreshed this cycle. When none remain, every eligible
-                // watch has been read once this cycle — we're caught up.
-                let pending: Vec<_> = coalesced_all
+                // Eligible = budget-sized coalesced reads with at least one
+                // member whose latest request marker is still unfulfilled
+                // and has not already been serviced in this cycle.
+                let chunked = split_reads_to_budget(&coalesced_all, iter_budget);
+                let pending: Vec<_> = chunked
                     .iter()
-                    .filter(|r| {
-                        r.members
-                            .iter()
-                            .any(|&(id, _, _)| !done_this_cycle.contains(&id))
-                    })
+                    .filter(|r| read_is_pending(r, &request_seq, &read_state, &done_this_cycle))
                     .cloned()
                     .collect();
                 if pending.is_empty() {
-                    break; // fully drained this cycle
+                    break; // all currently requested data is fulfilled
                 }
 
-                let sel =
-                    select_bulk(pending, budget, &last_read, cycle);
+                let sel = select_bulk(pending, iter_budget, &read_state, cycle);
                 if sel.reads.is_empty() {
                     break;
                 }
                 budget_capped |= sel.capped;
 
-                let regions: Vec<_> =
-                    sel.reads.iter().map(|r| r.region).collect();
+                let regions: Vec<_> = sel.reads.iter().map(|r| r.region).collect();
                 let bytes: u32 = regions.iter().map(|r| r.size).sum();
+                if !batch_fits_remaining_time(bytes, throughput, elapsed_ms, frame_ms) {
+                    break;
+                }
 
                 let t0 = Instant::now();
                 match client.multi_read(&uri, &regions).await {
@@ -331,51 +340,61 @@ pub fn spawn(
                         let rtt = t0.elapsed().as_millis() as u32;
                         worst_rtt = worst_rtt.max(rtt);
                         apply_reads(&sel.reads, &blobs, &mut builder);
-                        for r in &sel.reads {
-                            for &(id, _, _) in &r.members {
-                                last_read.insert(id, cycle);
-                                done_this_cycle.insert(id);
-                            }
-                        }
-                        bytes_requested =
-                            bytes_requested.saturating_add(bytes);
+                        mark_fulfilled(&sel.reads, &request_seq, cycle, &mut read_state);
+                        mark_done(&sel.reads, &mut done_this_cycle);
+                        bytes_requested = bytes_requested.saturating_add(bytes);
                         reads_issued += 1;
 
                         // Adaptive byte budget: converge so a single batch
                         // fits the frame. Driven by the per-batch RTT.
                         let inst_bpms = bytes as f32 / rtt.max(1) as f32;
                         throughput = Some(match throughput {
-                            Some(tp) => cfg.rtt_alpha * inst_bpms
-                                + (1.0 - cfg.rtt_alpha) * tp,
+                            Some(tp) => cfg.rtt_alpha * inst_bpms + (1.0 - cfg.rtt_alpha) * tp,
                             None => inst_bpms,
                         });
-                        budget =
-                            next_budget(budget, rtt, throughput, &cfg);
+                        budget = next_budget(budget, rtt, throughput, &cfg);
 
-                        // Don't start another batch that would clearly
-                        // overrun the drain window (estimate the next one's
-                        // cost from this batch's RTT). Measured from
-                        // bulk_start for the same reason as the top check.
-                        if bulk_start.elapsed().as_millis() + rtt as u128
-                            >= frame_ms
-                        {
+                        // Don't start another batch that would clearly spend
+                        // past the shared frame window, estimating the next
+                        // cost from this batch's RTT.
+                        if cycle_start.elapsed().as_millis() + rtt as u128 >= frame_ms {
                             break;
                         }
-                        // NOTE: deliberately NO `!capped` break here. capped
-                        // just means "budget was full this batch" — exactly
-                        // when we MUST keep going to drain the rest within
-                        // the time window. We stop only on time or when
-                        // nothing pending remains.
                     }
                     Err(e) => {
-                        worst_rtt = worst_rtt
-                            .max(t0.elapsed().as_millis() as u32);
+                        worst_rtt = worst_rtt.max(t0.elapsed().as_millis() as u32);
                         last_error = Some(classify_err(&e));
                         tracing::debug!("bulk multi_read failed: {e}");
                         break;
                     }
                 }
             }
+
+            let pending_after = pending_summary(
+                &split_reads_to_budget(&coalesced_all, budget),
+                &request_seq,
+                &read_state,
+                cycle,
+            );
+            let cycle_elapsed_ms = cycle_start.elapsed().as_millis() as u32;
+            let frame_budget_ms = cfg.frame_budget_ms.max(1);
+            let frame_budget_overran = cycle_elapsed_ms > frame_budget_ms;
+            let frame_budget_overrun_ms = cycle_elapsed_ms.saturating_sub(frame_budget_ms);
+            if frame_budget_overran {
+                frame_budget_overruns += 1;
+            }
+            let overrun_sample = if frame_budget_overran { 1.0 } else { 0.0 };
+            frame_budget_overrun_rate = if cycle <= 1 {
+                overrun_sample
+            } else {
+                0.05 * overrun_sample + 0.95 * frame_budget_overrun_rate
+            };
+            let drain_sample = bytes_requested as f32 / cycle_elapsed_ms.max(1) as f32;
+            deferred_drain_bpms_ewma = if cycle <= 1 {
+                drain_sample
+            } else {
+                0.20 * drain_sample + 0.80 * deferred_drain_bpms_ewma
+            };
 
             let rtt_ms = worst_rtt;
             let snap = builder.build(cycle, rtt_ms, rtt_ms);
@@ -396,26 +415,37 @@ pub fn spawn(
                 st.rtt_ms_ewma = if st.rtt_ms_ewma == 0.0 {
                     rtt_ms as f32
                 } else {
-                    cfg.rtt_alpha * rtt_ms as f32
-                        + (1.0 - cfg.rtt_alpha) * st.rtt_ms_ewma
+                    cfg.rtt_alpha * rtt_ms as f32 + (1.0 - cfg.rtt_alpha) * st.rtt_ms_ewma
                 };
                 st.budget_capped = budget_capped;
+                st.deferred_watches = pending_after.watches;
+                st.deferred_bytes = pending_after.bytes;
+                st.deferred_oldest_cycles = pending_after.oldest_cycles;
+                st.deferred_avg_cycles = pending_after.avg_cycles;
+                st.deferred_bytes_processed_last_cycle = bytes_requested;
+                st.deferred_drain_bpms_ewma = deferred_drain_bpms_ewma;
+                st.cycle_elapsed_ms = cycle_elapsed_ms;
+                st.frame_budget_ms = frame_budget_ms;
+                st.frame_budget_overran = frame_budget_overran;
+                st.frame_budget_overrun_ms = frame_budget_overrun_ms;
+                st.frame_budget_overruns = frame_budget_overruns;
+                st.frame_budget_overrun_rate = frame_budget_overrun_rate;
                 st.last_error = last_error;
             }
 
-            // Garbage-collect last_read entries for watches that no longer
+            // Garbage-collect read-state entries for watches that no longer
             // exist so it can't grow unbounded across room/script changes.
             if cycle % 256 == 0 {
-                last_read.retain(|id, _| live_ids.contains(id));
+                read_state.retain(|id, _| live_ids.contains(id));
             }
 
             // Inter-cycle pacing: only sleep the UNUSED remainder of the
             // window. If the drain loop already consumed it (or overran —
             // latency-bound), continue immediately.
             let elapsed = cycle_start.elapsed();
-            let target = cfg.target_period.min(Duration::from_millis(
-                cfg.frame_budget_ms.max(1) as u64,
-            ));
+            let target = cfg
+                .target_period
+                .min(Duration::from_millis(cfg.frame_budget_ms.max(1) as u64));
             if elapsed < target {
                 tokio::time::sleep(target - elapsed).await;
             } else {
@@ -427,71 +457,81 @@ pub fn spawn(
     engine
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct ReadState {
+    /// Latest registry request marker fulfilled by a successful SNI read.
+    request_seq: u64,
+    /// Poll cycle when this watch was last refreshed.
+    refresh_cycle: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct PendingSummary {
+    watches: usize,
+    bytes: u32,
+    oldest_cycles: u32,
+    avg_cycles: f32,
+}
+
 /// Result of selecting the bulk reads for one drain-loop iteration.
 struct BulkSelection {
-    /// Reads admitted, priority-ordered (urgent first, then stalest Low).
-    reads: Vec<crate::watch::CoalescedRead>,
+    /// Reads admitted for this batch.
+    reads: Vec<CoalescedRead>,
     /// True if the budget trimmed at least one read (more deferred work
     /// remains for the next drain iteration / cycle).
     capped: bool,
 }
 
-/// Pick this iteration's reads from `reads`, urgent-first then *stalest Low
-/// first*, trimmed to `budget`.
-///
-/// `coalesce` returns address order (unrelated to priority); trimming that by
-/// size starves arbitrary reads. We sort High→Normal→Low so fast data is
-/// never starved, and within Low we order by **how long since each read's
-/// watches were last refreshed** (oldest first), using `last_read` keyed by
-/// watch id. That is robust to the registry growing mid-stream (new watches
-/// have no entry → treated as maximally stale → read promptly) and
-/// guarantees every Low watch is refreshed within a bounded number of
-/// iterations — no index cursor to smear when the set changes.
+/// Pick this iteration's pending reads, round-robin by oldest successful
+/// refresh and trimmed to `budget`. Priority is only a tie-breaker after
+/// staleness; realtime has already been removed into its own first tier.
 fn select_bulk(
-    mut reads: Vec<crate::watch::CoalescedRead>,
+    mut reads: Vec<CoalescedRead>,
     budget: u32,
-    last_read: &HashMap<crate::watch::WatchId, u64>,
+    read_state: &HashMap<WatchId, ReadState>,
     cycle: u64,
 ) -> BulkSelection {
-    use crate::watch::WatchPriority;
-
-    // Staleness of a coalesced read = the oldest (smallest) last-read cycle
-    // among its members; never-read => 0 => maximally stale.
-    let staleness = |r: &crate::watch::CoalescedRead| -> u64 {
+    // Staleness of a coalesced read = the oldest member refresh cycle;
+    // never-refreshed => 0 => maximally stale.
+    let staleness = |r: &CoalescedRead| -> u64 {
         let oldest = r
             .members
             .iter()
-            .map(|&(id, _, _)| *last_read.get(&id).unwrap_or(&0))
+            .map(|&(id, _, _)| read_state.get(&id).map(|s| s.refresh_cycle).unwrap_or(0))
             .min()
             .unwrap_or(0);
         cycle.saturating_sub(oldest)
     };
 
-    // Urgent tier first; within Low, stalest first (largest staleness).
+    // Stalest first; priority and address only make ties deterministic.
     reads.sort_by(|a, b| {
-        a.priority.cmp(&b.priority).then_with(|| {
-            if a.priority == WatchPriority::Low {
-                staleness(b).cmp(&staleness(a))
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        })
+        staleness(b)
+            .cmp(&staleness(a))
+            .then_with(|| a.priority.cmp(&b.priority))
+            .then_with(|| a.region.address.cmp(&b.region.address))
     });
 
     let mut remaining = budget;
     let mut capped = false;
-    reads.retain(|r| {
+    let mut selected = Vec::new();
+    for r in reads {
         if r.region.size <= remaining {
             remaining -= r.region.size;
-            true
+            selected.push(r);
         } else {
             capped = true;
-            false
+            if selected.is_empty() {
+                // A single watch can be larger than the adaptive byte budget.
+                // Admit one oversized read so it cannot starve forever; the
+                // AIMD step will react to any RTT overshoot.
+                selected.push(r);
+                break;
+            }
         }
-    });
+    }
 
     BulkSelection {
-        reads,
+        reads: selected,
         capped,
     }
 }
@@ -506,19 +546,16 @@ fn select_bulk(
 ///   jumping straight back to a spike.
 ///
 /// Pure so it can be unit-tested for convergence and backoff.
-fn next_budget(
-    budget: u32,
-    rtt_ms: u32,
-    throughput: Option<f32>,
-    cfg: &PollConfig,
-) -> u32 {
+fn next_budget(budget: u32, rtt_ms: u32, throughput: Option<f32>, cfg: &PollConfig) -> u32 {
     let frame_ms = cfg.frame_budget_ms.max(1) as f32;
     let b = budget as f32;
     let next = if rtt_ms > cfg.frame_budget_ms {
         let overshoot = (rtt_ms.max(1) as f32 / frame_ms).min(4.0);
         (b * (0.5 / overshoot).max(0.2)).max(0.0)
     } else {
-        let ceil = throughput.map(|t| t * frame_ms * 0.8).unwrap_or(b);
+        let ceil = throughput
+            .map(|t| t * frame_ms * THROUGHPUT_HEADROOM)
+            .unwrap_or(b);
         let step = (cfg.max_byte_budget as f32 * 0.05).max(256.0);
         // Grow additively toward the throughput ceiling; never shrink here.
         (b + step).min(ceil.max(b))
@@ -526,13 +563,49 @@ fn next_budget(
     (next as u32).clamp(cfg.min_byte_budget, cfg.max_byte_budget)
 }
 
+/// Trim a full-frame byte budget to what the measured throughput says still
+/// fits in the current frame remainder.
+fn budget_for_remaining_time(
+    budget: u32,
+    throughput: Option<f32>,
+    elapsed_ms: u128,
+    frame_ms: u128,
+) -> Option<u32> {
+    if elapsed_ms >= frame_ms {
+        return None;
+    }
+    let Some(tp) = throughput.filter(|tp| tp.is_finite() && *tp > 0.0) else {
+        return Some(budget);
+    };
+
+    let remaining_ms = (frame_ms - elapsed_ms) as f32;
+    let capped = (tp * remaining_ms * THROUGHPUT_HEADROOM).floor() as u32;
+    if capped == 0 {
+        None
+    } else {
+        Some(budget.min(capped.max(1)))
+    }
+}
+
+fn predicted_rtt_ms(bytes: u32, throughput: Option<f32>) -> Option<u128> {
+    let tp = throughput.filter(|tp| tp.is_finite() && *tp > 0.0)?;
+    Some((bytes as f32 / tp).ceil().max(1.0) as u128)
+}
+
+fn batch_fits_remaining_time(
+    bytes: u32,
+    throughput: Option<f32>,
+    elapsed_ms: u128,
+    frame_ms: u128,
+) -> bool {
+    predicted_rtt_ms(bytes, throughput)
+        .map(|predicted| elapsed_ms.saturating_add(predicted) <= frame_ms)
+        .unwrap_or(true)
+}
+
 /// Slice each coalesced blob back to its member watches and write them into
 /// the snapshot builder. Shared by the Realtime sub-poll and the bulk batch.
-fn apply_reads(
-    reads: &[crate::watch::CoalescedRead],
-    blobs: &[Vec<u8>],
-    builder: &mut SnapshotBuilder,
-) {
+fn apply_reads(reads: &[CoalescedRead], blobs: &[Vec<u8>], builder: &mut SnapshotBuilder) {
     for (read, blob) in reads.iter().zip(blobs.iter()) {
         for &(wid, off, sz) in &read.members {
             let (o, s) = (off as usize, sz as usize);
@@ -547,6 +620,140 @@ fn apply_reads(
             }
         }
     }
+}
+
+fn read_is_pending(
+    read: &CoalescedRead,
+    request_seq: &HashMap<WatchId, u64>,
+    read_state: &HashMap<WatchId, ReadState>,
+    done_this_cycle: &HashSet<WatchId>,
+) -> bool {
+    read.members.iter().any(|&(id, _, _)| {
+        !done_this_cycle.contains(&id)
+            && request_seq.get(&id).copied().unwrap_or(0)
+                > read_state.get(&id).map(|s| s.request_seq).unwrap_or(0)
+    })
+}
+
+fn mark_fulfilled(
+    reads: &[CoalescedRead],
+    request_seq: &HashMap<WatchId, u64>,
+    cycle: u64,
+    read_state: &mut HashMap<WatchId, ReadState>,
+) {
+    for read in reads {
+        for &(id, _, _) in &read.members {
+            if let Some(seq) = request_seq.get(&id).copied() {
+                read_state.insert(
+                    id,
+                    ReadState {
+                        request_seq: seq,
+                        refresh_cycle: cycle,
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn mark_done(reads: &[CoalescedRead], done_this_cycle: &mut HashSet<WatchId>) {
+    for read in reads {
+        for &(id, _, _) in &read.members {
+            done_this_cycle.insert(id);
+        }
+    }
+}
+
+fn pending_summary(
+    reads: &[CoalescedRead],
+    request_seq: &HashMap<WatchId, u64>,
+    read_state: &HashMap<WatchId, ReadState>,
+    cycle: u64,
+) -> PendingSummary {
+    let mut pending_ids = HashSet::new();
+    let mut bytes = 0u32;
+    let mut oldest = 0u64;
+    let mut age_sum = 0u64;
+
+    for read in reads {
+        let mut read_pending = false;
+        for &(id, _, _) in &read.members {
+            let Some(seq) = request_seq.get(&id).copied() else {
+                continue;
+            };
+            let state = read_state.get(&id).copied().unwrap_or_default();
+            if seq <= state.request_seq || !pending_ids.insert(id) {
+                continue;
+            }
+            let age = cycle.saturating_sub(state.refresh_cycle);
+            oldest = oldest.max(age);
+            age_sum = age_sum.saturating_add(age);
+            read_pending = true;
+        }
+        if read_pending {
+            bytes = bytes.saturating_add(read.region.size);
+        }
+    }
+
+    let watches = pending_ids.len();
+    PendingSummary {
+        watches,
+        bytes,
+        oldest_cycles: oldest.min(u32::MAX as u64) as u32,
+        avg_cycles: if watches == 0 {
+            0.0
+        } else {
+            age_sum as f32 / watches as f32
+        },
+    }
+}
+
+fn split_reads_to_budget(reads: &[CoalescedRead], budget: u32) -> Vec<CoalescedRead> {
+    let budget = budget.max(1);
+    let mut out = Vec::new();
+    for read in reads {
+        if read.region.size <= budget {
+            out.push(read.clone());
+            continue;
+        }
+
+        let mut members = read.members.clone();
+        members.sort_by_key(|&(_, off, _)| off);
+
+        let mut i = 0;
+        while i < members.len() {
+            let (first_id, first_off, first_size) = members[i];
+            let chunk_start = read.region.address + first_off;
+            let mut chunk_end = chunk_start + first_size;
+            let mut chunk_members = vec![(first_id, 0, first_size)];
+            i += 1;
+
+            while i < members.len() {
+                let (id, off, size) = members[i];
+                let member_start = read.region.address + off;
+                let member_end = member_start + size;
+                let candidate_end = chunk_end.max(member_end);
+                if candidate_end - chunk_start > budget {
+                    break;
+                }
+                chunk_members.push((id, member_start - chunk_start, size));
+                chunk_end = candidate_end;
+                i += 1;
+            }
+
+            out.push(CoalescedRead {
+                region: sni_client::MemRegion {
+                    address: chunk_start,
+                    size: chunk_end - chunk_start,
+                    space: read.region.space,
+                    mapping: read.region.mapping,
+                },
+                members: chunk_members,
+                priority: read.priority,
+            });
+        }
+    }
+    out
 }
 
 fn classify_err(e: &sni_client::SniError) -> &'static str {
@@ -588,6 +795,13 @@ mod tests {
         }
     }
 
+    fn request_seq_for(reads: &[CoalescedRead], seq: u64) -> HashMap<WatchId, u64> {
+        reads
+            .iter()
+            .flat_map(|r| r.members.iter().map(move |&(id, _, _)| (id, seq)))
+            .collect()
+    }
+
     // Faithfully model the engine's per-cycle DRAIN LOOP: repeatedly select
     // within budget, marking admitted watches done-this-cycle and EXCLUDING
     // them from later iterations, until either nothing pending remains or the
@@ -597,101 +811,152 @@ mod tests {
     fn step_drain(
         all_reads: &[CoalescedRead],
         budget: u32,
-        last_read: &mut HashMap<WatchId, u64>,
+        read_state: &mut HashMap<WatchId, ReadState>,
         cycle: u64,
         max_batches: usize,
     ) -> Vec<u32> {
+        let request_seq = request_seq_for(all_reads, cycle);
         let mut done: HashSet<WatchId> = HashSet::new();
         let mut refreshed = Vec::new();
         for _ in 0..max_batches {
-            let pending: Vec<_> = all_reads
+            let chunked = split_reads_to_budget(all_reads, budget);
+            let pending: Vec<_> = chunked
                 .iter()
-                .filter(|r| {
-                    r.members.iter().any(|&(id, _, _)| !done.contains(&id))
-                })
+                .filter(|r| read_is_pending(r, &request_seq, read_state, &done))
                 .cloned()
                 .collect();
             if pending.is_empty() {
                 break; // fully drained this cycle
             }
-            let sel = select_bulk(pending, budget, last_read, cycle);
+            let sel = select_bulk(pending, budget, read_state, cycle);
             if sel.reads.is_empty() {
                 break;
             }
             for r in &sel.reads {
                 refreshed.push(r.region.address);
-                for &(id, _, _) in &r.members {
-                    last_read.insert(id, cycle);
-                    done.insert(id);
-                }
             }
+            mark_fulfilled(&sel.reads, &request_seq, cycle, read_state);
+            mark_done(&sel.reads, &mut done);
         }
         refreshed
     }
 
-    // Mirrors the real loop's time guard exactly:
-    //   if reads_issued > 0 && spent_since_bulk_start >= frame_ms { break }
-    // Returns how many bulk batches would be issued given a per-batch cost
-    // and the time the realtime sub-poll already consumed. The bug was using
-    // cycle_start (incl. realtime) for `spent`; the fix measures from
-    // bulk_start and makes the first batch unconditional.
+    // Mirrors the real loop's shared time guard: realtime spends from the
+    // same frame budget, and bulk starts only while time remains.
     fn batches_issued(
         frame_ms: u128,
-        realtime_cost_ms: u128, // time spent BEFORE bulk starts
+        realtime_cost_ms: u128,
         per_batch_ms: u128,
         pending_batches: usize,
-        measure_from_cycle_start: bool, // true = the OLD buggy behaviour
     ) -> usize {
         let mut issued = 0usize;
-        let mut bulk_elapsed = 0u128;
+        let mut elapsed = realtime_cost_ms;
         for _ in 0..pending_batches {
-            let spent = if measure_from_cycle_start {
-                realtime_cost_ms + bulk_elapsed
-            } else {
-                bulk_elapsed
-            };
-            if issued > 0 && spent >= frame_ms {
+            if elapsed >= frame_ms {
                 break;
             }
             issued += 1;
-            bulk_elapsed += per_batch_ms;
+            elapsed += per_batch_ms;
         }
         issued
     }
 
     #[test]
-    fn realtime_poll_cannot_starve_bulk_to_zero() {
-        // Real-FXPAK shape: 16ms frame budget, realtime sub-poll already ate
-        // 20ms (RTT). OLD behaviour (measure from cycle_start) => the bulk
-        // loop's time check is already true => ZERO bulk batches => "adds a
-        // bit then stops, blank forever". FIX (measure from bulk_start +
-        // unconditional first batch) => steady forward progress.
-        let old = batches_issued(16, 20, 4, 100, true);
-        assert_eq!(old, 1, "old behaviour: only the freebie, then starved");
+    fn realtime_poll_spends_the_shared_frame_budget() {
+        // Realtime is always first. If it consumes the whole 16ms window,
+        // bulk does not get an extra private budget.
+        assert_eq!(batches_issued(16, 20, 4, 100), 0);
+        assert_eq!(batches_issued(16, 16, 4, 100), 0);
 
-        let fixed = batches_issued(16, 20, 4, 100, false);
-        assert!(
-            fixed >= 4,
-            "fixed: drain gets its own window regardless of realtime cost \
-             (got {fixed} batches)"
-        );
+        // If realtime leaves 8ms and batches cost ~4ms, two bulk batches fit.
+        assert_eq!(batches_issued(16, 8, 4, 100), 2);
     }
 
     #[test]
-    fn always_at_least_one_bulk_batch_per_cycle() {
-        // Even if a single batch costs more than the whole window, exactly
-        // one must still be issued (guaranteed forward progress) — never
-        // zero, which would leave data blank forever.
-        for rt in [0u128, 10, 50, 500] {
-            let n = batches_issued(16, rt, 999, 100, false);
-            assert_eq!(n, 1, "must issue exactly one batch (rt={rt})");
-        }
+    fn bulk_only_reads_unfulfilled_requests() {
+        let reads = vec![
+            cr(0x1000, 64, WatchPriority::Normal),
+            cr(0x2000, 64, WatchPriority::Normal),
+        ];
+        let mut state = HashMap::new();
+        state.insert(
+            0x1000,
+            ReadState {
+                request_seq: 5,
+                refresh_cycle: 1,
+            },
+        );
+        let mut request_seq = HashMap::new();
+        request_seq.insert(0x1000, 5); // already fulfilled
+        request_seq.insert(0x2000, 6); // pending
+        let done = HashSet::new();
+
+        let pending: Vec<_> = reads
+            .iter()
+            .filter(|r| read_is_pending(r, &request_seq, &state, &done))
+            .cloned()
+            .collect();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].region.address, 0x2000);
+    }
+
+    #[test]
+    fn oversized_coalesced_reads_are_split_to_budget() {
+        let read = CoalescedRead {
+            region: sni_client::MemRegion::fxpak(0x2000, 1000),
+            members: vec![(1, 0, 200), (2, 300, 200), (3, 700, 200)],
+            priority: WatchPriority::Low,
+        };
+
+        let chunks = split_reads_to_budget(&[read], 500);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].region.address, 0x2000);
+        assert_eq!(chunks[0].region.size, 500);
+        assert_eq!(chunks[0].members, vec![(1, 0, 200), (2, 300, 200)]);
+        assert_eq!(chunks[1].region.address, 0x2000 + 700);
+        assert_eq!(chunks[1].region.size, 200);
+        assert_eq!(chunks[1].members, vec![(3, 0, 200)]);
+    }
+
+    #[test]
+    fn pending_summary_reports_backlog_and_staleness() {
+        let reads = vec![
+            cr(0x1000, 64, WatchPriority::Normal),
+            cr(0x2000, 128, WatchPriority::Low),
+            cr(0x3000, 256, WatchPriority::Low),
+        ];
+        let mut request_seq = HashMap::new();
+        request_seq.insert(0x1000, 2);
+        request_seq.insert(0x2000, 2);
+        request_seq.insert(0x3000, 2);
+
+        let mut state = HashMap::new();
+        state.insert(
+            0x1000,
+            ReadState {
+                request_seq: 2,
+                refresh_cycle: 7,
+            },
+        );
+        state.insert(
+            0x2000,
+            ReadState {
+                request_seq: 1,
+                refresh_cycle: 4,
+            },
+        );
+
+        let summary = pending_summary(&reads, &request_seq, &state, 10);
+        assert_eq!(summary.watches, 2);
+        assert_eq!(summary.bytes, 128 + 256);
+        assert_eq!(summary.oldest_cycles, 10);
+        assert!((summary.avg_cycles - 8.0).abs() < f32::EPSILON);
     }
 
     #[test]
     fn high_priority_is_never_starved_by_low() {
         // Small High + big Low, budget fits only one big Low per batch.
-        // High must always get in regardless of how stale the Low reads are.
+        // High must still fit into each batch even as older Low reads rotate.
         let mut lr = HashMap::new();
         for cycle in 1..8 {
             let reads = vec![
@@ -700,12 +965,9 @@ mod tests {
                 cr(0x3000, 4096, WatchPriority::Low),
                 cr(0x4000, 4096, WatchPriority::Low),
             ];
-            // Even with a single batch this cycle, High is admitted first.
+            // Even with a single batch this cycle, High is not squeezed out.
             let refreshed = step_drain(&reads, 4096 + 64, &mut lr, cycle, 1);
-            assert!(
-                refreshed.contains(&0x1000),
-                "High starved at cycle {cycle}"
-            );
+            assert!(refreshed.contains(&0x1000), "High starved at cycle {cycle}");
         }
     }
 
@@ -773,13 +1035,12 @@ mod tests {
     #[test]
     fn registry_growth_midstream_still_streams_all() {
         // New watches appear as the script touches addresses. A freshly
-        // registered watch has no last_read entry -> maximally stale ->
-        // must be picked up promptly, and existing ones must not starve.
+        // registered watch has no read state -> maximally stale -> must be
+        // picked up promptly, and existing ones must not starve.
         let budget = 3000;
         let mut lr = HashMap::new();
         let mut seen = std::collections::HashSet::new();
-        let mut addrs: Vec<u32> =
-            (0..5).map(|i| 0x2000 + i * 0x1000).collect();
+        let mut addrs: Vec<u32> = (0..5).map(|i| 0x2000 + i * 0x1000).collect();
         for cycle in 1..=40 {
             // Grow the set partway through (simulates lazy registration).
             if cycle == 10 {
@@ -835,6 +1096,26 @@ mod tests {
     }
 
     #[test]
+    fn remaining_time_caps_iteration_budget_by_throughput() {
+        // 8ms left at ~500 B/ms with 20% headroom -> 3200 bytes.
+        let capped = budget_for_remaining_time(6400, Some(500.0), 8, 16);
+        assert_eq!(capped, Some(3200));
+    }
+
+    #[test]
+    fn unknown_throughput_keeps_full_iteration_budget() {
+        assert_eq!(budget_for_remaining_time(4096, None, 12, 16), Some(4096));
+    }
+
+    #[test]
+    fn predicted_overrun_defers_late_batch() {
+        // 4000 bytes at ~500 B/ms predicts ~8ms RTT, which does not fit in
+        // the last 4ms of a 16ms frame.
+        assert!(!batch_fits_remaining_time(4000, Some(500.0), 12, 16));
+        assert!(batch_fits_remaining_time(1600, Some(500.0), 12, 16));
+    }
+
+    #[test]
     fn converges_and_is_stable_at_the_throughput_point() {
         let c = cfg();
         // Simulate: link does ~500 B/ms, frame target 16ms. Steady state
@@ -860,12 +1141,7 @@ mod tests {
         let lo = next_budget(c.min_byte_budget, 500, Some(1.0), &c);
         assert_eq!(lo, c.min_byte_budget);
         // Huge throughput can't push past the ceiling.
-        let hi = next_budget(
-            c.max_byte_budget,
-            1,
-            Some(1_000_000.0),
-            &c,
-        );
+        let hi = next_budget(c.max_byte_budget, 1, Some(1_000_000.0), &c);
         assert_eq!(hi, c.max_byte_budget);
     }
 }
