@@ -421,18 +421,22 @@ local CONFIG = {
     -- General Mesen drawing options.
     drawing = {
         useScriptHud = false,
-        mesenYOffset = 7,
+        mesenYOffset = 0,
 
         -- Mesen/Mesen2 draw APIs commonly use inverted alpha:
         -- 0x00RRGGBB is opaque and 0xFFRRGGBB is transparent.
         -- Leave true unless your local build behaves like normal ARGB.
         mesenDrawAlphaInverted = true,
+
+        -- Camera & position smoothing to eliminate stuttering from missed/delayed frames
+        cameraInterpolation = true,
+        cameraInterpolationFactor = 0.35, -- lower is smoother, 1.0 is instant
     },
 
     -- Samus-centered high-resolution block viewer.
     -- Uses scriptHud so scale 2/3/4 draws a larger world-space area around Samus.
     samusCenteredBlockView = {
-        enabled = false,
+        enabled = true,
         visibleByDefault = true, -- Select+B+L+R toggles only the block/world viewer layer.
         scale = 3, -- 1..4. 4 shows the most blocks around Samus.
         drawScrolls = true,
@@ -801,7 +805,7 @@ local CONFIG = {
             -- Expanded checklist placement and readability.
             -- Leave checklistX/checklistY nil to place it on the right side automatically.
             checklistX = nil,
-            checklistY = 580,
+            checklistY = 550,
             checklistWidth = 278,
             checklistLineHeight = 8,
             checklistShowNotes = false,
@@ -952,7 +956,7 @@ local CONFIG = {
         -- Text style for labels inside blocks.
         -- "compact" draws type/BTS on one line, e.g. 9/40.
         -- "stacked" draws type above BTS.
-        textStyle = "compact",
+        textStyle = "stacked",
         includePrefixes = false, -- true gives T:9 and B:40 instead of 9 and 40.
 
         -- Mini-font sizing. Increase pixelSize to 2 if you want larger labels.
@@ -1020,24 +1024,24 @@ local CONFIG = {
         scrollOpacity = nil, -- nil = use opacity
         slopeOpacity = nil,  -- nil = use opacity
 
-        slope = {0x00, 0xFF, 0x00},
-        solidBlock = {0xFF, 0x00, 0x00},
-        specialBlock = {0x00, 0x00, 0xFF},
-        doorBlock = {0x00, 0xFF, 0xFF},
-        doorcap = {0xFF, 0x80, 0x00},
-        errorBlock = {0x80, 0x00, 0xFF},
+        slope = {0x10, 0xD0, 0x70},          -- Beautiful Emerald/Neon Green
+        solidBlock = {0xEF, 0x44, 0x44},     -- Vibrant Coral Red
+        specialBlock = {0x63, 0x66, 0xF1},   -- Indigo Blue
+        doorBlock = {0x06, 0xB6, 0xD4},      -- Cyan/Teal
+        doorcap = {0xF5, 0x9E, 0x0B},        -- Amber Orange
+        errorBlock = {0xD9, 0x46, 0xEF},     -- Magenta Purple
 
-        scrollRed = {0xFF, 0x00, 0x00},
-        scrollBlue = {0x00, 0x00, 0xFF},
-        scrollGreen = {0x00, 0xFF, 0x00},
+        scrollRed = {0xEF, 0x44, 0x44},
+        scrollBlue = {0x3B, 0x82, 0xF6},
+        scrollGreen = {0x10, 0xD0, 0x70},
 
-        enemy = {0xFF, 0xFF, 0xFF},
-        spriteObject = {0xFF, 0x80, 0x00},
-        enemyProjectile = {0x00, 0xFF, 0x00},
+        enemy = {0xF3, 0xF4, 0xF6},          -- Cool grey/white
+        spriteObject = {0xF5, 0x9E, 0x0B},   -- Amber
+        enemyProjectile = {0x22, 0xC5, 0x5E},-- Green
         powerBomb = {0xFF, 0xFF, 0xFF},
-        projectile = {0xFF, 0xFF, 0x00},
-        samus = {0x00, 0xFF, 0xFF},
-        camera = {0x80, 0x80, 0x80},
+        projectile = {0xEA, 0x58, 0x0C},    -- Orange/yellow
+        samus = {0x06, 0xB6, 0xD4},          -- Cyan/teal
+        camera = {0x9C, 0xA3, 0xAF},         -- Gray
     },
 }
 -- =============================================================================
@@ -1065,6 +1069,10 @@ local ANYG = CONFIG.anyGlitchedAssist or {}
 -- centered scale, y-offset, view mode). Everything below this part is the
 -- pristine upstream body, verbatim.
 -- =============================================================================
+
+-- ---- coordinate smoothing state variables -----------------------------------
+local currentCameraX, currentCameraY = nil, nil
+local currentSamusX, currentSamusY = nil, nil
 
 -- Console / SNES-core guard (upstream had this inline; emu.getState is real).
 local _state = emu.getState()
@@ -1102,11 +1110,21 @@ ui.checkbox("anyg_warnings",   "Warnings",            ANYG.showWarnings ~= false
 ui.checkbox("anyg_inputwarn",  "Input warnings",      ANYG.showInputWarnings ~= false)
 ui.checkbox("anyg_waypoints",  "Practice waypoints",  ANYG.showPracticeWaypoints ~= false)
 
+ui.header("Block Viewer / Hitbox Options")
+ui.checkbox("samus_centered", "Samus-centered block view", USE_SAMUS_CENTERED_BLOCK_VIEW)
+ui.checkbox("viewer_visible", "World block viewer visible", blockViewerLayerVisible)
+ui.checkbox("draw_scrolls", "Draw scroll boundaries", SAMUS_CENTERED_BLOCK_VIEW_DRAW_SCROLLS)
+ui.checkbox("draw_fx", "Draw water/lava/acid FX layer", SAMUS_CENTERED_BLOCK_VIEW_DRAW_FX)
+ui.checkbox("draw_hitboxes", "Draw sprite & enemy hitboxes", SAMUS_CENTERED_BLOCK_VIEW_DRAW_HITBOXES)
+ui.checkbox("draw_status", "Draw status text overlay", SAMUS_CENTERED_BLOCK_VIEW_DRAW_STATUS_TEXT)
+ui.slider("hud_scale", "HUD scale (1..4)", 1, 4, SAMUS_CENTERED_BLOCK_VIEW_SCALE or 3)
+
 ui.header("Overlay")
 -- colours.opacity is 0..0xFF and IS read live by the colour packer.
 ui.slider("opacity", "Opacity", 0, 255,
           (CONFIG.colours and CONFIG.colours.opacity) or 0xFF)
-ui.label("Toggles take effect immediately. Scale/viewer layout still edited in the file.")
+ui.checkbox("smooth_camera", "Smooth camera/scroll", CONFIG.drawing.cameraInterpolation ~= false)
+ui.label("Toggles and scale adjustments take effect immediately.")
 
 -- Push the current control values onto the live CONFIG/ANYG tables. Called
 -- every frame (cheap: a handful of table writes) so flipping a checkbox in
@@ -1122,8 +1140,37 @@ local function _apply_ui_settings()
     ANYG.showWarnings            = ui.get("anyg_warnings")
     ANYG.showInputWarnings       = ui.get("anyg_inputwarn")
     ANYG.showPracticeWaypoints   = ui.get("anyg_waypoints")
+    
+    USE_SAMUS_CENTERED_BLOCK_VIEW = ui.get("samus_centered")
+    blockViewerLayerVisible       = ui.get("viewer_visible")
+    SAMUS_CENTERED_BLOCK_VIEW_DRAW_SCROLLS = ui.get("draw_scrolls")
+    SAMUS_CENTERED_BLOCK_VIEW_DRAW_FX       = ui.get("draw_fx")
+    SAMUS_CENTERED_BLOCK_VIEW_DRAW_HITBOXES  = ui.get("draw_hitboxes")
+    SAMUS_CENTERED_BLOCK_VIEW_DRAW_STATUS_TEXT = ui.get("draw_status")
+    
+    local new_scale = ui.get("hud_scale")
+    if new_scale and new_scale ~= SAMUS_CENTERED_BLOCK_VIEW_SCALE then
+        SAMUS_CENTERED_BLOCK_VIEW_SCALE = new_scale
+        if CONFIG.samusCenteredBlockView then
+            CONFIG.samusCenteredBlockView.scale = new_scale
+        end
+        gfx.scale(new_scale)
+    end
+    
+    if CONFIG.samusCenteredBlockView then
+        CONFIG.samusCenteredBlockView.enabled          = USE_SAMUS_CENTERED_BLOCK_VIEW
+        CONFIG.samusCenteredBlockView.visibleByDefault = blockViewerLayerVisible
+        CONFIG.samusCenteredBlockView.drawScrolls      = SAMUS_CENTERED_BLOCK_VIEW_DRAW_SCROLLS
+        CONFIG.samusCenteredBlockView.drawFx           = SAMUS_CENTERED_BLOCK_VIEW_DRAW_FX
+        CONFIG.samusCenteredBlockView.drawHitboxes     = SAMUS_CENTERED_BLOCK_VIEW_DRAW_HITBOXES
+        CONFIG.samusCenteredBlockView.drawStatusText   = SAMUS_CENTERED_BLOCK_VIEW_DRAW_STATUS_TEXT
+    end
+    
     if CONFIG.colours then
         CONFIG.colours.opacity = ui.get("opacity")
+    end
+    if CONFIG.drawing then
+        CONFIG.drawing.cameraInterpolation = ui.get("smooth_camera")
     end
 end
 
@@ -1183,6 +1230,13 @@ function selectConfiguredDrawSurface() end
 -- Integer-width note: LuaJIT's bit ops are signed 32-bit, so lshift(0xFF,24)
 -- is negative while gfx.* want an unsigned 0..0xFFFFFFFF. Decompose with /%
 -- and recompose with arithmetic (stays an exact double).
+
+-- Helper to construct translucent fill colors from solid outline colors by modifying alpha
+local function get_fill_color(colour, fill_alpha)
+    local a = fill_alpha or 0x30
+    local rgb = colour % 0x1000000
+    return a * 0x1000000 + rgb
+end
 
 local NAMED = {
     red="FF0000", orange="FF8000", yellow="FFFF00", white="FFFFFF",
@@ -1253,9 +1307,11 @@ xemu.drawLine = function(x0, y0, x1, y1, fg)
 end
 
 xemu.drawText = function(x, y, text, fg, bg)
-    -- sni-lua text has no per-call background; the body draws its own backing
-    -- boxes for panels, so dropping bg is faithful.
-    gfx.text(i(x), i(y + drawYOffset()), tostring(text), to_argb(fg))
+    local opts = { outline = 0xFF000000 }
+    if bg and bg ~= "clear" then
+        opts.bg = to_argb(bg)
+    end
+    gfx.text(i(x), i(y + drawYOffset()), tostring(text), to_argb(fg), opts)
 end
 
 -- The body issues one direct emu.drawRectangle (drawMiniText backing); keep it
@@ -2375,7 +2431,10 @@ local doors = {[0x88FE]=true, [0x890A]=true, [0x8916]=true, [0x8922]=true, [0x89
 -- Draw standard block outline
 function standardOutline(colour)
     return function(blockX, blockY, blockIndex, stackLimit)
-        drawBox(blockX, blockY, blockX + 15, blockY + 15, colour, "clear")
+        local c = to_argb(colour)
+        local fill = get_fill_color(c, 0x25) -- translucent fill (e.g. 15% opacity)
+        local yo = drawYOffset()
+        gfx.round_rect(i(blockX), i(blockY + yo), 16, 16, 2, c, fill, 1)
     end
 end
 
@@ -2400,87 +2459,103 @@ outline = {
             ys[x] = xemu.read_u8(p_slope + x)
         end
         
-        -- Determine drawable X range
-        local x_min
+        -- Determine drawable X range to check if slope has collision
+        local has_collision = false
         for x = 0, 0xF do
-            if ys[x] < 0x10 then
-                x_min = x
+            if ys[x] <= 0x10 then
+                has_collision = true
                 break
             end
         end
         
-        if x_min == nil then
+        if not has_collision then
             return
         end
         
-        local x_max
-        for j = 0, 0xF do
-            local x = 0xF - j
-            if ys[x] < 0x10 then
-                x_max = x
-                break
-            end
-        end
-        
-        -- Natural surface
-        for i = x_min + 1, x_max - 1 do
-            if ys[i - 1] < 0x10 and ys[i] < 0x10 then
-                local y_from = ys[i - 1]
-                local y_to = ys[i]
+        -- Generate surface points
+        local surface_pts = {}
+        local y_base = flip_y and 0 or 16
+        for x = 0, 15 do
+            local orig_x = flip_x and (15 - x) or x
+            local sy = ys[orig_x]
+            if sy > 16 then
+                sy = y_base
+            else
                 if flip_y then
-                    y_from = 0xF - y_from
-                    y_to = 0xF - y_to
+                    -- Ceiling slope: Y coordinate is 16 - ys[orig_x]
+                    sy = 16 - sy
                 end
-                
-                local x = i
-                if flip_x then
-                    x = 0xF - x
-                end
-                
-                xemu.drawPixel(
-                    blockX + x, blockY + y_to, 
-                    colour_slope
-                )
+            end
+            table.insert(surface_pts, { blockX + x, blockY + sy })
+        end
+        
+        -- To prevent 1-pixel gaps between adjacent tiles, we extend the slope surface
+        -- to the rightmost boundary (blockX + 16) using the height of the last column (x = 15).
+        local last_orig_x = flip_x and 0 or 15
+        local last_sy = ys[last_orig_x]
+        if last_sy > 16 then
+            last_sy = y_base
+        else
+            if flip_y then
+                last_sy = 16 - last_sy
             end
         end
+        table.insert(surface_pts, { blockX + 16, blockY + last_sy })
         
-        -- Position of natural left, right and bottom edges
-        local x_left = x_min
-        local x_right = x_max
-        if flip_x then
-            x_left = 0xF - x_left
-            x_right = 0xF - x_right
+        -- Build the filled polygon points
+        local pts = {}
+        
+        -- Left base corner
+        table.insert(pts, { blockX, blockY + y_base })
+        
+        -- Copy surface points
+        for _, pt in ipairs(surface_pts) do
+            table.insert(pts, { pt[1], pt[2] })
         end
         
-        local y_left = ys[x_min]
-        local y_right = ys[x_max]
-        local y_base = 0xF
-        if flip_y then
-            y_base = 0xF - y_base
-            y_left = 0xF - y_left
-            y_right = 0xF - y_right
+        -- Right base corner
+        table.insert(pts, { blockX + 16, blockY + y_base })
+        
+        -- Get untranslated Ys for wall check
+        local sy0 = surface_pts[1][2] - blockY
+        local sy16 = surface_pts[17][2] - blockY
+        
+        -- Translate and round all points for the drawing offset
+        local yo = drawYOffset()
+        for _, pt in ipairs(pts) do
+            pt[1] = i(pt[1])
+            pt[2] = i(pt[2] + yo)
+        end
+        for _, pt in ipairs(surface_pts) do
+            pt[1] = i(pt[1])
+            pt[2] = i(pt[2] + yo)
         end
         
-        -- Natural bottom edge
-        xemu.drawLine(
-            blockX + x_left,  blockY + y_base, 
-            blockX + x_right, blockY + y_base, 
-            colour_slope
-        )
+        local c = to_argb(colour_slope)
+        local fill = get_fill_color(c, 0x30) -- beautiful translucent green fill
         
-        -- Natural left edge
-        xemu.drawLine(
-            blockX + x_left, blockY + y_base, 
-            blockX + x_left, blockY + y_left, 
-            colour_slope
-        )
+        -- 1. Draw the filled slope polygon with NO border!
+        gfx.poly(pts, 0, fill, 0, true)
         
-        -- Natural right edge
-        xemu.drawLine(
-            blockX + x_right, blockY + y_base, 
-            blockX + x_right, blockY + y_right, 
-            colour_slope
-        )
+        -- 2. Draw the sloped surface line
+        gfx.poly(surface_pts, c, 0, 1, false)
+        
+        -- 3. Draw vertical walls ONLY where they have solid height
+        if not flip_y then
+            if sy0 < 16 then
+                gfx.line(i(blockX), i(blockY + 16 + yo), i(blockX), i(blockY + sy0 + yo), c, 1)
+            end
+            if sy16 < 16 then
+                gfx.line(i(blockX + 16), i(blockY + 16 + yo), i(blockX + 16), i(blockY + sy16 + yo), c, 1)
+            end
+        else
+            if sy0 > 0 then
+                gfx.line(i(blockX), i(blockY + yo), i(blockX), i(blockY + sy0 + yo), c, 1)
+            end
+            if sy16 > 0 then
+                gfx.line(i(blockX + 16), i(blockY + yo), i(blockX + 16), i(blockY + sy16 + yo), c, 1)
+            end
+        end
     end,
 
     -- Spike air
@@ -2862,7 +2937,20 @@ local function drawFilledRect(x, y, width, height, colour)
     if colour == nil or colour == "clear" or width <= 0 or height <= 0 then
         return
     end
-    emu.drawRectangle(i(x), i(y + drawYOffset()), i(width), i(height), mesenColour(colour), true, 1)
+    local c = to_argb(colour)
+    local yo = drawYOffset()
+
+    if width > 30 and height > 20 then
+        -- Premium floating HUD card look for panels
+        local radius = 6
+        gfx.round_rect(i(x), i(y + yo), i(width), i(height), radius, 0x25FFFFFF, c, 1, {
+            shadow = { dx = 0, dy = 2, blur = 6, color = 0x80000000 }
+        })
+    else
+        -- Clean rounded look for block label backgrounds
+        local radius = 3
+        gfx.round_rect(i(x), i(y + yo), i(width), i(height), radius, 0, c, 0)
+    end
 end
 
 local function drawMiniText(x, y, text, fg, bg, opts)
@@ -4179,8 +4267,10 @@ local function anygDrawRouteBlockMarker(blockX, blockY, blockType, bts, blockInd
     local bg = rule.background or "black"
 
     if cfg.drawBoxes ~= false then
-        drawBox(blockX - 1, blockY - 1, blockX + 16, blockY + 16, colour, "clear")
-        drawBox(blockX - 2, blockY - 2, blockX + 17, blockY + 17, colour, "clear")
+        local c = to_argb(colour)
+        local fill = get_fill_color(c, 0x15) -- extremely soft translucent glow inside
+        local yo = drawYOffset()
+        gfx.round_rect(i(blockX - 2), i(blockY + yo - 2), 20, 20, 3, c, fill, 1.5)
     end
 
     if cfg.drawLabels ~= false then
@@ -4481,7 +4571,6 @@ local function anygDrawTrainingGuide(viewWidth, viewHeight)
     local nLines = 2 + #(page.lines or {})
     local fill = cfg.panelFill or bg
     drawFilledRect(x - 4, y - 4, width + 8, nLines * lh + 10, fill)
-    drawBox(x - 2, y - 2, x + width, y + nLines * lh + 4, cfg.titleColour or "yellow", "clear")
     anygDrawPanelLine(x, y, string.format("AnyG guide %d/%d: %s", pageIndex, #pages, page.title or ""), cfg.titleColour or "yellow", bg)
     anygDrawPanelLine(x, y + lh, "Select+B+Left/Right pages, Up hide", cfg.textColour or "white", bg)
     for i, line in ipairs(page.lines or {}) do
@@ -4517,8 +4606,6 @@ local function anygDrawDoorskipTiming(viewWidth, viewHeight)
     local nLines = 7 + liveLine + historyLines
     local fill = cfg.panelFill or bg
     drawFilledRect(x - 4, y - 4, width + 8, nLines * lh + 10, fill)
-    drawBox(x - 2, y - 2, x + width, y + nLines * lh + 4, title, "clear")
-
     anygDrawPanelLine(x, y, "Doorskip timing", title, bg)
     y = y + lh
 
@@ -4815,9 +4902,6 @@ local function anygDrawTrainingChecklist(viewWidth, viewHeight)
 
     local height = contentLines * lh + 8
     drawFilledRect(x - 4, y - 4, width + 8, height, fill)
-    drawBox(x - 4, y - 4, x + width + 4, y + height - 4, title, "clear")
-    drawBox(x - 2, y - 2, x + width + 2, y + height - 6, title, "clear")
-
     local cy = y
     anygDrawPanelLine(x, cy, "AnyG route checklist", title, bg)
     cy = cy + lh
@@ -4906,9 +4990,21 @@ function displayBlocks(cameraX, cameraY, roomWidth, viewWidth, viewHeight)
             -- Block type is the most significant 4 bits of level data
             local blockType = xemu.rshift(sm.getLevelDatum(blockIndex), 12)
             local bts = sm.getBts(blockIndex)
+
+            -- Suppress standard block outline if this is a highlighted route block
+            local hasRouteHighlight = false
+            if blockFresh then
+                local rule = anygClassifyBlock(blockType, bts)
+                if rule ~= nil then
+                    hasRouteHighlight = true
+                end
+            end
+
             -- Draw the block outline depending on its block type.
-            local f = outline[blockType] or standardOutline(colour_errorBlock)
-            f(blockX, blockY, blockIndex, stackLimit)
+            if not hasRouteHighlight then
+                local f = outline[blockType] or standardOutline(colour_errorBlock)
+                f(blockX, blockY, blockIndex, stackLimit)
+            end
 
             if blockFresh then
                 anygDrawRouteBlockMarker(blockX, blockY, blockType, bts, blockIndex, cameraX, cameraY, viewWidth, viewHeight)
@@ -5385,8 +5481,56 @@ function on_paint()
         return
     end
 
-    local samusXPosition = sm.getSamusXPositionSigned()
-    local samusYPosition = sm.getSamusYPositionSigned()
+    local targetSamusX = sm.getSamusXPositionSigned()
+    local targetSamusY = sm.getSamusYPositionSigned()
+    local targetCameraX = sm.getLayer1XPosition()
+    local targetCameraY = sm.getLayer1YPosition()
+
+    if CONFIG.drawing.cameraInterpolation then
+        -- Smooth Samus position
+        if not currentSamusX or not currentSamusY then
+            currentSamusX = targetSamusX
+            currentSamusY = targetSamusY
+        else
+            local dx = targetSamusX - currentSamusX
+            local dy = targetSamusY - currentSamusY
+            if math.abs(dx) > 100 or math.abs(dy) > 100 then
+                currentSamusX = targetSamusX
+                currentSamusY = targetSamusY
+            else
+                local factor = CONFIG.drawing.cameraInterpolationFactor or 0.35
+                currentSamusX = currentSamusX + dx * factor
+                currentSamusY = currentSamusY + dy * factor
+            end
+        end
+
+        -- Smooth Camera position
+        if not currentCameraX or not currentCameraY then
+            currentCameraX = targetCameraX
+            currentCameraY = targetCameraY
+        else
+            local dx = targetCameraX - currentCameraX
+            local dy = targetCameraY - currentCameraY
+            if math.abs(dx) > 100 or math.abs(dy) > 100 then
+                currentCameraX = targetCameraX
+                currentCameraY = targetCameraY
+            else
+                local factor = CONFIG.drawing.cameraInterpolationFactor or 0.35
+                currentCameraX = currentCameraX + dx * factor
+                currentCameraY = currentCameraY + dy * factor
+            end
+        end
+    else
+        currentSamusX = targetSamusX
+        currentSamusY = targetSamusY
+        currentCameraX = targetCameraX
+        currentCameraY = targetCameraY
+    end
+
+    local samusXPosition = math.floor(currentSamusX + 0.5)
+    local samusYPosition = math.floor(currentSamusY + 0.5)
+    local layer1XPosition = math.floor(currentCameraX + 0.5)
+    local layer1YPosition = math.floor(currentCameraY + 0.5)
     
     -- Debug controls
     if debugControlsEnabled ~= 0 then
@@ -5403,8 +5547,8 @@ function on_paint()
         cameraX = samusXPosition - 128 + xAdjust
         cameraY = samusYPosition - 112 + yAdjust
     else
-        cameraX = sm.getLayer1XPosition()
-        cameraY = sm.getLayer1YPosition()
+        cameraX = layer1XPosition
+        cameraY = layer1YPosition
     end
     
     -- Width of the room in blocks
