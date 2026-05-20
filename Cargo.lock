@@ -3897,7 +3897,7 @@ dependencies = [
 
 [[package]]
 name = "sni-cache"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3909,7 +3909,7 @@ dependencies = [
 
 [[package]]
 name = "sni-capture"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "nokhwa",
@@ -3919,7 +3919,7 @@ dependencies = [
 
 [[package]]
 name = "sni-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3936,7 +3936,7 @@ dependencies = [
 
 [[package]]
 name = "sni-lua-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mlua",
  "parking_lot",
@@ -3952,7 +3952,7 @@ dependencies = [
 
 [[package]]
 name = "sni-lua-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3974,7 +3974,7 @@ dependencies = [
 
 [[package]]
 name = "sni-render"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "egui",
  "geo",
